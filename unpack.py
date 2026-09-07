@@ -124,7 +124,7 @@ def unpack(pkg: Path, out_dir: Path, *, list_only: bool = False) -> None:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("pkg", nargs="?", default="content/scene.pkg", type=Path)
+    parser.add_argument("pkg", nargs="?", default="papers/scene_example/scene.pkg", type=Path)
     parser.add_argument("-o", "--out", default=Path("unpacked"), type=Path)
     parser.add_argument(
         "-l", "--list", action="store_true", help="list contents without extracting"
