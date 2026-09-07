@@ -15,8 +15,9 @@
 //! "TEXB000n\0"                    image container:
 //!     int32 image_count
 //!     int32 free_image_format     FreeImage FIF_* enum; -1 = raw pixels
+//!                                 |- containers v3+ only
 //!     repeat image_count times:
-//!         int32 unknown           always 0 in samples seen
+//!         int32 unknown           always 0 in samples seen; v4+ only
 //!         int32 mipmap_count
 //!         repeat mipmap_count times:
 //!             int32 width
@@ -191,7 +192,10 @@ pub fn parse(path: &Path) -> Result<Tex> {
         bail!("implausible image count {image_count}");
     }
 
-    let free_image_format = if container_number >= 4 {
+    // v2 and older have no such field and are always raw pixels. v3 gained it;
+    // v4 additionally gained the per-image word below, so the two must not be
+    // read together or a v3 container mistakes its format for a mipmap count.
+    let free_image_format = if container_number >= 3 {
         reader.i32()?
     } else {
         -1
@@ -199,9 +203,11 @@ pub fn parse(path: &Path) -> Result<Tex> {
 
     let mut images = Vec::with_capacity(image_count as usize);
     for _ in 0..image_count {
-        // Purpose unknown; 0 in every sample inspected. Both samples have a
+        // Purpose unknown; 0 in every v4 sample inspected. Every sample has a
         // single image, so it could equally be a one-off field before the loop.
-        let _unknown = reader.i32()?;
+        if container_number >= 4 {
+            let _unknown = reader.i32()?;
+        }
 
         let mipmap_count = reader.i32()?;
         if !(0..=64).contains(&mipmap_count) {

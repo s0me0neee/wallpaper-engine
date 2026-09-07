@@ -13,7 +13,7 @@ use walkdir::WalkDir;
 /// Unpack and inspect Wallpaper Engine scene packages.
 ///
 /// With no subcommand, runs the whole pipeline with default paths:
-/// papers/scene_example/scene.pkg -> unpacked/ -> textures/
+/// papers/scene_example1/scene.pkg -> unpacked/ -> textures/
 #[derive(Parser)]
 #[command(name = "wallpaper-engine", version, about, long_about = None)]
 struct Cli {
@@ -32,7 +32,7 @@ enum Command {
 #[derive(Args)]
 struct UnpackArgs {
     /// Archive to read.
-    #[arg(default_value = "papers/scene_example/scene.pkg")]
+    #[arg(default_value = "papers/scene_example1/scene.pkg")]
     pkg: PathBuf,
 
     /// Directory to extract into.
@@ -66,7 +66,7 @@ struct TexArgs {
 impl Default for UnpackArgs {
     fn default() -> Self {
         Self {
-            pkg: PathBuf::from("papers/scene_example/scene.pkg"),
+            pkg: PathBuf::from("papers/scene_example1/scene.pkg"),
             out: PathBuf::from("unpacked"),
             list: false,
         }

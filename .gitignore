@@ -7,3 +7,7 @@
 # Python reference implementation
 __pycache__/
 .venv/
+
+# Sample wallpapers — 3.4 GB of Workshop content, not ours to redistribute
+/papers
+.DS_Store
