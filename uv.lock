@@ -1,0 +1,45 @@
+version = 1
+revision = 3
+requires-python = ">=3.12"
+
+[[package]]
+name = "easyprocess"
+version = "1.1"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/86/e5/1071ad7de469bf3baae5b04d6c8019876c819c2d428cc1b0f15b4b31fc89/EasyProcess-1.1.tar.gz", hash = "sha256:885898302a57aab948973e8b5d32a4229392b9fb2d986ab1d4ffd590e5ba90ec", size = 11829, upload-time = "2022-01-15T10:58:56.146Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/9c/cf/27d1f4b3bae5e566f94fc716e048120128cf603d5163638d22bcd0fc92d8/EasyProcess-1.1-py3-none-any.whl", hash = "sha256:82eed523a0a5eb12a81fa4eacd9f342caeb3f900eb4b798740e6696ad07e63f9", size = 8660, upload-time = "2022-01-15T10:58:54.473Z" },
+]
+
+[[package]]
+name = "entrypoint2"
+version = "1.1"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/41/2b/513088059a4bfe89acd8ddb74f9350b399507a0fe6676c3346d54449a5b1/entrypoint2-1.1.tar.gz", hash = "sha256:fc0b7fe7b21acdab47a585ab9407ca7e5c4f96cb6888575db6b0ceb91f0e105a", size = 13393, upload-time = "2022-06-11T06:28:21.619Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/42/ee/84c8990b08efa0265bd10fc8781ef26e3157715bf0dfa47ee3c056b513d4/entrypoint2-1.1-py2.py3-none-any.whl", hash = "sha256:eeb8c327bdb65cdd1668c023a6b110b7e3d1a046fb05e043861ebd9264b3a257", size = 9864, upload-time = "2022-06-11T06:28:19.529Z" },
+]
+
+[[package]]
+name = "pyunpack"
+version = "0.3"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "easyprocess" },
+    { name = "entrypoint2" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/00/98/37d8f1712ffc8ff594b921a9ad649a195ebcebb22d54a7d189e5654ea1df/pyunpack-0.3.tar.gz", hash = "sha256:b9192665c3aa28eaeb2b01198a2f2f985d9a3ecce55f266a657b31cd337d3f12", size = 6420, upload-time = "2022-06-06T19:24:50.773Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/72/20/5a6dcb0d28529ce6efe850755994c80817279eecf08620003775fda3b914/pyunpack-0.3-py2.py3-none-any.whl", hash = "sha256:8f517cfc71215f37f74cf3a7668028828c68dc76f4d02e7a69f227ce978d51a3", size = 4092, upload-time = "2022-06-06T19:24:47.594Z" },
+]
+
+[[package]]
+name = "wallpaper-engine"
+version = "0.1.0"
+source = { editable = "." }
+dependencies = [
+    { name = "pyunpack" },
+]
+
+[package.metadata]
+requires-dist = [{ name = "pyunpack", specifier = ">=0.3" }]

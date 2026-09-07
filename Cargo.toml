@@ -4,3 +4,22 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+anyhow = "1.0.104"
+clap = { version = "4.6.6", features = ["derive"] }
+# Wallpaper Engine stores bare LZ4 *blocks* with no length prefix, so only the
+# block API is used. `safe-decode` keeps the hot path free of `unsafe`, which
+# matters because Workshop packages are untrusted input.
+lz4_flex = { version = "0.14.0", default-features = false, features = [
+    "std",
+    "safe-decode",
+    "safe-encode",
+] }
+# Encodes the PNGs we generate for raw-pixel textures. Textures whose payload is
+# already an encoded image are passed through byte-for-byte and never hit this.
+png = "0.18.1"
+# BC1/BC2/BC3 decoding for DXT1/DXT3/DXT5 textures.
+texpresso = "2.0.2"
+walkdir = "2.5.0"
+
+[profile.release]
+opt-level = 3
