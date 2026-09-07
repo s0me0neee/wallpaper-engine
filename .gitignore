@@ -1,1 +1,9 @@
 /target
+
+# Derived output — regenerate with `cargo run`
+/unpacked
+/textures
+
+# Python reference implementation
+__pycache__/
+.venv/
