@@ -173,11 +173,22 @@ fn run_layer_chain(
 struct CompiledPass {
     program: pass::Program,
     target: pass::Target,
-    textures: Vec<(String, glow::Texture)>,
+    textures: Vec<(String, PassTexture)>,
     /// Every non-sampler uniform except `g_Time`, resolved once.
     floats: Vec<(String, Vec<f32>)>,
     ints: Vec<(String, i32)>,
     label: String,
+}
+
+/// What a pass binds to one sampler slot.
+#[derive(Clone, Copy)]
+enum PassTexture {
+    /// Resolved once at prepare time and never changes.
+    Fixed(glow::Texture),
+    /// The layer image that entered the chain. Kept symbolic rather than
+    /// resolved, because a puppet or particle layer re-uploads that image
+    /// every frame and the binding has to follow it.
+    LayerBase,
 }
 
 /// One shader parameter Wallpaper Engine's own Properties panel would show as
@@ -224,6 +235,9 @@ fn collect_tweakables(declarations: &Declarations, floats: &[(String, Vec<f32>)]
 pub struct EffectChain {
     quad: pass::Quad,
     passes: Vec<CompiledPass>,
+    /// The layer image uploaded at prepare time, for `PassTexture::LayerBase`
+    /// when the caller does not re-feed one.
+    base: glow::Texture,
     pub tweakables: Vec<Tweakable>,
 }
 
@@ -265,9 +279,12 @@ impl EffectChain {
                 .textures
                 .iter()
                 .map(|(name, texture)| {
-                    let texture = match (pass_index, base) {
-                        (0, Some(base)) if name == "g_Texture0" => base,
-                        _ => *texture,
+                    let texture = match *texture {
+                        PassTexture::LayerBase => base.unwrap_or(self.base),
+                        PassTexture::Fixed(handle) => match (pass_index, base) {
+                            (0, Some(base)) if name == "g_Texture0" => base,
+                            _ => handle,
+                        },
                     };
                     (name.as_str(), texture)
                 })
@@ -305,7 +322,8 @@ pub fn prepare_effect_chain(
     let (width, height) = (base.width(), base.height());
     let quad = pass::build_quad(gl)?;
 
-    let mut current = pass::upload_texture(gl, base)?;
+    let base_texture = pass::upload_texture(gl, base)?;
+    let mut current = base_texture;
     let mut current_size = (width, height);
     let mut passes = Vec::new();
     let mut tweakables = Vec::new();
@@ -347,8 +365,15 @@ pub fn prepare_effect_chain(
                 let program = pass::compile_program(gl, &vertex_glsl, &fragment_glsl)
                     .with_context(|| format!("compiling {stem}"))?;
 
-                let (textures, resolutions) =
-                    resolve_textures(gl, archive, &fragment_declarations, &effect_pass.textures, current, current_size)?;
+                let (textures, resolutions) = resolve_textures(
+                    gl,
+                    archive,
+                    &fragment_declarations,
+                    &effect_pass.textures,
+                    current,
+                    current_size,
+                    (width, height),
+                )?;
 
                 let mut floats = uniform_floats(&vertex_declarations, &effect_pass.constantshadervalues);
                 floats.extend(uniform_floats(&fragment_declarations, &effect_pass.constantshadervalues));
@@ -376,19 +401,19 @@ pub fn prepare_effect_chain(
     if passes.is_empty() {
         bail!("at least one pass must have run");
     }
-    Ok(EffectChain { quad, passes, tweakables })
+    Ok(EffectChain { quad, passes, base: base_texture, tweakables })
 }
 
 /// Bind every sampler the fragment shader declares: slot 0 is always the
-/// chain's running result, higher slots come from the pass's positional
-/// `textures[]` or the sampler's own annotation default.
+/// chain's running result, higher slots come from the pass's `textures[]` —
+/// indexed by slot number — or the sampler's own annotation default.
 ///
 /// Returns the bound textures alongside the `g_TextureNResolution` uniform
 /// each one implies — `(width, height, width, height)`, since nothing here
 /// packs textures into an atlas, the one case Wallpaper Engine uses the two
 /// halves of that vector to tell apart.
 /// Bound textures, and the `g_TextureNResolution` floats they imply.
-type BoundTextures = (Vec<(String, glow::Texture)>, Vec<(String, Vec<f32>)>);
+type BoundTextures = (Vec<(String, PassTexture)>, Vec<(String, Vec<f32>)>);
 
 fn resolve_textures(
     gl: &glow::Context,
@@ -397,6 +422,7 @@ fn resolve_textures(
     textures: &[Option<String>],
     current: glow::Texture,
     current_size: (u32, u32),
+    layer_size: (u32, u32),
 ) -> Result<BoundTextures> {
     let mut bound = Vec::new();
     let mut resolutions = Vec::new();
@@ -406,11 +432,15 @@ fn resolve_textures(
             continue;
         };
 
+        let name = textures.get(slot).and_then(Option::as_deref);
         let (texture, size) = if slot == 0 {
-            (current, current_size)
+            (PassTexture::Fixed(current), current_size)
+        } else if name.is_some_and(is_layer_composite_target) {
+            (PassTexture::LayerBase, layer_size)
         } else {
-            let name = slot.checked_sub(1).and_then(|index| textures.get(index)).and_then(Option::as_deref);
-            resolve_slot_texture(gl, archive, name, uniform.default.as_ref())?
+            let (texture, size) =
+                resolve_slot_texture(gl, archive, name.filter(|name| !is_render_target(name)), uniform.default.as_ref())?;
+            (PassTexture::Fixed(texture), size)
         };
 
         bound.push((uniform.name.clone(), texture));
@@ -420,6 +450,21 @@ fn resolve_textures(
     }
 
     Ok((bound, resolutions))
+}
+
+/// A `_rt_*` name is one of Wallpaper Engine's runtime render targets, not a
+/// file in the package — reading it as one is what used to drop a whole
+/// layer's chain.
+fn is_render_target(name: &str) -> bool {
+    name.starts_with("_rt_")
+}
+
+/// `_rt_imageLayerComposite_<id>_<slot>` is the layer's own image as it
+/// entered the effect chain. A `godrays`/`shine` chain's final `*_combine`
+/// pass samples it as the albedo it blends its rays back over, so without it
+/// the layer loses every effect it has.
+fn is_layer_composite_target(name: &str) -> bool {
+    name.starts_with("_rt_imageLayerComposite")
 }
 
 /// Load and upload one texture slot: the scene's own mask/map texture when

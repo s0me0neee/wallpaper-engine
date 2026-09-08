@@ -268,10 +268,14 @@ pub struct EffectPass {
     /// Material keys bound to shader uniforms for this pass.
     #[serde(default)]
     pub constantshadervalues: Map<String, Value>,
-    /// Texture slots, positionally bound to `g_Texture1`, `g_Texture2`, ...
-    /// (`g_Texture0` is always the previous pass and never appears here).
-    /// `null` means "use the shader's own annotation default", e.g.
-    /// `util/noflow`.
+    /// Texture slots, indexed by slot number: `textures[1]` is `g_Texture1`.
+    /// Entry 0 stands for `g_Texture0`, which is always the previous pass, and
+    /// is written as `null`. `null` elsewhere means "use the shader's own
+    /// annotation default", e.g. `util/noflow`.
+    ///
+    /// The corpus pins the indexing down: `shake`'s pass writes `util/white`
+    /// at index 2 and `godrays_downsample2`'s writes `util/clouds_256` at
+    /// index 2, each the declared default of that shader's `g_Texture2`.
     #[serde(default)]
     pub textures: Vec<Option<String>>,
 }

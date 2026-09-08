@@ -67,18 +67,18 @@ pub fn resolve(declarations: &Declarations, material: &Map<String, Value>) -> Ve
 /// "combo":"MASK"}`) that the shader expects to be `1` exactly when that slot
 /// is actually bound — this is how `shake.frag`'s `MASK` and `TIMEOFFSET`
 /// combos get set without scene.json ever mentioning them by name.
-/// `textures[i]` binds `g_Texture{i+1}`; `g_Texture0` is always the previous
-/// pass and is never switched by this.
+/// `textures[i]` binds `g_Texture{i}`; entry 0 stands for the previous pass
+/// and is always null, so it is never switched by this.
 pub fn texture_combos(declarations: &Declarations, textures: &[Option<String>]) -> BTreeMap<String, i64> {
     let mut combos = BTreeMap::new();
     for uniform in &declarations.uniforms {
         let (Some(combo), Some(slot)) = (&uniform.combo, sampler_slot(&uniform.name)) else {
             continue;
         };
-        let Some(index) = slot.checked_sub(1) else {
+        if slot == 0 {
             continue; // slot 0 is the previous pass, not a positional entry.
-        };
-        let bound = textures.get(index).is_some_and(Option::is_some);
+        }
+        let bound = textures.get(slot).is_some_and(Option::is_some);
         combos.insert(combo.clone(), i64::from(bound));
     }
     combos
@@ -205,16 +205,28 @@ mod tests {
 
     #[test]
     fn a_bound_texture_slot_switches_on_its_combo() {
-        // Verbatim shape from shake.frag: g_Texture2 is TIMEOFFSET, g_Texture3
-        // is MASK; textures[] positionally binds g_Texture1.. onward.
+        // Verbatim shape from waterwaves.frag, whose g_Texture1 is the opacity
+        // mask, with the entry scene.json actually writes for it. The array is
+        // indexed by slot number, so the mask lands in slot 1 and MASK is on —
+        // reading it as slot 1 = textures[0] leaves every mask unbound, and the
+        // effect then warps the whole layer instead of the painted region.
+        let declarations = parse("uniform sampler2D g_Texture1; // {\"combo\":\"MASK\"}\n");
+        let textures = vec![None, Some("masks/waterwaves_mask_beb0a0a6".to_string())];
+        assert_eq!(texture_combos(&declarations, &textures).get("MASK"), Some(&1));
+    }
+
+    #[test]
+    fn an_unbound_texture_slot_switches_its_combo_off() {
+        // shake.frag's own layout: the scene fills slots 1 and 2 and leaves
+        // the MASK slot empty.
         let declarations = parse(concat!(
             "uniform sampler2D g_Texture2; // {\"combo\":\"TIMEOFFSET\"}\n",
             "uniform sampler2D g_Texture3; // {\"combo\":\"MASK\"}\n",
         ));
-        let textures = vec![None, Some("masks/shake_mask".to_string())];
+        let textures = vec![None, Some("masks/shake_mask".to_string()), Some("util/white".to_string())];
         let combos = texture_combos(&declarations, &textures);
-        assert_eq!(combos.get("TIMEOFFSET"), Some(&1), "textures[1] is bound");
-        assert_eq!(combos.get("MASK"), Some(&0), "textures[2] is out of range");
+        assert_eq!(combos.get("TIMEOFFSET"), Some(&1), "textures[2] is bound");
+        assert_eq!(combos.get("MASK"), Some(&0), "textures[3] is out of range");
     }
 
     #[test]

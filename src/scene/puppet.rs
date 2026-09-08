@@ -1,8 +1,8 @@
 //! Wallpaper Engine puppet-warp models (`models/*_puppet.mdl`).
 //!
 //! A puppet layer is a textured 2D triangle mesh with a small bone skeleton
-//! and one or more baked animation clips (per-bone translation + Z rotation
-//! frames). Playing it means: sample the referenced clip at `g_Time`, build a
+//! and one or more baked animation clips (per-bone translation, Z rotation and
+//! scale frames). Playing it means: sample the referenced clip at `g_Time`, build a
 //! skin transform per bone (`animated_world * bind_world⁻¹`), blend each
 //! vertex by its bone weights, then rasterize the deformed mesh through the
 //! layer's texture. The result replaces the flat layer image in the per-layer
@@ -59,13 +59,19 @@ pub struct Bone {
     pub parent: i32,
 }
 
-/// One sampled bone pose: local translation plus rotation about Z (radians).
+/// One sampled bone pose: local translation, rotation about Z (radians) and
+/// axis scale. Scale carries the blinks — an eye clip squashes `scale_y` to
+/// ~0 and leaves translation and rotation almost untouched.
 #[derive(Clone, Copy)]
 pub struct Pose {
     pub x: f32,
     pub y: f32,
     pub rotation: f32,
+    pub scale_x: f32,
+    pub scale_y: f32,
 }
+
+pub const POSE_REST: Pose = Pose { x: 0.0, y: 0.0, rotation: 0.0, scale_x: 1.0, scale_y: 1.0 };
 
 pub struct Animation {
     pub id: u32,
@@ -230,8 +236,10 @@ fn parse_animations(cursor: &mut Cursor<&[u8]>, bone_count: usize) -> Result<Vec
                 skip(cursor, 4)?; // translation z
                 skip(cursor, 8)?; // euler x, y
                 let rotation = cursor.read_f32::<LittleEndian>()?; // euler z
-                skip(cursor, 12)?; // scale x, y, z
-                poses.push(Pose { x, y, rotation });
+                let scale_x = cursor.read_f32::<LittleEndian>()?;
+                let scale_y = cursor.read_f32::<LittleEndian>()?;
+                skip(cursor, 4)?; // scale z
+                poses.push(Pose { x, y, rotation, scale_x, scale_y });
             }
             tracks.push(poses);
         }
@@ -268,9 +276,18 @@ pub struct Affine {
 
 pub const AFFINE_IDENTITY: Affine = Affine { a: 1.0, b: 0.0, c: 0.0, d: 1.0, tx: 0.0, ty: 0.0 };
 
-fn affine_trs(x: f32, y: f32, rotation: f32) -> Affine {
-    let (sin, cos) = rotation.sin_cos();
-    Affine { a: cos, b: sin, c: -sin, d: cos, tx: x, ty: y }
+/// `translate · rotate · scale`, the order Wallpaper Engine composes a bone's
+/// local transform in.
+fn affine_trs(pose: Pose) -> Affine {
+    let (sin, cos) = pose.rotation.sin_cos();
+    Affine {
+        a: cos * pose.scale_x,
+        b: sin * pose.scale_x,
+        c: -sin * pose.scale_y,
+        d: cos * pose.scale_y,
+        tx: pose.x,
+        ty: pose.y,
+    }
 }
 
 fn affine_mul(m: Affine, n: Affine) -> Affine {
@@ -309,8 +326,8 @@ fn affine_apply(m: Affine, x: f32, y: f32) -> (f32, f32) {
 fn world_transforms(bones: &[Bone], poses: &[Pose]) -> PerBone<Affine> {
     let mut world: PerBone<Affine> = smallvec::smallvec![AFFINE_IDENTITY; bones.len()];
     for (index, bone) in bones.iter().enumerate() {
-        let pose = poses.get(index).copied().unwrap_or(Pose { x: 0.0, y: 0.0, rotation: 0.0 });
-        let local = affine_trs(pose.x, pose.y, pose.rotation);
+        let pose = poses.get(index).copied().unwrap_or(POSE_REST);
+        let local = affine_trs(pose);
         world[index] = if bone.parent >= 0 && (bone.parent as usize) < index {
             affine_mul(world[bone.parent as usize], local)
         } else {
@@ -347,6 +364,8 @@ fn sample_poses(animation: &Animation, time: f32, rate: f32) -> PerBone<Pose> {
             x: start.x + (end.x - start.x) * fraction,
             y: start.y + (end.y - start.y) * fraction,
             rotation: start.rotation + (end.rotation - start.rotation) * fraction,
+            scale_x: start.scale_x + (end.scale_x - start.scale_x) * fraction,
+            scale_y: start.scale_y + (end.scale_y - start.scale_y) * fraction,
         })
         .collect()
 }
@@ -544,7 +563,10 @@ mod tests {
 
     #[test]
     fn affine_inverse_round_trips() {
-        let m = affine_mul(affine_trs(12.0, -4.0, 0.7), Affine { a: 1.3, b: 0.0, c: 0.0, d: 0.8, tx: 0.0, ty: 0.0 });
+        let m = affine_mul(
+            affine_trs(Pose { x: 12.0, y: -4.0, rotation: 0.7, ..POSE_REST }),
+            Affine { a: 1.3, b: 0.0, c: 0.0, d: 0.8, tx: 0.0, ty: 0.0 },
+        );
         let round = affine_mul(m, affine_inv(m));
         assert!((round.a - 1.0).abs() < 1e-4 && round.b.abs() < 1e-4);
         assert!((round.d - 1.0).abs() < 1e-4 && round.c.abs() < 1e-4);
@@ -564,8 +586,14 @@ mod tests {
                 mirrors: false,
                 fps: 30.0,
                 frames: vec![
-                    vec![Pose { x: 5.0, y: 2.0, rotation: 0.1 }, Pose { x: 3.0, y: 0.0, rotation: -0.2 }],
-                    vec![Pose { x: 9.0, y: 7.0, rotation: 0.4 }, Pose { x: 1.0, y: 5.0, rotation: 0.3 }],
+                    vec![
+                        Pose { x: 5.0, y: 2.0, rotation: 0.1, ..POSE_REST },
+                        Pose { x: 3.0, y: 0.0, rotation: -0.2, ..POSE_REST },
+                    ],
+                    vec![
+                        Pose { x: 9.0, y: 7.0, rotation: 0.4, scale_x: 0.5, scale_y: 0.2 },
+                        Pose { x: 1.0, y: 5.0, rotation: 0.3, scale_x: 1.4, scale_y: 0.0 },
+                    ],
                 ],
             }],
         };
@@ -574,6 +602,26 @@ mod tests {
             assert!(skin.b.abs() < 1e-4 && skin.c.abs() < 1e-4);
             assert!(skin.tx.abs() < 1e-3 && skin.ty.abs() < 1e-3);
         }
+    }
+
+    #[test]
+    fn a_scale_only_clip_still_squashes_the_mesh() {
+        // How an eye blinks: translation and rotation hold still and `scale_y`
+        // collapses. Dropping the scale channel makes such a clip a no-op.
+        let puppet = Puppet {
+            vertices: vec![Vertex { x: 0.0, y: 10.0, u: 0.0, v: 0.0, bones: [0, 0, 0, 0], weights: [1.0, 0.0, 0.0, 0.0] }],
+            triangles: vec![],
+            bones: vec![Bone { parent: -1 }],
+            animations: vec![Animation {
+                id: 1,
+                mirrors: false,
+                fps: 1.0,
+                frames: vec![vec![POSE_REST], vec![Pose { scale_y: 0.0, ..POSE_REST }]],
+            }],
+        };
+        // Half way to the flattened frame, so the sample does not wrap round.
+        let squashed = deform(&puppet, &skin_transforms(&puppet, Some(1), 0.5, 1.0));
+        assert!((squashed[0].1 - 5.0).abs() < 1e-3, "scale_y should halve y, got {}", squashed[0].1);
     }
 
     #[test]
