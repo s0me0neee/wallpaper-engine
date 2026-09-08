@@ -272,6 +272,53 @@ pub fn draw(gl: &glow::Context, call: &DrawCall) -> Result<()> {
     Ok(())
 }
 
+/// A trivial passthrough program: samples one texture and draws it fullscreen
+/// onto whichever framebuffer is bound. Its own attribute locations are
+/// pinned explicitly, unlike the effect passes' shim-translated shaders,
+/// since this one is ours to write from scratch.
+pub struct BlitProgram {
+    program: Program,
+}
+
+const BLIT_VERTEX: &str = "#version 330 core\n\
+    layout(location = 0) in vec3 a_Position;\n\
+    layout(location = 1) in vec2 a_TexCoord;\n\
+    out vec2 v_TexCoord;\n\
+    void main() {\n\
+        v_TexCoord = a_TexCoord;\n\
+        gl_Position = vec4(a_Position, 1.0);\n\
+    }\n";
+const BLIT_FRAGMENT: &str = "#version 330 core\n\
+    in vec2 v_TexCoord;\n\
+    out vec4 o_Color;\n\
+    uniform sampler2D u_Texture;\n\
+    void main() {\n\
+        o_Color = texture(u_Texture, v_TexCoord);\n\
+    }\n";
+
+pub fn compile_blit_program(gl: &glow::Context) -> Result<BlitProgram> {
+    Ok(BlitProgram { program: compile_program(gl, BLIT_VERTEX, BLIT_FRAGMENT)? })
+}
+
+/// Draw `texture` fullscreen to the window (framebuffer 0), stretched to
+/// `width`x`height`.
+pub fn blit_to_screen(gl: &glow::Context, blit: &BlitProgram, quad: &Quad, texture: glow::Texture, width: i32, height: i32) {
+    unsafe {
+        gl.bind_framebuffer(glow::FRAMEBUFFER, None);
+        gl.viewport(0, 0, width, height);
+        gl.use_program(Some(blit.program.handle));
+        gl.bind_vertex_array(Some(quad.vertex_array));
+        gl.active_texture(glow::TEXTURE0);
+        gl.bind_texture(glow::TEXTURE_2D, Some(texture));
+        if let Some(location) = gl.get_uniform_location(blit.program.handle, "u_Texture") {
+            gl.uniform_1_i32(Some(&location), 0);
+        }
+        gl.draw_arrays(glow::TRIANGLE_STRIP, 0, 4);
+        gl.bind_vertex_array(None);
+        gl.use_program(None);
+    }
+}
+
 fn bind_sampler(gl: &glow::Context, program: glow::Program, name: &str, texture: glow::Texture, unit: usize) {
     let Some(location) = (unsafe { gl.get_uniform_location(program, name) }) else {
         return;

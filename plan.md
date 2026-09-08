@@ -8,7 +8,9 @@ effects baked in.
 verified against a six-wallpaper corpus. The Scene renderer now runs the real
 GPU effect chain for the common one-image-plus-effects shape (§4); richer
 scenes (multiple image layers, particles) still fall back to the effect-free
-composite. Web capture is still to build.
+composite. A `simulate` subcommand plays that same chain live in a real window
+at wall-clock speed, ahead of video export existing (§10, §11). Web capture is
+still to build.
 
 ---
 
@@ -196,6 +198,26 @@ Confirmed in practice: re-rendering the same timestamp twice is byte-identical.
 - **`util/noise` has no synthesized default yet**, unlike `util/noflow` and
   `util/black`; `foliagesway`'s noise-driven wobble falls back to flat black
   until one exists. Documented gap, not a silent one.
+- **Compiling a chain is separate from redrawing it.** `scene::render::EffectChain`
+  splits shader compilation, texture uploads and `scene.json` parsing (done
+  once, in `prepare_effect_chain`) from the actual draw calls (`EffectChain::render`,
+  called with a new `g_Time` every frame). One-shot export and the live
+  simulator both build on this; only the simulator calls `render` more than
+  once per chain.
+
+### 4.6 Live simulator
+
+`wallpaper-engine simulate <wallpaper>` opens a real window (`winit` +
+`glutin-winit`, GL 3.3 core same as the headless exporter) and redraws the
+compiled chain every frame with `g_Time = start.elapsed()`, blitting the
+result straight to the window instead of reading it back to the CPU. Only
+`g_Time` is live; every other input Wallpaper Engine can feed a shader —
+pointer position, system audio spectrum, time-of-day sync, now-playing
+media — is not wired up (deliberately, for now: none of it is exercised by
+this scene, and system audio loopback in particular is nontrivial on macOS,
+needing a virtual device or a `ScreenCaptureKit` audio tap). A scene without
+the one-image-plus-effects shape just shows the static composite in the
+window rather than refusing to open one.
 
 ---
 
@@ -374,9 +396,10 @@ Expect to stub WE's JS API (`window.wallpaperPropertyListener`,
 Built:
 
 ```
-wallpaper-engine info    <wallpaper-dir>
-wallpaper-engine export  <wallpaper-dir> [OPTIONS]
-wallpaper-engine shaders <wallpaper-dir> [OPTIONS]
+wallpaper-engine info     <wallpaper-dir>
+wallpaper-engine export   <wallpaper-dir> [OPTIONS]
+wallpaper-engine shaders  <wallpaper-dir> [OPTIONS]
+wallpaper-engine simulate <wallpaper-dir>   # Scene only; opens a live window
 
   --out DIR              parent directory for the wallpaper's own output
                          folder (default: the current directory), named
@@ -430,6 +453,7 @@ Each phase ships something independently useful.
 | ~~**1. Type routing + Video passthrough**~~ | **Done.** `project.json` parsing; Video wallpapers export with no rendering at all | Low |
 | ~~**2. Scene model + still export**~~ | **Done.** serde types for scene/effect/material; correct-resolution base PNG | Low |
 | ~~**3. Shader pipeline**~~ | **Done** for the one-image-layer shape: preprocessor, shim, headless glow/glutin context, the full effect chain per `--frame` timestamp. Verified deterministic (byte-identical re-renders) and animated (distinct frames at t=0 vs t=30 on `scene_example1`). Multi-layer/particle scenes (`scene_example2`) still fall back to the effect-free composite | **High**, now landed |
+| ~~**3.5. Live simulator**~~ | **Done.** `simulate` plays the same compiled chain in a real window at wall-clock speed instead of one still per run (§4.6). Only `g_Time` is live — no mouse/audio/daytime input yet | Low |
 | **4. Animation + video** | `g_Time` sweep across a whole video's worth of frames, loop detection, feeding the chain's output into `export::video` instead of one still | Medium |
 | **5. Web capture** | Local server, headless Chrome, virtual-time frames | Medium |
 

@@ -14,6 +14,7 @@ mod reader;
 mod render;
 mod scene;
 mod shader;
+mod simulate;
 mod tex;
 
 use anyhow::{Context, Result, bail};
@@ -44,6 +45,14 @@ enum Command {
     Tex(TexArgs),
     /// Preprocess a scene's shaders into compilable GLSL.
     Shaders(ShadersArgs),
+    /// Open a live window playing a scene's effect chain in real time.
+    Simulate(SimulateArgs),
+}
+
+#[derive(Args)]
+struct SimulateArgs {
+    /// Wallpaper directory, or its project.json. Must be a Scene wallpaper.
+    wallpaper: PathBuf,
 }
 
 #[derive(Args)]
@@ -541,6 +550,25 @@ fn run_export(args: &ExportArgs) -> Result<()> {
     }
 }
 
+/// Open a live window playing a scene wallpaper's effect chain in real time.
+fn run_simulate(args: &SimulateArgs) -> Result<()> {
+    let project = project::load(&args.wallpaper)?;
+    if project.kind != Kind::Scene {
+        bail!("only Scene wallpapers can be simulated (this one is {})", project.kind);
+    }
+    if let Some(reason) = unsupported_reason(&project) {
+        bail!("cannot simulate {}: {reason}", project::display_name(&project));
+    }
+
+    let package = project::require_package(&project)?;
+    let mut archive = pkg::Archive::open(package)?;
+    let scene = scene::load(&mut archive)?;
+
+    let title = project::display_name(&project);
+    println!("{title}");
+    simulate::run(&mut archive, &scene, title)
+}
+
 fn main() -> Result<()> {
     match Cli::parse().command {
         Command::Export(args) => run_export(&args),
@@ -548,6 +576,7 @@ fn main() -> Result<()> {
         Command::Unpack(args) => run_unpack(&args),
         Command::Tex(args) => run_tex(&args),
         Command::Shaders(args) => run_shaders(&args),
+        Command::Simulate(args) => run_simulate(&args),
     }
 }
 

@@ -14,6 +14,11 @@ ffmpeg-next = "9.0.0"
 glow = "0.18.0"
 glsl-include = "0.3.1"
 glutin = "0.32.3"
+# Wires a glutin GL context to a real winit window, for the live simulator —
+# the headless exporter still uses the hidden-NSWindow trick above instead.
+# Its default features are all Linux windowing systems (x11/wayland/egl/wgl);
+# CGL, macOS's, needs none of them.
+glutin-winit = { version = "0.5", default-features = false }
 image = { version = "0.25.10", default-features = false, features = [
 	"png",
 	"jpeg",
@@ -45,6 +50,9 @@ serde_json = "1.0.151"
 # BC1/BC2/BC3 decoding for DXT1/DXT3/DXT5 textures.
 texpresso = "2.0.2"
 walkdir = "2.5.0"
+# The simulator's visible window and event loop. `rwh_06` is the
+# raw-window-handle version glutin-winit 0.5 bridges through.
+winit = { version = "0.30", default-features = false, features = ["rwh_06"] }
 
 [lints.clippy]
 pedantic = { level = "deny", priority = -1 }
