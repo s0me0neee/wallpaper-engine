@@ -1,70 +1,29 @@
-//! Thin wrapper around the `ffmpeg` and `ffprobe` binaries.
+//! In-process libav access through the `ffmpeg-next` bindings.
 //!
-//! Deliberately a subprocess rather than `libav` bindings: it keeps the build
-//! free of native library pain, and ffmpeg's CLI is a far more stable contract
-//! than its C API. Arguments are passed as a vector, never a shell string —
-//! wallpaper filenames contain spaces and CJK text, and no shell ever sees them.
+//! No ffmpeg binary is involved at runtime — the export pipelines link
+//! libavformat/libavcodec/libavfilter directly, so an export behaves the same
+//! whatever happens to be on the user's PATH. The trade is at build time: the
+//! ffmpeg development libraries must be installed (`brew install ffmpeg`, or
+//! `libavcodec-dev` and friends).
 
-use anyhow::{Context, Result, bail};
-use serde::Deserialize;
-use std::{
-    ffi::OsStr,
-    path::Path,
-    process::{Command, Stdio},
-};
+use anyhow::{Context, Result, anyhow};
+use ffmpeg::media::Type;
+use ffmpeg_next as ffmpeg;
+use std::{path::Path, sync::OnceLock};
 
-/// Override for either binary, so a user with a non-PATH build can point at it.
-fn binary(tool: &str) -> String {
-    let variable = tool.to_ascii_uppercase();
-    std::env::var(&variable).unwrap_or_else(|_| tool.to_string())
-}
-
-/// Check that both binaries are runnable, with an actionable message if not.
-pub fn require() -> Result<()> {
-    for tool in ["ffmpeg", "ffprobe"] {
-        let status = Command::new(binary(tool))
-            .arg("-version")
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
-
-        match status {
-            Ok(status) if status.success() => {}
-            Ok(status) => bail!("`{tool} -version` failed with {status}"),
-            Err(error) => bail!(
-                "cannot run `{tool}`: {error}. Install ffmpeg, or set the \
-                 {} environment variable to its path.",
-                tool.to_ascii_uppercase()
-            ),
-        }
-    }
-    Ok(())
-}
-
-/// Run ffmpeg, surfacing its own diagnostics when it fails.
-///
-/// ffmpeg writes everything to stderr and is extremely verbose, so on success
-/// it is discarded and on failure only the tail is kept — the last few lines
-/// carry the actual reason, the rest is codec banners.
-pub fn run<I, S>(args: I) -> Result<()>
-where
-    I: IntoIterator<Item = S>,
-    S: AsRef<OsStr>,
-{
-    let output = Command::new(binary("ffmpeg"))
-        .args(["-hide_banner", "-nostdin", "-loglevel", "error", "-y"])
-        .args(args)
-        .stdout(Stdio::null())
-        .output()
-        .context("running ffmpeg")?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let tail: Vec<&str> = stderr.lines().rev().take(6).collect();
-        let tail: Vec<&str> = tail.into_iter().rev().collect();
-        bail!("ffmpeg failed ({}): {}", output.status, tail.join("; "));
-    }
-    Ok(())
+/// libav's global setup, run at most once per process.
+pub fn init() -> Result<()> {
+    static READY: OnceLock<std::result::Result<(), String>> = OnceLock::new();
+    READY
+        .get_or_init(|| {
+            ffmpeg::init().map_err(|error| error.to_string())?;
+            // libav logs to stderr uninvited, and at anything above Error it
+            // narrates every packet it mishandles.
+            ffmpeg::log::set_level(ffmpeg::log::Level::Error);
+            Ok(())
+        })
+        .clone()
+        .map_err(|error| anyhow!("initialising libav: {error}"))
 }
 
 /// What we need to know about a source video before re-encoding it.
@@ -80,150 +39,96 @@ pub struct MediaInfo {
     pub has_audio: bool,
 }
 
-#[derive(Deserialize)]
-struct ProbeOutput {
-    #[serde(default)]
-    streams: Vec<ProbeStream>,
-    #[serde(default)]
-    format: ProbeFormat,
-}
-
-#[derive(Deserialize)]
-struct ProbeStream {
-    #[serde(default)]
-    codec_type: String,
-    #[serde(default)]
-    codec_name: String,
-    #[serde(default)]
-    width: Option<u32>,
-    #[serde(default)]
-    height: Option<u32>,
-    #[serde(default)]
-    pix_fmt: Option<String>,
-    #[serde(default)]
-    avg_frame_rate: Option<String>,
-    #[serde(default)]
-    r_frame_rate: Option<String>,
-    #[serde(default)]
-    duration: Option<String>,
-}
-
-#[derive(Default, Deserialize)]
-struct ProbeFormat {
-    #[serde(default)]
-    duration: Option<String>,
-}
-
-/// Parse ffprobe's rational frame rate, e.g. `"60/1"` or `"30000/1001"`.
+/// Convert a stream's rational rate to fps.
 ///
-/// A zero denominator or numerator means "unknown", which ffprobe reports for
-/// streams with no meaningful rate (audio, single images) — not an error.
-fn parse_rational(value: &str) -> Option<f64> {
-    let (numerator, denominator) = value.split_once('/')?;
-    let numerator: f64 = numerator.trim().parse().ok()?;
-    let denominator: f64 = denominator.trim().parse().ok()?;
-    if numerator <= 0.0 || denominator <= 0.0 {
+/// libav writes 0/0 for streams with no meaningful rate (audio, single
+/// images), which is "unknown" rather than an error.
+pub fn rate_to_fps(rate: ffmpeg::Rational) -> Option<f64> {
+    if rate.numerator() <= 0 || rate.denominator() <= 0 {
         return None;
     }
-    Some(numerator / denominator)
+    Some(f64::from(rate))
+}
+
+/// Open `path` and build a decoder for its best video stream.
+///
+/// Returns the input context alongside the stream index, because the caller
+/// needs the index to tell that stream's packets apart while demuxing.
+pub fn open_video(
+    path: &Path,
+) -> Result<(ffmpeg::format::context::Input, usize, ffmpeg::decoder::Video)> {
+    init()?;
+    let ictx = ffmpeg::format::input(path)
+        .with_context(|| format!("opening {}", path.display()))?;
+    let stream = ictx
+        .streams()
+        .best(Type::Video)
+        .with_context(|| format!("{} has no video stream", path.display()))?;
+    let index = stream.index();
+    let decoder = ffmpeg::codec::context::Context::from_parameters(stream.parameters())
+        .and_then(|context| context.decoder().video())
+        .with_context(|| format!("opening the video decoder for {}", path.display()))?;
+    Ok((ictx, index, decoder))
 }
 
 /// Read the dimensions, frame rate and duration of a media file.
 pub fn probe(path: &Path) -> Result<MediaInfo> {
-    let output = Command::new(binary("ffprobe"))
-        .args([
-            "-v",
-            "error",
-            "-print_format",
-            "json",
-            "-show_streams",
-            "-show_format",
-        ])
-        .arg(path)
-        .output()
-        .with_context(|| format!("probing {}", path.display()))?;
+    let (ictx, index, decoder) = open_video(path)?;
+    let stream = ictx
+        .stream(index)
+        .expect("the index came from this context");
 
-    if !output.status.success() {
-        bail!(
-            "ffprobe could not read {}: {}",
-            path.display(),
-            String::from_utf8_lossy(&output.stderr).trim()
-        );
-    }
+    // Prefer the container duration: a stream may omit it, and for our
+    // purposes the whole-file length is what a loop is measured against.
+    let duration = if ictx.duration() > 0 {
+        ictx.duration() as f64 / f64::from(ffmpeg::ffi::AV_TIME_BASE)
+    } else if stream.duration() > 0 {
+        stream.duration() as f64 * f64::from(stream.time_base())
+    } else {
+        0.0
+    };
 
-    let probe: ProbeOutput = serde_json::from_slice(&output.stdout)
-        .with_context(|| format!("parsing ffprobe output for {}", path.display()))?;
-
-    let video = probe
-        .streams
-        .iter()
-        .find(|stream| stream.codec_type == "video")
-        .with_context(|| format!("{} has no video stream", path.display()))?;
-
-    let has_audio = probe
-        .streams
-        .iter()
-        .any(|stream| stream.codec_type == "audio");
-
-    // Prefer the container duration: a stream may omit it, and for our purposes
-    // the whole-file length is what a loop is measured against.
-    let duration = probe
-        .format
-        .duration
-        .as_deref()
-        .or(video.duration.as_deref())
-        .and_then(|value| value.parse::<f64>().ok())
+    let fps = rate_to_fps(stream.avg_frame_rate())
+        .or_else(|| rate_to_fps(stream.rate()))
         .unwrap_or(0.0);
 
-    let fps = video
-        .avg_frame_rate
-        .as_deref()
-        .and_then(parse_rational)
-        .or_else(|| video.r_frame_rate.as_deref().and_then(parse_rational))
-        .unwrap_or(0.0);
+    let codec = ffmpeg::decoder::find(stream.parameters().id())
+        .map(|codec| codec.name().to_string())
+        .unwrap_or_default();
 
     Ok(MediaInfo {
-        width: video.width.unwrap_or(0),
-        height: video.height.unwrap_or(0),
+        width: decoder.width(),
+        height: decoder.height(),
         fps,
         duration,
-        codec: video.codec_name.clone(),
-        pixel_format: video.pix_fmt.clone().unwrap_or_default(),
-        has_audio,
+        codec,
+        pixel_format: decoder
+            .format()
+            .descriptor()
+            .map(|descriptor| descriptor.name().to_string())
+            .unwrap_or_default(),
+        has_audio: ictx.streams().best(Type::Audio).is_some(),
     })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ffmpeg::Rational;
 
     #[test]
-    fn parses_rational_frame_rates() {
-        assert_eq!(parse_rational("60/1"), Some(60.0));
-        assert_eq!(parse_rational("30000/1001").map(|v| (v * 100.0).round()), Some(2997.0));
+    fn converts_rational_frame_rates() {
+        assert_eq!(rate_to_fps(Rational(60, 1)), Some(60.0));
+        assert_eq!(
+            rate_to_fps(Rational(30000, 1001)).map(|fps| (fps * 100.0).round()),
+            Some(2997.0)
+        );
     }
 
     #[test]
     fn treats_an_unknown_frame_rate_as_absent() {
-        // ffprobe writes 0/0 for streams with no meaningful rate.
-        assert_eq!(parse_rational("0/0"), None);
-        assert_eq!(parse_rational("25"), None);
-        assert_eq!(parse_rational(""), None);
-    }
-
-    #[test]
-    fn reads_a_probe_document() {
-        let json = r#"{
-            "streams":[
-                {"codec_type":"video","codec_name":"h264","width":2560,"height":1440,
-                 "pix_fmt":"yuv420p","avg_frame_rate":"60/1","r_frame_rate":"60/1"},
-                {"codec_type":"audio","codec_name":"aac","avg_frame_rate":"0/0"}
-            ],
-            "format":{"duration":"27.066667"}
-        }"#;
-        let probe: ProbeOutput = serde_json::from_str(json).unwrap();
-        assert_eq!(probe.streams.len(), 2);
-        assert_eq!(probe.streams[0].width, Some(2560));
-        assert_eq!(probe.format.duration.as_deref(), Some("27.066667"));
+        assert_eq!(rate_to_fps(Rational(0, 0)), None);
+        assert_eq!(rate_to_fps(Rational(25, 0)), None);
+        assert_eq!(rate_to_fps(Rational(-1, 1)), None);
     }
 }

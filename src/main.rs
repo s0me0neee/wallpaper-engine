@@ -12,6 +12,7 @@ mod pkg;
 mod project;
 mod reader;
 mod scene;
+mod shader;
 mod tex;
 
 use anyhow::{Context, Result, bail};
@@ -43,6 +44,23 @@ enum Command {
     Unpack(UnpackArgs),
     /// Decode .tex textures to PNG.
     Tex(TexArgs),
+    /// Preprocess a scene's shaders into compilable GLSL.
+    Shaders(ShadersArgs),
+}
+
+#[derive(Args)]
+struct ShadersArgs {
+    /// Wallpaper directory, or its project.json.
+    wallpaper: PathBuf,
+
+    /// Directory to write the preprocessed GLSL into.
+    #[arg(short, long, default_value = "shaders")]
+    out: PathBuf,
+
+    /// Read the real common*.h from a Wallpaper Engine install instead of
+    /// using our shim. Never redistributed — read from your own install.
+    #[arg(long)]
+    we_assets: Option<PathBuf>,
 }
 
 #[derive(Args)]
@@ -193,6 +211,68 @@ fn run_tex(args: &TexArgs) -> Result<()> {
     Ok(())
 }
 
+/// Preprocess every shader in a scene package into compilable GLSL.
+///
+/// A debugging tool for the renderer: the combo values are all defaulted to 0
+/// rather than resolved per effect pass, so what comes out is the base variant
+/// of each shader. It exists to answer "does the shim cover this wallpaper?"
+/// without needing a GPU.
+fn run_shaders(args: &ShadersArgs) -> Result<()> {
+    let project = project::load(&args.wallpaper)?;
+    let package = project::require_package(&project)?;
+    let mut archive = pkg::Archive::open(package)?;
+
+    let headers = match &args.we_assets {
+        Some(root) => shader::shim::headers_from_install(root)?,
+        None => shader::shim::headers(),
+    };
+
+    let mut targets: Vec<String> = archive
+        .paths()
+        .filter(|path| path.ends_with(".frag") || path.ends_with(".vert"))
+        .map(str::to_string)
+        .collect();
+    targets.sort();
+
+    if targets.is_empty() {
+        bail!("{} contains no shaders", package.display());
+    }
+    std::fs::create_dir_all(&args.out)?;
+
+    let mut failures = 0;
+    for name in &targets {
+        let stage = if name.ends_with(".vert") {
+            shader::preprocess::Stage::Vertex
+        } else {
+            shader::preprocess::Stage::Fragment
+        };
+
+        let source = String::from_utf8(archive.read(name)?)
+            .with_context(|| format!("{name} is not valid UTF-8"))?;
+
+        // Combos default to 0 here; the renderer will supply real values.
+        let combos = std::collections::BTreeMap::new();
+        match shader::preprocess::build(&source, stage, &headers, &combos) {
+            Ok(glsl) => {
+                let stem = name.replace('/', "_");
+                let target = args.out.join(format!("{stem}.glsl"));
+                std::fs::write(&target, glsl)?;
+                println!("  {} -> {}", name, target.display());
+            }
+            Err(error) => {
+                eprintln!("error: {name}: {error:#}");
+                failures += 1;
+            }
+        }
+    }
+
+    println!("\n{} shader(s) written to {}/", targets.len() - failures, args.out.display());
+    if failures > 0 {
+        bail!("{failures} of {} shaders failed", targets.len());
+    }
+    Ok(())
+}
+
 /// A filesystem-safe stem for the exported files.
 ///
 /// Titles are unusable here: real ones contain `/`, `|`, brackets and CJK.
@@ -320,7 +400,7 @@ fn run_info(args: &InfoArgs) -> Result<()> {
 /// Video wallpapers ship a finished looping file; exporting is packaging.
 fn export_video(project: &Project, stem: &str, options: &Options) -> Result<()> {
     let source = project::require_entry(project)?;
-    export::ffmpeg::require()?;
+    export::ffmpeg::init()?;
 
     let info = export::ffmpeg::probe(source)?;
     println!(
@@ -429,6 +509,7 @@ fn main() -> Result<()> {
         Some(Command::Info(args)) => run_info(&args),
         Some(Command::Unpack(args)) => run_unpack(&args),
         Some(Command::Tex(args)) => run_tex(&args),
+        Some(Command::Shaders(args)) => run_shaders(&args),
         // No subcommand: run the whole pipeline with default paths.
         None => {
             let unpack_args = UnpackArgs::default();

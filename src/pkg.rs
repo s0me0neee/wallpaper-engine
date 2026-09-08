@@ -119,6 +119,11 @@ impl Archive {
         })
     }
 
+    /// Every entry path in the archive, in no particular order.
+    pub fn paths(&self) -> impl Iterator<Item = &str> {
+        self.index.values().map(|entry| entry.path.as_str())
+    }
+
     /// Read one entry into memory.
     pub fn read(&mut self, path: &str) -> Result<Vec<u8>> {
         let entry = self

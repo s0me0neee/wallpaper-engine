@@ -6,6 +6,11 @@ edition = "2024"
 [dependencies]
 anyhow = "1.0.104"
 clap = { version = "4.6.6", features = ["derive"] }
+# libav bindings, used in-process instead of driving the ffmpeg CLI. Needs the
+# ffmpeg development libraries at build time (`brew install ffmpeg`), and the
+# major version tracks ffmpeg's own — 9.x builds against ffmpeg 9.
+ffmpeg-next = "9.0.0"
+glsl-include = "0.3.1"
 image = { version = "0.25.10", default-features = false, features = ["png", "jpeg", "gif", "bmp", "tga", "rayon"] }
 # Wallpaper Engine stores bare LZ4 *blocks* with no length prefix, so only the
 # block API is used. `safe-decode` keeps the hot path free of `unsafe`, which
@@ -18,11 +23,29 @@ lz4_flex = { version = "0.14.0", default-features = false, features = [
 # Encodes the PNGs we generate for raw-pixel textures. Textures whose payload is
 # already an encoded image are passed through byte-for-byte and never hit this.
 png = "0.18.1"
+regex = "1.13.1"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 # BC1/BC2/BC3 decoding for DXT1/DXT3/DXT5 textures.
 texpresso = "2.0.2"
 walkdir = "2.5.0"
+
+[lints.clippy]
+nursery = { level = "deny", priority = -1 }
+pedantic = { level = "deny", priority = -1 }
+unwrap_used = "deny"
+expect_used = "deny"
+indexing_slicing = "deny"
+arithmetic_side_effects = "deny"
+unreachable = "deny"
+unimplemented = "deny"
+unchecked_time_subtraction = "deny"
+todo = "deny"
+string_slice = "deny"
+panic_in_result_fn = "deny"
+panic = "deny"
+exit = "deny"
+as_conversions = "deny"
 
 [profile.release]
 opt-level = 3
