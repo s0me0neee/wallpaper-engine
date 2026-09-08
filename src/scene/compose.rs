@@ -2,14 +2,17 @@
 //!
 //! This is the base composite: every visible image layer decoded, scaled and
 //! alpha-blended in file order. It deliberately does *not* run the effect
-//! shaders, particle systems or keyframe animation — those need the renderer.
-//! What it produces is the wallpaper with nothing moving, which for a still is
-//! most of the way there, and it reports precisely what it left out.
+//! shaders or particle systems — those need the renderer. Puppet-warp layers
+//! *are* deformed here (at `time`, or the bind pose when the caller passes 0),
+//! since the warp produces the layer image the effect chain then runs over.
+//! What it produces is the wallpaper with nothing else moving, and it reports
+//! precisely what it left out.
 
 use super::model::{
     self, Material, Model, Object, Orthographic, Scene, Vec3, base_texture, is_image, is_particle,
     is_sound,
 };
+use super::puppet;
 use crate::{export::Resolution, pkg::Archive, tex};
 use anyhow::{Context, Result, bail};
 use image::{Rgba, RgbaImage, imageops};
@@ -33,6 +36,11 @@ pub struct PreparedLayer<'a> {
     pub image: RgbaImage,
     pub left: i64,
     pub top: i64,
+    /// True when a puppet-warp deformation produced `image`.
+    pub warped: bool,
+    /// Set when a warp was attempted but failed; the layer falls back to its
+    /// flat texture and this is surfaced as an omission.
+    pub warp_error: Option<String>,
 }
 
 /// A scene resolved as far as a plain flatten can take it: the output canvas
@@ -93,8 +101,9 @@ fn to_pixels(canvas: &Canvas, world_x: f32, world_y: f32) -> (f32, f32) {
     (world_x * canvas.scale, (height - world_y) * canvas.scale)
 }
 
-/// Resolve an object's texture through the model and material indirection.
-fn layer_texture(archive: &mut Archive, object: &Object) -> Result<Option<RgbaImage>> {
+/// Resolve an object's texture through the model and material indirection,
+/// along with the model's puppet path when it has one.
+fn layer_texture(archive: &mut Archive, object: &Object) -> Result<Option<(RgbaImage, Option<String>)>> {
     let Some(model_path) = object.image.as_deref() else {
         return Ok(None);
     };
@@ -121,7 +130,7 @@ fn layer_texture(archive: &mut Archive, object: &Object) -> Result<Option<RgbaIm
     let decoded = tex::decode_rgba(&texture, mipmap)
         .with_context(|| format!("decoding {texture_path}"))?;
 
-    Ok(Some(decoded))
+    Ok(Some((decoded, model.puppet)))
 }
 
 /// Scale a channel by a `0.0..=1.0` factor and round back to a byte.
@@ -220,19 +229,43 @@ fn background_pixel(scene: &Scene) -> Rgba<u8> {
     }
 }
 
+/// Deformation padding, as a fraction of the layer's extent on each side — the
+/// warped mesh can bend outside its rest rectangle and the raster must cover
+/// that. Puppet motion in practice is a few percent; 30% is comfortably safe.
+const WARP_PAD: f32 = 0.3;
+
 /// Decode one image object's texture and place it: scaled to its on-canvas
-/// pixel extent, tinted, and positioned by its `origin`. `None` when the
-/// object resolves to no texture (a solid-colour or effect-only layer).
+/// pixel extent, tinted, and positioned by its `origin`. A puppet-warp layer
+/// is deformed at `time` instead of scaled. `None` when the object resolves to
+/// no texture (a solid-colour or effect-only layer).
 fn prepare_layer<'a>(
     archive: &mut Archive,
     canvas: &Canvas,
     object: &'a Object,
+    time: f32,
 ) -> Result<Option<PreparedLayer<'a>>> {
-    let Some(texture) = layer_texture(archive, object)? else {
+    let Some((texture, puppet_path)) = layer_texture(archive, object)? else {
         return Ok(None);
     };
 
     let (extent_x, extent_y) = extent(object, &texture);
+    // `origin` is the centre of the layer, and the top edge is the one with
+    // the larger scene Y.
+    let (rect_left, rect_top) = to_pixels(
+        canvas,
+        object.origin.x - extent_x / 2.0,
+        object.origin.y + extent_y / 2.0,
+    );
+
+    // A puppet layer replaces the flat scale with a skinned-mesh deformation.
+    let mut warp_error = None;
+    if let (Some(path), Some(clip)) = (puppet_path.as_deref(), model::visible_animation_layer(object)) {
+        match warp_layer(archive, canvas, object, path, &texture, (extent_x, extent_y), (rect_left, rect_top), clip, time) {
+            Ok(layer) => return Ok(Some(layer)),
+            Err(error) => warp_error = Some(format!("{error:#}")),
+        }
+    }
+
     // Rounded and floored at 1.0, so this always lands in u32's range for any
     // wallpaper-sized canvas.
     #[expect(
@@ -257,28 +290,74 @@ fn prepare_layer<'a>(
     };
     apply_tint(&mut image, object.color, object.brightness, object.alpha);
 
-    // `origin` is the centre of the layer, and the top edge is the one with
-    // the larger scene Y.
-    let (left, top) = to_pixels(
-        canvas,
-        object.origin.x - extent_x / 2.0,
-        object.origin.y + extent_y / 2.0,
-    );
     // A wallpaper canvas is at most a few tens of thousands of pixels wide,
     // nowhere near i64's range.
     #[expect(clippy::cast_possible_truncation, reason = "canvas coordinates, nowhere near i64's range")]
-    let (left, top) = (left.round() as i64, top.round() as i64);
+    let (left, top) = (rect_left.round() as i64, rect_top.round() as i64);
 
-    Ok(Some(PreparedLayer { object, image, left, top }))
+    Ok(Some(PreparedLayer { object, image, left, top, warped: false, warp_error }))
+}
+
+/// Skin a puppet mesh at `time` and rasterize it through `texture`, returning
+/// a layer whose image covers the rest rectangle plus a deformation margin.
+#[expect(clippy::too_many_arguments, reason = "all of it is placement state the caller already has computed")]
+fn warp_layer<'a>(
+    archive: &mut Archive,
+    canvas: &Canvas,
+    object: &'a Object,
+    puppet_path: &str,
+    texture: &RgbaImage,
+    (extent_x, extent_y): (f32, f32),
+    (rect_left, rect_top): (f32, f32),
+    clip: &model::AnimationLayer,
+    time: f32,
+) -> Result<PreparedLayer<'a>> {
+    let data = archive.read(puppet_path).with_context(|| format!("reading {puppet_path}"))?;
+    let puppet = puppet::parse(&data).with_context(|| format!("parsing {puppet_path}"))?;
+    if puppet.vertices.is_empty() || puppet.triangles.len() < 3 {
+        bail!("puppet mesh is empty");
+    }
+
+    let skins = puppet::skin_transforms(&puppet, clip.animation, time, clip.rate);
+    let positions = puppet::deform(&puppet, &skins);
+    let (u_slope, u_intercept, v_slope, v_intercept) = puppet::uv_fit(&puppet);
+
+    let rect_px = (extent_x * canvas.scale, extent_y * canvas.scale);
+    #[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss, reason = "layer extents are at most a few thousand px")]
+    let (out_w, out_h) = (
+        ((rect_px.0 * (1.0 + 2.0 * WARP_PAD)).ceil() as u32).clamp(1, 16384),
+        ((rect_px.1 * (1.0 + 2.0 * WARP_PAD)).ceil() as u32).clamp(1, 16384),
+    );
+
+    // A deformed vertex lands in the same texture rectangle a flat layer would
+    // place it in (via the mesh's own vertex->UV fit), offset by the pad.
+    let place = |x: f32, y: f32| -> (f32, f32) {
+        let u = u_slope * x + u_intercept;
+        let v = v_slope * y + v_intercept;
+        ((WARP_PAD + u) * rect_px.0, (WARP_PAD + v) * rect_px.1)
+    };
+
+    let mut image = puppet::rasterize(&puppet, &positions, texture, out_w, out_h, place);
+    apply_tint(&mut image, object.color, object.brightness, object.alpha);
+
+    #[expect(clippy::cast_possible_truncation, reason = "canvas coordinates, nowhere near i64's range")]
+    let (left, top) = (
+        (rect_left - WARP_PAD * rect_px.0).round() as i64,
+        (rect_top - WARP_PAD * rect_px.1).round() as i64,
+    );
+
+    Ok(PreparedLayer { object, image, left, top, warped: true, warp_error: None })
 }
 
 /// Resolve a scene into its canvas plus every visible image layer, prepared
 /// for placement but not yet flattened. `compose::render` overlays these
-/// straight; `scene::render` runs each layer's effect chain first.
+/// straight; `scene::render` runs each layer's effect chain first. Puppet
+/// layers are deformed at `time` (pass 0 for the bind pose / a plain still).
 pub fn prepare<'a>(
     archive: &mut Archive,
     scene: &'a Scene,
     resolution: Option<Resolution>,
+    time: f32,
 ) -> Result<Layered<'a>> {
     let ortho = scene
         .general
@@ -298,7 +377,8 @@ pub fn prepare<'a>(
         if !is_image(object) {
             continue;
         }
-        if let Some(layer) = prepare_layer(archive, &canvas, object)? {
+        if let Some(layer) = prepare_layer(archive, &canvas, object, time)? {
+            reconcile_warp_note(&mut omissions, &layer);
             layers.push(layer);
         }
     }
@@ -316,13 +396,29 @@ pub fn prepare<'a>(
     })
 }
 
-/// Flatten every visible image layer into one image.
+/// `omissions_for` flags every object with animation layers as "keyframe
+/// animation not applied". Once the layer is prepared we know better: drop the
+/// note when the warp ran, or swap in the reason when it was attempted and
+/// failed.
+fn reconcile_warp_note(omissions: &mut Vec<String>, layer: &PreparedLayer) {
+    let stale = format!("{}: keyframe animation not applied", model::label(layer.object));
+    if layer.warped {
+        omissions.retain(|note| *note != stale);
+    } else if let Some(reason) = &layer.warp_error
+        && let Some(note) = omissions.iter_mut().find(|note| **note == stale)
+    {
+        *note = format!("{}: puppet warp skipped ({reason})", model::label(layer.object));
+    }
+}
+
+/// Flatten every visible image layer into one image. Puppet layers show their
+/// bind pose (nothing else in a still moves either).
 pub fn render(
     archive: &mut Archive,
     scene: &Scene,
     resolution: Option<Resolution>,
 ) -> Result<Composite> {
-    let layered = prepare(archive, scene, resolution)?;
+    let layered = prepare(archive, scene, resolution, 0.0)?;
     let mut output = RgbaImage::from_pixel(layered.width, layered.height, layered.background);
     for layer in &layered.layers {
         imageops::overlay(&mut output, &layer.image, layer.left, layer.top);

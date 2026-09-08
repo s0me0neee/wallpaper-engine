@@ -173,9 +173,26 @@ pub struct Object {
     /// user the still is missing something.
     #[serde(default)]
     pub effects: Vec<Effect>,
-    /// Keyframed transforms. Their presence means the object moves over time.
+    /// Puppet-warp clips bound to this object. Each names a baked animation id
+    /// inside the model's `*_puppet.mdl`; `rate` scales playback speed.
     #[serde(default)]
-    pub animationlayers: Vec<Value>,
+    pub animationlayers: Vec<AnimationLayer>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct AnimationLayer {
+    /// The baked clip's id inside the puppet `.mdl`.
+    #[serde(default)]
+    pub animation: Option<u32>,
+    #[serde(default = "one")]
+    pub rate: f32,
+    #[serde(default = "r#true")]
+    pub visible: bool,
+}
+
+/// The first playable puppet clip bound to an object, if any.
+pub fn visible_animation_layer(object: &Object) -> Option<&AnimationLayer> {
+    object.animationlayers.iter().find(|layer| layer.visible)
 }
 
 /// What kind of object this is, by which field is populated.
@@ -252,6 +269,9 @@ pub struct Model {
     /// Take the layer's extent from the texture rather than from `size`.
     #[serde(default)]
     pub autosize: bool,
+    /// Path to a binary `*_puppet.mdl` when the layer is a warp puppet.
+    #[serde(default)]
+    pub puppet: Option<String>,
 }
 
 /// `materials/*.json`.

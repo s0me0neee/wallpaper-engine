@@ -78,7 +78,9 @@ pub fn effect_chain_shape(scene: &Scene) -> Option<(&Object, Vec<&Effect>)> {
 /// composited unprocessed and the reason is recorded as an omission, the same
 /// way the plain composite reports what it left out.
 pub fn render_frame(archive: &mut Archive, scene: &Scene, resolution: Option<Resolution>, time: f64) -> Result<Composite> {
-    let mut layered = compose::prepare(archive, scene, resolution)?;
+    #[expect(clippy::cast_possible_truncation, reason = "a wallpaper's timestamp is always a few seconds at most")]
+    let time = time as f32;
+    let mut layered = compose::prepare(archive, scene, resolution, time)?;
 
     let effected: Vec<usize> = layered
         .layers
@@ -91,8 +93,6 @@ pub fn render_frame(archive: &mut Archive, scene: &Scene, resolution: Option<Res
     if !effected.is_empty() {
         let gpu = Gpu::new().context("opening a headless GL context")?;
         let headers = shim::headers();
-        #[expect(clippy::cast_possible_truncation, reason = "a wallpaper's timestamp is always a few seconds at most")]
-        let time = time as f32;
 
         // The per-object "N effect(s) not applied" notes are about to become
         // wrong for every layer whose chain runs; drop them and let each

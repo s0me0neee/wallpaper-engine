@@ -63,6 +63,8 @@ walkdir = "2.5.0"
 # The simulator's visible window and event loop. `rwh_06` is the
 # raw-window-handle version glutin-winit 0.5 bridges through.
 winit = { version = "0.30", default-features = false, features = ["rwh_06"] }
+byteorder = "1.5.0"
+smallvec = "1.16.0"
 
 [lints.clippy]
 pedantic = { level = "deny", priority = -1 }
