@@ -4,7 +4,9 @@
 //! this attaches a GL context directly to a visible window and redraws every
 //! frame with wall-clock `g_Time`. Nothing else Wallpaper Engine feeds a
 //! shader — mouse position, system audio, time-of-day, now-playing media —
-//! is wired up yet; see plan.md.
+//! is wired up yet; see plan.md. An `egui` overlay does let you drag any
+//! range-annotated shader parameter (e.g. `foliagesway`'s wave strength)
+//! away from the wallpaper's own preset, live.
 
 use crate::pkg::Archive;
 use crate::render::pass;
@@ -23,6 +25,7 @@ use raw_window_handle::HasWindowHandle;
 use std::collections::HashMap;
 use std::ffi::CString;
 use std::num::NonZeroU32;
+use std::sync::Arc;
 use std::time::Instant;
 use winit::application::ApplicationHandler;
 use winit::event::WindowEvent;
@@ -79,11 +82,17 @@ struct State {
     window: Window,
     surface: Surface<WindowSurface>,
     context: PossiblyCurrentContext,
-    gl: glow::Context,
+    /// Shared with `egui`'s painter, which needs to hold its own handle to it.
+    gl: Arc<glow::Context>,
     quad: pass::Quad,
     blit: pass::BlitProgram,
     chain: Option<EffectChain>,
     base_texture: glow::Texture,
+    egui: egui_glow::winit::EguiGlow,
+    /// One live value per `chain`'s `tweakables`, in the same order —
+    /// starts at the wallpaper's own preset and moves as the panel's
+    /// sliders are dragged.
+    values: Vec<f32>,
 }
 
 impl App<'_> {
@@ -129,6 +138,7 @@ impl App<'_> {
                 display.get_proc_address(&name).cast()
             })
         };
+        let gl = Arc::new(gl);
 
         let quad = pass::build_display_quad(&gl)?;
         let blit = pass::compile_blit_program(&gl)?;
@@ -139,15 +149,52 @@ impl App<'_> {
             .map(|effects| render::prepare_effect_chain(&gl, self.archive, effects, &self.base, &self.headers))
             .transpose()
             .context("preparing the effect chain")?;
+        if let Some(chain) = &chain {
+            if chain.tweakables.is_empty() {
+                println!("  no tweakable parameters in this chain");
+            } else {
+                println!("  tweakable parameters (drag them in the Effect Parameters panel):");
+                for tweakable in &chain.tweakables {
+                    println!("    {} = {} (range {}..{})", tweakable.label, tweakable.default, tweakable.min, tweakable.max);
+                }
+            }
+        }
+        let values = chain.as_ref().map(|chain| chain.tweakables.iter().map(|t| t.default).collect()).unwrap_or_default();
+        let egui = egui_glow::winit::EguiGlow::new(event_loop, Arc::clone(&gl), None, None, true);
 
         window.request_redraw();
-        Ok(State { window, surface, context, gl, quad, blit, chain, base_texture })
+        Ok(State { window, surface, context, gl, quad, blit, chain, base_texture, egui, values })
     }
 }
 
-fn redraw(state: &State, time: f32) -> Result<()> {
+/// The panel's static description of each tweakable — cloned out of `state`
+/// up front so the closure `egui`'s `run` takes doesn't need to borrow
+/// `state` at all (it can't: `run` already holds `state.egui` mutably).
+fn panel_labels(state: &State) -> Vec<(String, f32, f32)> {
+    state
+        .chain
+        .as_ref()
+        .map(|chain| chain.tweakables.iter().map(|t| (t.label.clone(), t.min, t.max)).collect())
+        .unwrap_or_default()
+}
+
+fn redraw(state: &mut State, time: f32) -> Result<()> {
+    let labels = panel_labels(state);
+    let mut values = state.values.clone();
+    state.egui.run(&state.window, |ctx| {
+        egui::Window::new("Effect Parameters").show(ctx, |ui| {
+            if labels.is_empty() {
+                ui.label("No tweakable parameters in this chain.");
+            }
+            for ((label, min, max), value) in labels.iter().zip(values.iter_mut()) {
+                ui.add(egui::Slider::new(value, *min..=*max).text(label));
+            }
+        });
+    });
+    state.values = values;
+
     let texture = match &state.chain {
-        Some(chain) => chain.render(&state.gl, time)?.texture,
+        Some(chain) => chain.render(&state.gl, time, &state.values)?.texture,
         None => state.base_texture,
     };
 
@@ -155,6 +202,7 @@ fn redraw(state: &State, time: f32) -> Result<()> {
     #[expect(clippy::cast_possible_wrap, reason = "window dimensions are nowhere near i32::MAX")]
     let (width, height) = (size.width as i32, size.height as i32);
     pass::blit_to_screen(&state.gl, &state.blit, &state.quad, texture, width, height);
+    state.egui.paint(&state.window);
     state.surface.swap_buffers(&state.context).context("swapping buffers")
 }
 
@@ -175,6 +223,10 @@ impl ApplicationHandler for App<'_> {
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
         let Some(state) = &mut self.state else { return };
+        // Feed the panel every event so its sliders can be dragged; still
+        // handle Resized/CloseRequested/Escape below regardless of whether
+        // egui says it "consumed" one, since those are the window's business.
+        let _ = state.egui.on_window_event(&state.window, &event);
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
             WindowEvent::KeyboardInput { event, .. }
@@ -201,6 +253,12 @@ impl ApplicationHandler for App<'_> {
     fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
         if let Some(state) = &self.state {
             state.window.request_redraw();
+        }
+    }
+
+    fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
+        if let Some(state) = &mut self.state {
+            state.egui.destroy();
         }
     }
 }

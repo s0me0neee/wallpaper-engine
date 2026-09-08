@@ -84,7 +84,7 @@ pub fn render_frame(archive: &mut Archive, scene: &Scene, resolution: Option<Res
     let chain = prepare_effect_chain(&gpu.gl, archive, &effects, &composite.image, &headers)
         .with_context(|| format!("preparing the effect chain on {:?}", object.name))?;
     let target = chain
-        .render(&gpu.gl, time)
+        .render(&gpu.gl, time, &[])
         .with_context(|| format!("running the effect chain on {:?}", object.name))?;
     composite.image = capture::read_rgba(&gpu.gl, target.framebuffer, target.width, target.height)?;
     composite.omissions.retain(|note| !note.ends_with("effect(s) not applied"));
@@ -105,6 +105,43 @@ struct CompiledPass {
     label: String,
 }
 
+/// One shader parameter Wallpaper Engine's own Properties panel would show as
+/// a slider — any scalar `float` uniform whose annotation carries a `range`,
+/// e.g. `foliagesway`'s `g_Strength`. `default` is the wallpaper's own preset
+/// value (`scene.json`'s `constantshadervalues`, or the shader's own default
+/// if the scene doesn't override it) — the value a live override replaces.
+pub struct Tweakable {
+    pub label: String,
+    pub min: f32,
+    pub max: f32,
+    pub default: f32,
+    pass_index: usize,
+    uniform_name: String,
+}
+
+/// Every range-annotated scalar float `declarations` names, read back out of
+/// `floats` (already resolved against the wallpaper's own preset) rather than
+/// the shader's own default.
+fn collect_tweakables(declarations: &Declarations, floats: &[(String, Vec<f32>)], pass_index: usize) -> Vec<Tweakable> {
+    declarations
+        .uniforms
+        .iter()
+        .filter(|uniform| uniform.kind == "float")
+        .filter_map(|uniform| {
+            let (min, max) = uniform.range?;
+            let &value = floats.iter().find(|(name, _)| *name == uniform.name)?.1.first()?;
+            Some(Tweakable {
+                label: uniform.material.clone().unwrap_or_else(|| uniform.name.clone()),
+                min,
+                max,
+                default: value,
+                pass_index,
+                uniform_name: uniform.name.clone(),
+            })
+        })
+        .collect()
+}
+
 /// A scene's effect chain, compiled and ready to redraw at any `g_Time`
 /// without touching the archive, the shader preprocessor, or the GL compiler
 /// again — the point of splitting this out of the old one-shot renderer is
@@ -112,16 +149,28 @@ struct CompiledPass {
 pub struct EffectChain {
     quad: pass::Quad,
     passes: Vec<CompiledPass>,
+    pub tweakables: Vec<Tweakable>,
 }
 
 impl EffectChain {
     /// Redraw every pass in order with `g_Time` set to `time`, and return the
     /// final pass's target (its texture is what a caller displays or reads
     /// back).
-    pub fn render(&self, gl: &glow::Context, time: f32) -> Result<&pass::Target> {
-        for pass in &self.passes {
+    ///
+    /// `overrides` gives a live value for each of `self.tweakables`, in the
+    /// same order — pass `&[]` to just use the wallpaper's own presets, as
+    /// export does.
+    pub fn render(&self, gl: &glow::Context, time: f32, overrides: &[f32]) -> Result<&pass::Target> {
+        for (pass_index, pass) in self.passes.iter().enumerate() {
             let mut floats = pass.floats.clone();
             floats.push(("g_Time".to_string(), vec![time]));
+            for (tweakable, &value) in self.tweakables.iter().zip(overrides) {
+                if tweakable.pass_index == pass_index
+                    && let Some(entry) = floats.iter_mut().find(|(name, _)| *name == tweakable.uniform_name)
+                {
+                    entry.1 = vec![value];
+                }
+            }
 
             let texture_refs: Vec<(&str, glow::Texture)> =
                 pass.textures.iter().map(|(name, texture)| (name.as_str(), *texture)).collect();
@@ -161,6 +210,7 @@ pub fn prepare_effect_chain(
     let mut current = pass::upload_texture(gl, base)?;
     let mut current_size = (width, height);
     let mut passes = Vec::new();
+    let mut tweakables = Vec::new();
 
     for effect in effects {
         let definition: EffectDefinition = serde_json::from_slice(&archive.read(&effect.file)?)
@@ -195,6 +245,10 @@ pub fn prepare_effect_chain(
 
                 let mut floats = uniform_floats(&vertex_declarations, &effect_pass.constantshadervalues);
                 floats.extend(uniform_floats(&fragment_declarations, &effect_pass.constantshadervalues));
+
+                tweakables.extend(collect_tweakables(&vertex_declarations, &floats, passes.len()));
+                tweakables.extend(collect_tweakables(&fragment_declarations, &floats, passes.len()));
+
                 floats.extend(resolutions);
 
                 let ints = uniform_ints(&vertex_declarations, &effect_pass.constantshadervalues)
@@ -215,7 +269,7 @@ pub fn prepare_effect_chain(
     if passes.is_empty() {
         bail!("at least one pass must have run");
     }
-    Ok(EffectChain { quad, passes })
+    Ok(EffectChain { quad, passes, tweakables })
 }
 
 /// Bind every sampler the fragment shader declares: slot 0 is always the

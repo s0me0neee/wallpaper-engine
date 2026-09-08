@@ -28,7 +28,7 @@ pub struct Combo {
 }
 
 /// A `uniform` declaration and whatever its trailing comment said about it.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Uniform {
     /// GLSL type, e.g. `float`, `vec2`, `sampler2D`.
     pub kind: String,
@@ -40,6 +40,10 @@ pub struct Uniform {
     pub default: Option<Value>,
     /// For samplers, the combo that gets defined when this slot is bound.
     pub combo: Option<String>,
+    /// The slider range Wallpaper Engine's own Properties panel would show
+    /// for this uniform, e.g. `"range":[0.01, 1]` on `foliagesway`'s
+    /// `g_Strength` — `(min, max)`.
+    pub range: Option<(f32, f32)>,
 }
 
 /// What a shader declares about itself.
@@ -64,6 +68,8 @@ struct UniformAnnotation {
     default: Option<Value>,
     #[serde(default)]
     combo: Option<String>,
+    #[serde(default)]
+    range: Option<(f32, f32)>,
 }
 
 /// Coerce an annotation's `default` to the integer a `#define` needs.
@@ -153,7 +159,8 @@ pub fn parse(source: &str) -> Declarations {
             name,
             material: annotation.as_ref().and_then(|a| a.material.clone()),
             default: annotation.as_ref().and_then(|a| a.default.clone()),
-            combo: annotation.and_then(|a| a.combo),
+            combo: annotation.as_ref().and_then(|a| a.combo.clone()),
+            range: annotation.and_then(|a| a.range),
         });
     }
 

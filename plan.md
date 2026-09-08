@@ -233,6 +233,24 @@ needing a virtual device or a `ScreenCaptureKit` audio tap). A scene without
 the one-image-plus-effects shape just shows the static composite in the
 window rather than refusing to open one.
 
+An `egui` (`egui_glow`, winit-integrated) overlay draws an "Effect
+Parameters" panel on top with one slider per range-annotated scalar `float`
+uniform any pass declares (`scene::render::Tweakable`, `collect_tweakables`)
+— e.g. `foliagesway`'s `g_Strength`, the wave-distortion knob that prompted
+this. Each slider starts at the wallpaper's own preset (`scene.json`'s
+`constantshadervalues`, not the shader's generic default — `scene_example1`
+ships `strength: 0.65` for the sway and `0.1` for the shake, both above their
+shaders' own `0.4`/no-op defaults) and its declared `range`; dragging one
+feeds `EffectChain::render`'s `overrides` slice, which only overwrites that
+one named uniform in the one pass it belongs to, leaving everything else —
+including `export`, which always calls `render` with `overrides: &[]` — on
+the wallpaper's own values. Discovery is fully generic (no per-effect
+hardcoding): any current or future effect whose shader carries a `range`
+annotation gets a slider for free.
+`glow` is pinned to 0.17 rather than 0.18 specifically because that's what
+`egui_glow` depends on and 0.x crates don't unify across minor versions —
+confirmed a clean drop-in with no code changes elsewhere.
+
 ---
 
 ## 5. The `common.h` problem

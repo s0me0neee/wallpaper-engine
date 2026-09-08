@@ -10,8 +10,12 @@ clap = { version = "4.6.6", features = ["derive"] }
 # ffmpeg development libraries at build time (`brew install ffmpeg`), and the
 # major version tracks ffmpeg's own — 9.x builds against ffmpeg 9.
 ffmpeg-next = "9.0.0"
-# GL function loader/bindings, driven through a context glutin opens.
-glow = "0.18.0"
+# GL function loader/bindings, driven through a context glutin opens. Pinned
+# to 0.17 (not the newer 0.18) because that's what egui_glow 0.36 depends on;
+# 0.x crates don't unify across minor versions, so a mismatch here would give
+# us two incompatible glow::Context types. Confirmed a plain drop-in — no
+# code changes needed going from 0.18 to 0.17.
+glow = "0.17.0"
 glsl-include = "0.3.1"
 glutin = "0.32.3"
 # Wires a glutin GL context to a real winit window, for the live simulator —
@@ -19,6 +23,12 @@ glutin = "0.32.3"
 # Its default features are all Linux windowing systems (x11/wayland/egl/wgl);
 # CGL, macOS's, needs none of them.
 glutin-winit = { version = "0.5", default-features = false }
+# The simulator's on-screen slider panel for tweaking effect parameters live.
+# The "winit" feature pulls in egui-winit + winit (matching our own winit
+# below) and gives us the bundled egui_glow::winit::EguiGlow helper instead
+# of wiring egui's context/input/painter together by hand.
+egui = "0.36.1"
+egui_glow = { version = "0.36.1", default-features = false, features = ["winit"] }
 image = { version = "0.25.10", default-features = false, features = [
 	"png",
 	"jpeg",
