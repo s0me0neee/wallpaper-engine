@@ -204,6 +204,20 @@ Confirmed in practice: re-rendering the same timestamp twice is byte-identical.
   called with a new `g_Time` every frame). One-shot export and the live
   simulator both build on this; only the simulator calls `render` more than
   once per chain.
+- **Two different fullscreen quads, not one.** `build_quad`'s V mapping
+  preserves texel row order (a pass with no displacement leaves the image
+  alone), which is what lets any number of chained passes still agree with
+  `read_rgba`'s row order with no flip needed there. `build_display_quad` is
+  the one exception: going from that same row-preserving texture to an
+  actual on-screen window needs exactly one flip, since GL always puts NDC's
+  top edge at the window's top row — `blit_to_screen` uses this one, never
+  `build_quad`. Mixing them up is exactly how the simulator first shipped
+  upside down: the export path's `read_rgba` was quietly absorbing a flip
+  that every pass introduced, and the direct-to-screen blit had nothing to
+  absorb it. See `render/capture.rs`'s two `#[ignore]`d tests for the
+  regression case (they need the AppKit main thread, which `cargo test`
+  can't provide without a lib target — verified manually instead, by
+  temporarily inlining them into `main()` and running via `cargo run`).
 
 ### 4.6 Live simulator
 

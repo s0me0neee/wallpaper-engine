@@ -130,7 +130,7 @@ impl App<'_> {
             })
         };
 
-        let quad = pass::build_quad(&gl)?;
+        let quad = pass::build_display_quad(&gl)?;
         let blit = pass::compile_blit_program(&gl)?;
         let base_texture = pass::upload_texture(&gl, &self.base)?;
         let chain = self

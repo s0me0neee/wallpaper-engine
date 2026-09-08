@@ -170,20 +170,37 @@ pub fn solid_texture(gl: &glow::Context, rgba: [u8; 4]) -> Result<glow::Texture>
     Ok(texture)
 }
 
-/// The fixed fullscreen quad every pass draws: two triangles, `a_Position`
-/// (clip-space xyz) interleaved with `a_TexCoord` (0..1, V=0 at the top so it
-/// lines up with how images are decoded row-major top-down).
+/// The fixed fullscreen quad a pass draws: two triangles, `a_Position`
+/// (clip-space xyz) interleaved with `a_TexCoord` (0..1).
 pub struct Quad {
     pub vertex_array: glow::VertexArray,
     _buffer: glow::Buffer,
 }
 
+/// The quad every effect pass uses to resample the previous result: V is
+/// aligned so texel row 0 of the input lands at texel row 0 of the output
+/// (`glFramebufferTexture`'s own row 0, at the bottom of NDC) — a pass with
+/// no displacement leaves row order alone. This is what keeps texel row 0
+/// meaning "the base image's own row 0" (its visual top, since that is what
+/// `upload_texture` puts there) through any number of chained passes.
 pub fn build_quad(gl: &glow::Context) -> Result<Quad> {
-    // The vertex layout below is fixed (xyz, then uv), so its byte offsets are
-    // compile-time constants rather than a `size_of::<f32>()` cast.
-    const STRIDE: i32 = 5 * 4;
-    const UV_OFFSET: i32 = 3 * 4;
+    #[rustfmt::skip]
+    let vertices: [f32; 20] = [
+        // x,    y,    z,   u,   v
+        -1.0, -1.0, 0.0,  0.0, 0.0,
+         1.0, -1.0, 0.0,  1.0, 0.0,
+        -1.0,  1.0, 0.0,  0.0, 1.0,
+         1.0,  1.0, 0.0,  1.0, 1.0,
+    ];
+    build_quad_from(gl, &vertices)
+}
 
+/// The quad `blit_to_screen` uses instead: going from texel-row-0-is-top
+/// texture space to an actual displayed window needs exactly one flip,
+/// since GL always rasterizes NDC's top edge to the window's top row. `V=0`
+/// at NDC's top supplies that flip directly, the same way `read_rgba`
+/// supplies it by reversing rows after `glReadPixels` for the PNG/video path.
+pub fn build_display_quad(gl: &glow::Context) -> Result<Quad> {
     #[rustfmt::skip]
     let vertices: [f32; 20] = [
         // x,    y,    z,   u,   v
@@ -192,7 +209,15 @@ pub fn build_quad(gl: &glow::Context) -> Result<Quad> {
         -1.0,  1.0, 0.0,  0.0, 0.0,
          1.0,  1.0, 0.0,  1.0, 0.0,
     ];
-    let bytes = bytes_of(&vertices);
+    build_quad_from(gl, &vertices)
+}
+
+fn build_quad_from(gl: &glow::Context, vertices: &[f32; 20]) -> Result<Quad> {
+    // The vertex layout is fixed (xyz, then uv), so its byte offsets are
+    // compile-time constants rather than a `size_of::<f32>()` cast.
+    const STRIDE: i32 = 5 * 4;
+    const UV_OFFSET: i32 = 3 * 4;
+    let bytes = bytes_of(vertices);
 
     let vertex_array = unsafe { gl.create_vertex_array() }.map_err(|error| anyhow::anyhow!(error))?;
     let buffer = unsafe { gl.create_buffer() }.map_err(|error| anyhow::anyhow!(error))?;
@@ -301,7 +326,8 @@ pub fn compile_blit_program(gl: &glow::Context) -> Result<BlitProgram> {
 }
 
 /// Draw `texture` fullscreen to the window (framebuffer 0), stretched to
-/// `width`x`height`.
+/// `width`x`height`. `quad` should be `build_display_quad`'s, not
+/// `build_quad`'s — see the difference between the two.
 pub fn blit_to_screen(gl: &glow::Context, blit: &BlitProgram, quad: &Quad, texture: glow::Texture, width: i32, height: i32) {
     unsafe {
         gl.bind_framebuffer(glow::FRAMEBUFFER, None);
