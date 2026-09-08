@@ -5,6 +5,7 @@
 
 pub mod compose;
 pub mod model;
+pub mod particle;
 pub mod puppet;
 pub mod render;
 

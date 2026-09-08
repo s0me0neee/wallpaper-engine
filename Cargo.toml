@@ -65,6 +65,11 @@ walkdir = "2.5.0"
 winit = { version = "0.30", default-features = false, features = ["rwh_06"] }
 byteorder = "1.5.0"
 smallvec = "1.16.0"
+rand = "0.10.2"
+rand_pcg = "0.10.2"
+glam = "0.33.7"
+tiny-skia = "0.12.0"
+noise = "0.9.0"
 
 [lints.clippy]
 pedantic = { level = "deny", priority = -1 }

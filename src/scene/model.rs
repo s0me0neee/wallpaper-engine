@@ -145,6 +145,11 @@ pub struct Object {
     /// Path to a particle preset.
     #[serde(default)]
     pub particle: Option<String>,
+    /// Per-instance tweaks a scene applies on top of a shared particle preset
+    /// (the sliders in WE's own particle panel): emission count, rate, size,
+    /// speed and an optional flat colour.
+    #[serde(default)]
+    pub instanceoverride: Option<InstanceOverride>,
     /// Audio tracks. Never rendered.
     #[serde(default)]
     pub sound: Option<Vec<String>>,
@@ -193,6 +198,29 @@ pub struct AnimationLayer {
 /// The first playable puppet clip bound to an object, if any.
 pub fn visible_animation_layer(object: &Object) -> Option<&AnimationLayer> {
     object.animationlayers.iter().find(|layer| layer.visible)
+}
+
+#[derive(Debug, Clone, Copy, Deserialize)]
+pub struct InstanceOverride {
+    #[serde(default = "one")]
+    pub count: f32,
+    #[serde(default = "one")]
+    pub rate: f32,
+    #[serde(default = "one")]
+    pub size: f32,
+    #[serde(default = "one")]
+    pub speed: f32,
+    #[serde(default = "one")]
+    pub alpha: f32,
+    /// A normalised RGB that replaces whatever colour the preset would pick.
+    #[serde(default)]
+    pub colorn: Option<Vec3>,
+}
+
+impl Default for InstanceOverride {
+    fn default() -> Self {
+        InstanceOverride { count: 1.0, rate: 1.0, size: 1.0, speed: 1.0, alpha: 1.0, colorn: None }
+    }
 }
 
 /// What kind of object this is, by which field is populated.

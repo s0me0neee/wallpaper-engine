@@ -12,9 +12,10 @@ use super::model::{
     self, Blend, Material, Model, Object, Orthographic, Scene, Vec3, base_blend, base_texture,
     is_image, is_particle, is_sound,
 };
-use super::puppet;
+use super::{particle, puppet};
 use crate::{export::Resolution, pkg::Archive, tex};
 use anyhow::{Context, Result, bail};
+use glam::{Vec2, Vec3 as GVec3};
 use image::{Rgba, RgbaImage, imageops};
 
 /// A finished still, plus what could not be represented in it.
@@ -387,6 +388,15 @@ pub fn prepare<'a>(
         }
         omissions.extend(omissions_for(object));
 
+        if is_particle(object) {
+            let outcome = prepare_particle_layer(archive, &canvas, object, time);
+            reconcile_particle_note(&mut omissions, object, &outcome);
+            if let Ok((layer, _)) = outcome {
+                layers.push(layer);
+            }
+            continue;
+        }
+
         if !is_image(object) {
             continue;
         }
@@ -421,6 +431,80 @@ fn reconcile_warp_note(omissions: &mut Vec<String>, layer: &PreparedLayer) {
         && let Some(note) = omissions.iter_mut().find(|note| **note == stale)
     {
         *note = format!("{}: puppet warp skipped ({reason})", model::label(layer.object));
+    }
+}
+
+/// Simulate and rasterize a particle object into a full-canvas additive layer
+/// placed at the object's z-order. Returns the layer and the list of preset
+/// features that were parsed but not simulated.
+fn prepare_particle_layer<'a>(
+    archive: &mut Archive,
+    canvas: &Canvas,
+    object: &'a Object,
+    time: f32,
+) -> Result<(PreparedLayer<'a>, Vec<String>)> {
+    let preset_path = object
+        .particle
+        .as_deref()
+        .context("particle object names no preset")?;
+
+    let (origin_x, origin_y) = to_pixels(canvas, object.origin.x, object.origin.y);
+    let place = particle::Placement {
+        origin_px: Vec2::new(origin_x, origin_y),
+        scale: Vec2::new(object.scale.x, object.scale.y),
+        px_per_unit: canvas.scale,
+        canvas_px: (canvas.width, canvas.height),
+        tint: GVec3::new(
+            object.color.x * object.brightness,
+            object.color.y * object.brightness,
+            object.color.z * object.brightness,
+        ),
+        alpha: object.alpha,
+        overrides: object.instanceoverride.unwrap_or_default(),
+    };
+
+    let blend = particle::layer_blend(archive, preset_path);
+    let rendered = particle::render_system(archive, preset_path, &place, time)
+        .with_context(|| format!("simulating {preset_path}"))?;
+
+    let layer = PreparedLayer {
+        object,
+        image: rendered.image,
+        left: 0,
+        top: 0,
+        blend,
+        warped: false,
+        warp_error: None,
+    };
+    Ok((layer, rendered.unsupported))
+}
+
+/// `omissions_for` flags every particle object as "particle system not
+/// rendered". Replace that once we've tried: drop it when the system rendered
+/// clean, or swap in what was skipped or why it failed.
+fn reconcile_particle_note(
+    omissions: &mut Vec<String>,
+    object: &Object,
+    outcome: &Result<(PreparedLayer, Vec<String>)>,
+) {
+    let name = model::label(object);
+    let stale = format!("{name}: particle system not rendered");
+    let replacement = match outcome {
+        Ok((_, unsupported)) if unsupported.is_empty() => None,
+        Ok((_, unsupported)) => {
+            Some(format!("{name}: particle system rendered without {}", unsupported.join(", ")))
+        }
+        Err(error) => Some(format!("{name}: particle system skipped ({error:#})")),
+    };
+    match replacement {
+        Some(note) => {
+            if let Some(slot) = omissions.iter_mut().find(|entry| **entry == stale) {
+                *slot = note;
+            } else {
+                omissions.push(note);
+            }
+        }
+        None => omissions.retain(|entry| *entry != stale),
     }
 }
 
