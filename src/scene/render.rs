@@ -10,7 +10,7 @@
 //! plain composite and reported as omissions (plan.md §4.7).
 
 use super::compose::{self, Composite};
-use super::model::{self, Effect, EffectDefinition, Material, Object, Scene};
+use super::model::{self, Effect, EffectDefinition, Material, Scene};
 use crate::export::Resolution;
 use crate::pkg::Archive;
 use crate::render::{capture, gpu::Gpu, pass};
@@ -103,26 +103,6 @@ fn noise_sample(perlin: &Perlin, u: f64, v: f64) -> f64 {
         frequency *= 2.0;
     }
     ((sum / norm) * 0.5 + 0.5).clamp(0.0, 1.0)
-}
-
-/// The scene's effect chain, if it has the shape plan.md §4.1 describes:
-/// exactly one visible image layer carrying at least one visible effect.
-/// `None` for anything richer (multiple image layers, particles, or an image
-/// with no effects) — the caller falls back to the plain composite.
-pub fn effect_chain_shape(scene: &Scene) -> Option<(&Object, Vec<&Effect>)> {
-    let image_objects: Vec<&Object> = scene
-        .objects
-        .iter()
-        .filter(|object| object.visible && model::is_image(object))
-        .collect();
-    let [object] = image_objects[..] else {
-        return None;
-    };
-    let effects: Vec<&Effect> = model::visible_effects(object).collect();
-    if effects.is_empty() {
-        return None;
-    }
-    Some((object, effects))
 }
 
 /// Render one frame of a scene at `time` seconds.

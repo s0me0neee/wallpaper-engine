@@ -132,6 +132,34 @@ pub fn upload_repeating_texture(gl: &glow::Context, image: &image::RgbaImage) ->
     upload_with_wrap(gl, image, glow::REPEAT)
 }
 
+/// Replace the pixels of an existing texture, which must already be `image`'s
+/// dimensions. The live simulator re-uploads a puppet or particle layer's
+/// image every frame; reusing the texture object avoids churning GL handles.
+pub fn update_texture(gl: &glow::Context, texture: glow::Texture, image: &image::RgbaImage) {
+    #[expect(clippy::cast_possible_wrap, reason = "wallpaper textures are nowhere near i32::MAX")]
+    let (width, height) = (image.width() as i32, image.height() as i32);
+    unsafe {
+        gl.bind_texture(glow::TEXTURE_2D, Some(texture));
+        gl.tex_sub_image_2d(
+            glow::TEXTURE_2D,
+            0,
+            0,
+            0,
+            width,
+            height,
+            glow::RGBA,
+            glow::UNSIGNED_BYTE,
+            glow::PixelUnpackData::Slice(Some(image.as_raw())),
+        );
+    }
+}
+
+/// Free a texture handle (used when a per-frame layer image changes size and
+/// its texture has to be reallocated).
+pub fn delete_texture(gl: &glow::Context, texture: glow::Texture) {
+    unsafe { gl.delete_texture(texture) };
+}
+
 fn upload_with_wrap(gl: &glow::Context, image: &image::RgbaImage, wrap: u32) -> Result<glow::Texture> {
     #[expect(clippy::cast_possible_wrap, reason = "wallpaper textures are nowhere near i32::MAX")]
     let (width, height) = (image.width() as i32, image.height() as i32);
@@ -380,6 +408,103 @@ pub fn blit_to_screen(
         gl.draw_arrays(glow::TRIANGLE_STRIP, 0, 4);
         gl.bind_vertex_array(None);
         gl.use_program(None);
+    }
+}
+
+/// Draws one placed layer texture into a canvas-sized target, under a blend
+/// mode. The live simulator runs each layer's effect chain separately and then
+/// stacks the results here, the GPU equivalent of `compose::flatten`.
+pub struct LayerCompositor {
+    program: Program,
+    quad: Quad,
+}
+
+const COMPOSITE_VERTEX: &str = "#version 330 core\n\
+    layout(location = 0) in vec3 a_Position;\n\
+    layout(location = 1) in vec2 a_TexCoord;\n\
+    out vec2 v_TexCoord;\n\
+    void main() {\n\
+        v_TexCoord = a_TexCoord;\n\
+        gl_Position = vec4(a_Position, 1.0);\n\
+    }\n";
+const COMPOSITE_FRAGMENT: &str = "#version 330 core\n\
+    in vec2 v_TexCoord;\n\
+    out vec4 o_Color;\n\
+    uniform sampler2D u_Texture;\n\
+    void main() {\n\
+        o_Color = texture(u_Texture, v_TexCoord);\n\
+    }\n";
+
+pub fn compile_layer_compositor(gl: &glow::Context) -> Result<LayerCompositor> {
+    Ok(LayerCompositor {
+        program: compile_program(gl, COMPOSITE_VERTEX, COMPOSITE_FRAGMENT)?,
+        // Row-preserving, same as an effect pass: the target ends up with
+        // texel row 0 == the canvas's visual top, which `blit_to_screen` then
+        // flips once for the window.
+        quad: build_quad(gl)?,
+    })
+}
+
+/// Fill `target` with a solid colour (the scene background) before any layer
+/// is composited onto it.
+pub fn clear_target(gl: &glow::Context, target: &Target, color: [f32; 4]) {
+    #[expect(clippy::cast_possible_wrap, reason = "wallpaper canvases are nowhere near i32::MAX")]
+    let (width, height) = (target.width as i32, target.height as i32);
+    unsafe {
+        gl.bind_framebuffer(glow::FRAMEBUFFER, Some(target.framebuffer));
+        gl.viewport(0, 0, width, height);
+        gl.disable(glow::BLEND);
+        gl.clear_color(color[0], color[1], color[2], color[3]);
+        gl.clear(glow::COLOR_BUFFER_BIT);
+        gl.bind_framebuffer(glow::FRAMEBUFFER, None);
+    }
+}
+
+/// Composite `texture` into `target` at pixel rectangle `(left, top, width,
+/// height)` measured from the canvas's top-left. `additive` picks between
+/// `dst·(1-srcA) + src·srcA` (normal) and `dst + src·srcA` with the alpha
+/// lifted to the brighter of the two (additive) — the same two rules
+/// `compose::blit` uses on the CPU.
+pub fn composite_layer(
+    gl: &glow::Context,
+    compositor: &LayerCompositor,
+    target: &Target,
+    texture: glow::Texture,
+    (left, top, width, height): (i32, i32, i32, i32),
+    additive: bool,
+) {
+    unsafe {
+        gl.bind_framebuffer(glow::FRAMEBUFFER, Some(target.framebuffer));
+        // The target is row-preserving (texel row 0 == visual top), so viewport
+        // y measures straight down from the top — no flip.
+        gl.viewport(left, top, width, height);
+        gl.enable(glow::BLEND);
+        if additive {
+            gl.blend_equation_separate(glow::FUNC_ADD, glow::MAX);
+            gl.blend_func_separate(glow::SRC_ALPHA, glow::ONE, glow::ONE, glow::ONE);
+        } else {
+            gl.blend_equation_separate(glow::FUNC_ADD, glow::FUNC_ADD);
+            gl.blend_func_separate(
+                glow::SRC_ALPHA,
+                glow::ONE_MINUS_SRC_ALPHA,
+                glow::ONE,
+                glow::ONE_MINUS_SRC_ALPHA,
+            );
+        }
+
+        gl.use_program(Some(compositor.program.handle));
+        gl.bind_vertex_array(Some(compositor.quad.vertex_array));
+        gl.active_texture(glow::TEXTURE0);
+        gl.bind_texture(glow::TEXTURE_2D, Some(texture));
+        if let Some(location) = gl.get_uniform_location(compositor.program.handle, "u_Texture") {
+            gl.uniform_1_i32(Some(&location), 0);
+        }
+        gl.draw_arrays(glow::TRIANGLE_STRIP, 0, 4);
+
+        gl.bind_vertex_array(None);
+        gl.use_program(None);
+        gl.disable(glow::BLEND);
+        gl.bind_framebuffer(glow::FRAMEBUFFER, None);
     }
 }
 

@@ -1,17 +1,27 @@
-//! A live window that plays a scene's effect chain in real time.
+//! A live window that plays a whole scene in real time.
 //!
-//! Unlike `export`, which renders one frame and reads it back to the CPU,
-//! this attaches a GL context directly to a visible window and redraws every
-//! frame with wall-clock `g_Time`. Nothing else Wallpaper Engine feeds a
-//! shader — mouse position, system audio, time-of-day, now-playing media —
-//! is wired up yet; see plan.md. An `egui` overlay does let you drag any
-//! range-annotated shader parameter (e.g. `foliagesway`'s wave strength)
-//! away from the wallpaper's own preset, live.
+//! Unlike `export`, which renders one frame with a throwaway headless context,
+//! this attaches a GL context to a visible window and, every frame at
+//! wall-clock `g_Time`:
+//!
+//! - re-skins each puppet-warp layer and re-simulates each particle system on
+//!   the CPU, uploading the fresh image;
+//! - runs every image layer's own compiled effect chain over its texture;
+//! - composites the processed layers in z-order, honouring each layer's blend
+//!   mode, into one canvas-sized target that is then blitted to the window.
+//!
+//! The decode/compile/parse groundwork (`compose::prepare_static`,
+//! `render::prepare_effect_chain`) happens once when the window opens; only the
+//! per-frame work above repeats. Nothing else Wallpaper Engine feeds a shader —
+//! mouse position, system audio, time of day, now-playing media — is wired up
+//! yet; see plan.md. An `egui` overlay lets you drag any range-annotated shader
+//! parameter away from the wallpaper's own preset, live.
 
 use crate::pkg::Archive;
 use crate::render::pass;
-use crate::scene::compose;
-use crate::scene::model::{Effect, Scene};
+use crate::scene::compose::{self, StaticItem};
+use crate::scene::model::{self, Blend, Scene};
+use crate::scene::particle;
 use crate::scene::render::{self, EffectChain};
 use crate::shader::shim;
 use anyhow::{Context, Result, anyhow};
@@ -25,6 +35,7 @@ use raw_window_handle::HasWindowHandle;
 use std::collections::HashMap;
 use std::ffi::CString;
 use std::num::NonZeroU32;
+use std::ops::Range;
 use std::sync::Arc;
 use std::time::Instant;
 use winit::application::ApplicationHandler;
@@ -34,31 +45,17 @@ use winit::keyboard::{Key, NamedKey};
 use winit::window::{Window, WindowId};
 
 /// Open a window and play `scene` in it until it is closed.
-///
-/// Runs the effect chain when the scene has the shape `scene::render`
-/// handles; otherwise the window just shows the static composite, same
-/// fallback `export` uses, since a still preview is still a useful window.
 pub fn run(archive: &mut Archive, scene: &Scene, title: &str) -> Result<()> {
-    let mut composite = compose::render(archive, scene, None)?;
+    let static_scene = compose::prepare_static(archive, scene, None)?;
 
-    let effects = render::effect_chain_shape(scene).map(|(_, effects)| effects);
-    if effects.is_some() {
-        // The chain covers what this note describes; `render_frame` drops it
-        // the same way once the chain actually runs.
-        composite.omissions.retain(|note| !note.ends_with("effect(s) not applied"));
-    } else {
-        println!("  no effect chain on this scene; showing the static composite");
-    }
-    for note in &composite.omissions {
-        println!("  not simulated: {note}");
-    }
-
+    // What is left unsimulated depends on which layer chains compile, which
+    // needs the window's GL context — so the report is printed from
+    // `open_window`, not here.
     let event_loop = EventLoop::new().context("opening a window event loop")?;
     let mut app = App {
         title: title.to_string(),
         archive,
-        effects,
-        base: composite.image,
+        static_scene,
         headers: shim::headers(),
         start: Instant::now(),
         state: None,
@@ -69,39 +66,73 @@ pub fn run(archive: &mut Archive, scene: &Scene, title: &str) -> Result<()> {
 struct App<'a> {
     title: String,
     archive: &'a mut Archive,
-    effects: Option<Vec<&'a Effect>>,
-    base: RgbaImage,
+    static_scene: compose::StaticScene<'a>,
     headers: HashMap<String, String>,
     start: Instant,
     state: Option<State>,
 }
 
-/// Everything that only exists once the window itself does — winit only
-/// hands out a window from inside `resumed`, never before.
+/// Which per-frame work a live layer needs before it is composited.
+enum LiveKind {
+    /// A plain image layer: texture uploaded once, never changes.
+    Image,
+    /// A puppet-warp layer: `static_scene.items[usize]` is re-skinned each frame.
+    Puppet(usize),
+    /// A particle system: `static_scene.items[usize]` is re-simulated each frame.
+    Particle(usize),
+}
+
+/// One scene layer, in z-order, with everything the redraw loop needs.
+struct LiveLayer {
+    kind: LiveKind,
+    /// The object's name, for the tweakable panel.
+    name: String,
+    additive: bool,
+    /// The layer's own effect chain, compiled once. `None` if it has no effects.
+    chain: Option<EffectChain>,
+    /// This chain's slice of `State::tweak_values`, one entry per tweakable.
+    tweaks: Range<usize>,
+    /// The current image: uploaded once for `Image`, re-uploaded each frame for
+    /// `Puppet` / `Particle`.
+    texture: glow::Texture,
+    texture_size: (u32, u32),
+    /// Placement on the canvas — `(left, top, width, height)` in pixels,
+    /// measured from the top-left. Re-derived each frame for `Puppet`.
+    rect: (i32, i32, i32, i32),
+}
+
+/// Everything that only exists once the window itself does.
 struct State {
     window: Window,
     surface: Surface<WindowSurface>,
     context: PossiblyCurrentContext,
-    /// Shared with `egui`'s painter, which needs to hold its own handle to it.
     gl: Arc<glow::Context>,
-    quad: pass::Quad,
+    display_quad: pass::Quad,
     blit: pass::BlitProgram,
-    chain: Option<EffectChain>,
-    base_texture: glow::Texture,
-    /// The scene's own pixel dimensions — every render target matches this,
-    /// so the window is letterboxed to it rather than stretching to
-    /// whatever shape the window gets resized to.
+    compositor: pass::LayerCompositor,
+    /// Canvas-sized accumulator the layers are stacked into each frame.
+    composite: pass::Target,
+    /// The scene's own pixel dimensions — every layer and the composite match
+    /// this, so the window letterboxes to it rather than stretching.
     content_size: (u32, u32),
+    background: [f32; 4],
+    layers: Vec<LiveLayer>,
     egui: egui_glow::winit::EguiGlow,
-    /// One live value per `chain`'s `tweakables`, in the same order —
-    /// starts at the wallpaper's own preset and moves as the panel's
-    /// sliders are dragged.
-    values: Vec<f32>,
+    /// One live value per tweakable across every chain, concatenated in layer
+    /// order; each `LiveLayer::tweaks` indexes its own span.
+    tweak_values: Vec<f32>,
+}
+
+/// `(left, top, width, height)` in canvas pixels for an image placed with its
+/// top-left at `(left, top)`.
+#[expect(clippy::cast_possible_truncation, clippy::cast_possible_wrap, reason = "wallpaper canvas coords and sizes are nowhere near i32::MAX")]
+fn rect_of(left: i64, top: i64, image: &RgbaImage) -> (i32, i32, i32, i32) {
+    (left as i32, top as i32, image.width() as i32, image.height() as i32)
 }
 
 impl App<'_> {
     fn open_window(&mut self, event_loop: &ActiveEventLoop) -> Result<State> {
-        let (width, height) = self.base.dimensions();
+        let (width, height) = (self.static_scene.width, self.static_scene.height);
         let attributes = Window::default_attributes()
             .with_title(self.title.clone())
             .with_inner_size(winit::dpi::PhysicalSize::new(width, height));
@@ -144,70 +175,253 @@ impl App<'_> {
         };
         let gl = Arc::new(gl);
 
-        let quad = pass::build_display_quad(&gl)?;
+        let display_quad = pass::build_display_quad(&gl)?;
         let blit = pass::compile_blit_program(&gl)?;
-        let base_texture = pass::upload_texture(&gl, &self.base)?;
-        let chain = self
-            .effects
-            .as_ref()
-            .map(|effects| render::prepare_effect_chain(&gl, self.archive, effects, &self.base, &self.headers))
-            .transpose()
-            .context("preparing the effect chain")?;
-        if let Some(chain) = &chain {
-            if chain.tweakables.is_empty() {
-                println!("  no tweakable parameters in this chain");
-            } else {
-                println!("  tweakable parameters (drag them in the Effect Parameters panel):");
-                for tweakable in &chain.tweakables {
-                    println!("    {} = {} (range {}..{})", tweakable.label, tweakable.default, tweakable.min, tweakable.max);
-                }
-            }
+        let compositor = pass::compile_layer_compositor(&gl)?;
+        let composite = pass::Target::new(&gl, width, height).context("allocating the composite target")?;
+
+        let Built { layers, tweak_values, omissions } = self.build_layers(&gl)?;
+        for note in &omissions {
+            println!("  not simulated: {note}");
         }
-        let values = chain.as_ref().map(|chain| chain.tweakables.iter().map(|t| t.default).collect()).unwrap_or_default();
+        report_tweakables(&layers);
+
         let egui = egui_glow::winit::EguiGlow::new(event_loop, Arc::clone(&gl), None, None, true);
 
         window.request_redraw();
-        Ok(State { window, surface, context, gl, quad, blit, chain, base_texture, content_size: (width, height), egui, values })
+        Ok(State {
+            window,
+            surface,
+            context,
+            gl,
+            display_quad,
+            blit,
+            compositor,
+            composite,
+            content_size: (width, height),
+            background: normalized_rgba(self.static_scene.background),
+            layers,
+            egui,
+            tweak_values,
+        })
+    }
+
+    /// Build one `LiveLayer` per static item: take its t=0 image, upload it,
+    /// and — if the layer carries effects — compile its chain over that image.
+    /// A layer whose chain will not compile (an unimplemented effect helper, a
+    /// missing engine texture) still renders, just unprocessed, exactly as the
+    /// still exporter degrades it.
+    fn build_layers(&mut self, gl: &glow::Context) -> Result<Built> {
+        let App { archive, static_scene, headers, .. } = self;
+        let mut layers = Vec::with_capacity(static_scene.items.len());
+        let mut tweak_values = Vec::new();
+
+        // Start from what the static pass could not settle, then drop every
+        // "N effect(s) not applied" note — a chain either runs below or re-adds
+        // its own "skipped" note, the same handoff `render_frame` does.
+        let mut omissions: Vec<String> = static_scene
+            .omissions
+            .iter()
+            .filter(|note| !note.ends_with("effect(s) not applied"))
+            .cloned()
+            .collect();
+
+        for (index, item) in static_scene.items.iter().enumerate() {
+            let (image, rect, blend, kind, object) = match item {
+                StaticItem::Image(layer) => {
+                    if let Some(error) = &layer.warp_error {
+                        swap_note(
+                            &mut omissions,
+                            &format!("{}: keyframe animation not applied", model::label(layer.object)),
+                            format!("{}: puppet warp skipped ({error})", model::label(layer.object)),
+                        );
+                    }
+                    (
+                        layer.image.clone(),
+                        rect_of(layer.left, layer.top, &layer.image),
+                        layer.blend,
+                        LiveKind::Image,
+                        layer.object,
+                    )
+                }
+                StaticItem::Puppet(puppet) => {
+                    omissions.retain(|note| {
+                        *note != format!("{}: keyframe animation not applied", model::label(puppet.object))
+                    });
+                    let (image, left, top) = compose::warp_frame(puppet, 0.0);
+                    let rect = rect_of(left, top, &image);
+                    (image, rect, puppet.blend, LiveKind::Puppet(index), puppet.object)
+                }
+                StaticItem::Particle(system) => {
+                    let rect = rect_of(0, 0, &system.initial);
+                    (system.initial.clone(), rect, system.blend, LiveKind::Particle(index), system.object)
+                }
+            };
+
+            let effects: Vec<_> = model::visible_effects(object).collect();
+            let chain = if effects.is_empty() {
+                None
+            } else {
+                match render::prepare_effect_chain(gl, archive, &effects, &image, headers) {
+                    Ok(chain) => Some(chain),
+                    Err(error) => {
+                        omissions.push(format!("{}: effect chain skipped ({error:#})", model::label(object)));
+                        None
+                    }
+                }
+            };
+
+            let start = tweak_values.len();
+            if let Some(chain) = &chain {
+                tweak_values.extend(chain.tweakables.iter().map(|tweakable| tweakable.default));
+            }
+
+            layers.push(LiveLayer {
+                kind,
+                name: model::label(object),
+                additive: blend == Blend::Add,
+                chain,
+                tweaks: start..tweak_values.len(),
+                texture: pass::upload_texture(gl, &image)?,
+                texture_size: (image.width(), image.height()),
+                rect,
+            });
+        }
+
+        Ok(Built { layers, tweak_values, omissions })
     }
 }
 
-/// The panel's static description of each tweakable — cloned out of `state`
-/// up front so the closure `egui`'s `run` takes doesn't need to borrow
-/// `state` at all (it can't: `run` already holds `state.egui` mutably).
-fn panel_labels(state: &State) -> Vec<(String, f32, f32)> {
-    state
-        .chain
-        .as_ref()
-        .map(|chain| chain.tweakables.iter().map(|t| (t.label.clone(), t.min, t.max)).collect())
-        .unwrap_or_default()
+/// `build_layers`' output: the z-ordered layers, the flattened tweakable
+/// values, and the reconciled list of what is still not simulated.
+struct Built {
+    layers: Vec<LiveLayer>,
+    tweak_values: Vec<f32>,
+    omissions: Vec<String>,
 }
 
-fn redraw(state: &mut State, time: f32) -> Result<()> {
+/// Replace `stale` with `replacement` in `notes`, if present.
+fn swap_note(notes: &mut [String], stale: &str, replacement: String) {
+    if let Some(slot) = notes.iter_mut().find(|note| *note == stale) {
+        *slot = replacement;
+    }
+}
+
+/// Re-upload `image` into `layer`'s existing texture, reallocating only if the
+/// dimensions changed (a warp raster can grow or shrink by a pixel).
+fn refresh_texture(gl: &glow::Context, layer: &mut LiveLayer, image: &RgbaImage) -> Result<()> {
+    if (image.width(), image.height()) == layer.texture_size {
+        pass::update_texture(gl, layer.texture, image);
+    } else {
+        pass::delete_texture(gl, layer.texture);
+        layer.texture = pass::upload_texture(gl, image)?;
+        layer.texture_size = (image.width(), image.height());
+    }
+    Ok(())
+}
+
+fn redraw(app: &mut App, time: f32) -> Result<()> {
+    let App { archive, static_scene, state, .. } = app;
+    let Some(state) = state.as_mut() else { return Ok(()) };
+
+    run_panel(state);
+
+    // Per-frame CPU work: re-skin puppets, re-simulate particles.
+    for layer in &mut state.layers {
+        match layer.kind {
+            LiveKind::Image => {}
+            LiveKind::Puppet(index) => {
+                let StaticItem::Puppet(puppet) = &static_scene.items[index] else {
+                    unreachable!("a Puppet LiveKind always points at a Puppet item")
+                };
+                let (image, left, top) = compose::warp_frame(puppet, time);
+                layer.rect = rect_of(left, top, &image);
+                refresh_texture(&state.gl, layer, &image)?;
+            }
+            LiveKind::Particle(index) => {
+                let StaticItem::Particle(system) = &static_scene.items[index] else {
+                    unreachable!("a Particle LiveKind always points at a Particle item")
+                };
+                let image = particle::render_system(archive, &system.preset_path, &system.place, time)
+                    .with_context(|| format!("simulating {}", system.preset_path))?
+                    .image;
+                layer.rect = rect_of(0, 0, &image);
+                refresh_texture(&state.gl, layer, &image)?;
+            }
+        }
+    }
+
+    // Stack the layers into the composite target, each under its blend mode.
+    pass::clear_target(&state.gl, &state.composite, state.background);
+    for layer in &state.layers {
+        let source = match &layer.chain {
+            Some(chain) => {
+                // A static image's chain keeps its baked-in base; a puppet or
+                // particle layer's image changed this frame, so re-feed it.
+                let base = match layer.kind {
+                    LiveKind::Image => None,
+                    LiveKind::Puppet(_) | LiveKind::Particle(_) => Some(layer.texture),
+                };
+                chain
+                    .render_over(&state.gl, base, time, &state.tweak_values[layer.tweaks.clone()])?
+                    .texture
+            }
+            None => layer.texture,
+        };
+        pass::composite_layer(&state.gl, &state.compositor, &state.composite, source, layer.rect, layer.additive);
+    }
+
+    let size = state.window.inner_size();
+    #[expect(clippy::cast_possible_wrap, reason = "window dimensions are nowhere near i32::MAX")]
+    let window = (size.width as i32, size.height as i32);
+    pass::blit_to_screen(&state.gl, &state.blit, &state.display_quad, state.composite.texture, state.content_size, window);
+    state.egui.paint(&state.window);
+    state.surface.swap_buffers(&state.context).context("swapping buffers")
+}
+
+/// Run the egui pass and copy the slider values back into `state.tweak_values`.
+fn run_panel(state: &mut State) {
     let labels = panel_labels(state);
-    let mut values = state.values.clone();
+    let mut values = state.tweak_values.clone();
     state.egui.run(&state.window, |ctx| {
         egui::Window::new("Effect Parameters").show(ctx, |ui| {
             if labels.is_empty() {
-                ui.label("No tweakable parameters in this chain.");
+                ui.label("No tweakable parameters in this scene.");
             }
             for ((label, min, max), value) in labels.iter().zip(values.iter_mut()) {
                 ui.add(egui::Slider::new(value, *min..=*max).text(label));
             }
         });
     });
-    state.values = values;
+    state.tweak_values = values;
+}
 
-    let texture = match &state.chain {
-        Some(chain) => chain.render(&state.gl, time, &state.values)?.texture,
-        None => state.base_texture,
-    };
+/// One `(label, min, max)` per tweakable across every layer's chain, in the
+/// same order as `state.tweak_values`. Labels are prefixed with the layer name
+/// so sliders from different layers stay apart.
+fn panel_labels(state: &State) -> Vec<(String, f32, f32)> {
+    let mut labels = Vec::new();
+    for layer in &state.layers {
+        let Some(chain) = &layer.chain else { continue };
+        for tweakable in &chain.tweakables {
+            labels.push((format!("{} · {}", layer.name, tweakable.label), tweakable.min, tweakable.max));
+        }
+    }
+    labels
+}
 
-    let size = state.window.inner_size();
-    #[expect(clippy::cast_possible_wrap, reason = "window dimensions are nowhere near i32::MAX")]
-    let window = (size.width as i32, size.height as i32);
-    pass::blit_to_screen(&state.gl, &state.blit, &state.quad, texture, state.content_size, window);
-    state.egui.paint(&state.window);
-    state.surface.swap_buffers(&state.context).context("swapping buffers")
+fn report_tweakables(layers: &[LiveLayer]) {
+    let total: usize = layers.iter().filter_map(|layer| layer.chain.as_ref()).map(|chain| chain.tweakables.len()).sum();
+    if total == 0 {
+        println!("  no tweakable parameters in this scene");
+    } else {
+        println!("  {total} tweakable parameter(s) — drag them in the Effect Parameters panel");
+    }
+}
+
+/// A scene background pixel as a normalized RGBA clear colour.
+fn normalized_rgba(pixel: image::Rgba<u8>) -> [f32; 4] {
+    pixel.0.map(|channel| f32::from(channel) / 255.0)
 }
 
 impl ApplicationHandler for App<'_> {
@@ -226,11 +440,12 @@ impl ApplicationHandler for App<'_> {
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
-        let Some(state) = &mut self.state else { return };
-        // Feed the panel every event so its sliders can be dragged; still
-        // handle Resized/CloseRequested/Escape below regardless of whether
-        // egui says it "consumed" one, since those are the window's business.
-        let _ = state.egui.on_window_event(&state.window, &event);
+        if self.state.is_none() {
+            return;
+        }
+        if let Some(state) = &mut self.state {
+            let _ = state.egui.on_window_event(&state.window, &event);
+        }
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
             WindowEvent::KeyboardInput { event, .. }
@@ -239,13 +454,15 @@ impl ApplicationHandler for App<'_> {
                 event_loop.exit();
             }
             WindowEvent::Resized(size) => {
-                if let (Some(width), Some(height)) = (NonZeroU32::new(size.width), NonZeroU32::new(size.height)) {
+                if let (Some(width), Some(height), Some(state)) =
+                    (NonZeroU32::new(size.width), NonZeroU32::new(size.height), &self.state)
+                {
                     state.surface.resize(&state.context, width, height);
                 }
             }
             WindowEvent::RedrawRequested => {
                 let time = self.start.elapsed().as_secs_f32();
-                if let Err(error) = redraw(state, time) {
+                if let Err(error) = redraw(self, time) {
                     eprintln!("Error: drawing a frame\nCaused by: {error:#}");
                     event_loop.exit();
                 }
