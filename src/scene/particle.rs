@@ -45,7 +45,12 @@ use tiny_skia::{
 
 /// Simulation step rate for trajectory integration.
 const SIM_HZ: f32 = 60.0;
-/// Cap on integration steps for one particle (a very old, long-lived particle).
+/// Default cap on integration steps for one particle: enough that a particle
+/// living the full `MAX_STEPS / SIM_HZ` seconds still integrates at the true
+/// 60 Hz step. The still exporter keeps this; the live simulator lowers it via
+/// `Placement::max_sim_steps` so an old firefly does not cost 1000+ steps a
+/// frame (once the cap bites, the step count is fixed and the path stays
+/// frame-to-frame stable, just coarser).
 const MAX_STEPS: u32 = 4096;
 /// Recursion cap for child systems (presets in the wild nest one level).
 const MAX_DEPTH: u32 = 2;
@@ -244,7 +249,13 @@ pub struct Placement {
     /// The object's `alpha`.
     pub alpha: f32,
     pub overrides: InstanceOverride,
+    /// Per-particle integration-step ceiling. `MAX_STEPS` for an exact still;
+    /// the live simulator sets it lower to bound the per-frame cost.
+    pub max_sim_steps: u32,
 }
+
+/// The exact-integration step ceiling (`MAX_STEPS`), for the still exporter.
+pub const EXACT_SIM_STEPS: u32 = MAX_STEPS;
 
 /// A live particle's local position (sim units) to an output-pixel point.
 fn to_screen(place: &Placement, local: Vec2) -> Point {
@@ -414,8 +425,8 @@ struct Live {
 
 /// Integrate a particle to `age` seconds, then apply the display-only
 /// operators (fades, oscillators, size ramp) as closed-form functions of age.
-fn simulate(preset: &Preset, r: &Rolled, flow: &Perlin, speed: f32, age: f32) -> Live {
-    let steps = ((age * SIM_HZ).ceil() as u32).clamp(1, MAX_STEPS);
+fn simulate(preset: &Preset, r: &Rolled, flow: &Perlin, speed: f32, age: f32, max_steps: u32) -> Live {
+    let steps = ((age * SIM_HZ).ceil() as u32).clamp(1, max_steps.max(1));
     let dt = age / steps as f32;
 
     let mut pos = r.start;
@@ -648,7 +659,8 @@ fn render_preset(
             let (n, birth) = slot_particle(&em, slot, time)?;
             let age = time - birth;
             let rolled = roll(preset, emitter, &flow, seed(salt, n));
-            (age < rolled.lifetime).then(|| (n, birth, simulate(preset, &rolled, &flow, speed, age)))
+            (age < rolled.lifetime)
+                .then(|| (n, birth, simulate(preset, &rolled, &flow, speed, age, place.max_sim_steps)))
         })
         .collect();
 
@@ -710,19 +722,35 @@ pub fn render_system(
     place: &Placement,
     time: f32,
 ) -> Result<ParticleLayer> {
+    let presets = collect_system(archive, preset_path)?;
+    render_system_from(&presets, preset_path, place, time)
+}
+
+/// Read and parse a preset and every child it names — the file work, done once
+/// so a live redraw can call `render_system_from` each frame without touching
+/// the archive.
+pub fn collect_system(archive: &mut Archive, preset_path: &str) -> Result<HashMap<String, Preset>> {
     let mut presets = HashMap::new();
     collect_presets(archive, preset_path, 0, &mut presets)
         .with_context(|| format!("loading particle preset {preset_path}"))?;
+    Ok(presets)
+}
 
-    let root = presets.get(preset_path).context("particle preset had no body")?;
-    let start = root.starttime;
+/// Simulate and rasterize an already-parsed system at `time`.
+pub fn render_system_from(
+    presets: &HashMap<String, Preset>,
+    preset_path: &str,
+    place: &Placement,
+    time: f32,
+) -> Result<ParticleLayer> {
+    let start = presets.get(preset_path).context("particle preset had no body")?.starttime;
 
     let (w, h) = place.canvas_px;
     let mut pixmap = Pixmap::new(w.max(1), h.max(1)).context("allocating a particle canvas")?;
     let mut unsupported = Vec::new();
 
     let salt = 0x5EED_u64.wrapping_add(fnv1a(preset_path));
-    render_preset(&presets, preset_path, &mut pixmap, place, time, start, salt, 0, &mut unsupported);
+    render_preset(presets, preset_path, &mut pixmap, place, time, start, salt, 0, &mut unsupported);
 
     Ok(ParticleLayer { image: pixmap_to_rgba(&pixmap), unsupported })
 }
@@ -865,8 +893,8 @@ mod tests {
                 "maxcount":16}"#,
         );
         let flow = Perlin::new(7);
-        let a = simulate(&p, &roll(&p, &p.emitter[0], &flow, seed(3, 4)), &flow, 1.0, 2.5);
-        let b = simulate(&p, &roll(&p, &p.emitter[0], &flow, seed(3, 4)), &flow, 1.0, 2.5);
+        let a = simulate(&p, &roll(&p, &p.emitter[0], &flow, seed(3, 4)), &flow, 1.0, 2.5, MAX_STEPS);
+        let b = simulate(&p, &roll(&p, &p.emitter[0], &flow, seed(3, 4)), &flow, 1.0, 2.5, MAX_STEPS);
         assert_eq!(a.pos, b.pos);
         assert_eq!(a.alpha, b.alpha);
     }
@@ -881,9 +909,9 @@ mod tests {
         );
         let flow = Perlin::new(0);
         let r = roll(&p, &p.emitter[0], &flow, seed(0, 0));
-        let early = simulate(&p, &r, &flow, 1.0, 0.5).alpha; // half way through fade-in
-        let mid = simulate(&p, &r, &flow, 1.0, 5.0).alpha; // fully faded in, not yet out
-        let late = simulate(&p, &r, &flow, 1.0, 9.0).alpha; // half way through fade-out
+        let early = simulate(&p, &r, &flow, 1.0, 0.5, MAX_STEPS).alpha; // half way through fade-in
+        let mid = simulate(&p, &r, &flow, 1.0, 5.0, MAX_STEPS).alpha; // fully faded in, not yet out
+        let late = simulate(&p, &r, &flow, 1.0, 9.0, MAX_STEPS).alpha; // half way through fade-out
         assert!(early < mid, "{early} !< {mid}");
         assert!(late < mid, "{late} !< {mid}");
         assert!((mid - r.alpha).abs() < 1e-6);

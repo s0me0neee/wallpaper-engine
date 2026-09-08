@@ -594,6 +594,7 @@ fn static_particle<'a>(
         ),
         alpha: object.alpha,
         overrides: object.instanceoverride.unwrap_or_default(),
+        max_sim_steps: particle::EXACT_SIM_STEPS,
     };
 
     let blend = particle::layer_blend(archive, &preset_path);

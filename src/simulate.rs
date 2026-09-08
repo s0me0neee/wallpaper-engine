@@ -82,7 +82,12 @@ enum LiveKind {
     /// which may be a fraction of the real one (soft glows survive a bilinear
     /// upscale, and a full-res tiny-skia raster every frame is what pins a big
     /// scene to single digits). The compositor stretches it back to full size.
-    Particle { placement: particle::Placement, preset_path: String },
+    /// `presets` is parsed once so the redraw never re-reads the archive.
+    Particle {
+        placement: particle::Placement,
+        preset_path: String,
+        presets: HashMap<String, particle::Preset>,
+    },
 }
 
 /// Simulate particles into a canvas this fraction of the real one when the real
@@ -97,7 +102,14 @@ fn particle_sim_scale(canvas: (u32, u32)) -> f32 {
     }
 }
 
-/// `place` rescaled so a `scale`-of-canvas simulation lands in the same spots.
+/// Per-particle integration steps for the live sim: 6 seconds at 60 Hz. A
+/// particle older than that integrates in a fixed 360 steps with a slightly
+/// coarser `dt` — invisible on these soft drifting sprites, and it stops the
+/// per-frame cost climbing as long-lived fireflies age.
+const LIVE_SIM_STEPS: u32 = 360;
+
+/// `place` rescaled so a `scale`-of-canvas simulation lands in the same spots,
+/// and capped to the live per-particle step budget.
 fn scaled_placement(place: &particle::Placement, scale: f32) -> particle::Placement {
     let down = |side: u32| -> u32 {
         #[expect(
@@ -112,6 +124,7 @@ fn scaled_placement(place: &particle::Placement, scale: f32) -> particle::Placem
         origin_px: place.origin_px * scale,
         px_per_unit: place.px_per_unit * scale,
         canvas_px: (down(place.canvas_px.0), down(place.canvas_px.1)),
+        max_sim_steps: LIVE_SIM_STEPS,
         ..place.clone()
     }
 }
@@ -199,6 +212,9 @@ struct State {
     /// One live value per tweakable across every chain, concatenated in layer
     /// order; each `LiveLayer::tweaks` indexes its own span.
     tweak_values: Vec<f32>,
+    /// `(label, min, max)` per tweakable, in `tweak_values` order — fixed, so
+    /// it is built once rather than reformatted every frame.
+    panel: Vec<(String, f32, f32)>,
     /// Rolling frame counter for the once-a-second FPS line.
     frames_since: (Instant, u32),
 }
@@ -265,6 +281,7 @@ impl App<'_> {
             println!("  not simulated: {note}");
         }
         report_tweakables(&layers);
+        let panel = panel_labels(&layers);
 
         let egui = egui_glow::winit::EguiGlow::new(event_loop, Arc::clone(&gl), None, None, true);
 
@@ -283,6 +300,7 @@ impl App<'_> {
             layers,
             egui,
             tweak_values,
+            panel,
             frames_since: (Instant::now(), 0),
         })
     }
@@ -339,10 +357,16 @@ impl App<'_> {
                 }
                 StaticItem::Particle(system) => {
                     let placement = scaled_placement(&system.place, sim_scale);
-                    let image = particle::render_system(archive, &system.preset_path, &placement, 0.0)
+                    let presets = particle::collect_system(archive, &system.preset_path)
+                        .with_context(|| format!("loading {}", system.preset_path))?;
+                    let image = particle::render_system_from(&presets, &system.preset_path, &placement, 0.0)
                         .with_context(|| format!("simulating {}", system.preset_path))?
                         .image;
-                    let kind = LiveKind::Particle { placement, preset_path: system.preset_path.clone() };
+                    let kind = LiveKind::Particle {
+                        placement,
+                        preset_path: system.preset_path.clone(),
+                        presets,
+                    };
                     (image, full_rect, system.blend, kind, system.object)
                 }
             };
@@ -403,7 +427,7 @@ fn swap_note(notes: &mut [String], stale: &str, replacement: String) {
 /// Returns `true` when the caller should close the window (the debug dump hook
 /// asks for this after writing its frame).
 fn redraw(app: &mut App, time: f32) -> Result<bool> {
-    let App { archive, static_scene, state, .. } = app;
+    let App { static_scene, state, .. } = app;
     let Some(state) = state.as_mut() else { return Ok(false) };
 
     run_panel(state);
@@ -421,8 +445,8 @@ fn redraw(app: &mut App, time: f32) -> Result<bool> {
                 let rect = rect_of(left, top, &image);
                 Some((image, rect))
             }
-            LiveKind::Particle { placement, preset_path } => {
-                let image = particle::render_system(archive, preset_path, placement, time)
+            LiveKind::Particle { placement, preset_path, presets } => {
+                let image = particle::render_system_from(presets, preset_path, placement, time)
                     .with_context(|| format!("simulating {preset_path}"))?
                     .image;
                 Some((image, layer.rect))
@@ -498,27 +522,29 @@ fn report_fps(counter: &mut (Instant, u32)) {
 
 /// Run the egui pass and copy the slider values back into `state.tweak_values`.
 fn run_panel(state: &mut State) {
-    let labels = panel_labels(state);
+    let panel = &state.panel;
     let mut values = state.tweak_values.clone();
     state.egui.run(&state.window, |ctx| {
-        egui::Window::new("Effect Parameters").show(ctx, |ui| {
-            if labels.is_empty() {
-                ui.label("No tweakable parameters in this scene.");
-            }
-            for ((label, min, max), value) in labels.iter().zip(values.iter_mut()) {
-                ui.add(egui::Slider::new(value, *min..=*max).text(label));
-            }
-        });
+        egui::Window::new("Effect Parameters")
+            .default_open(false)
+            .show(ctx, |ui| {
+                if panel.is_empty() {
+                    ui.label("No tweakable parameters in this scene.");
+                }
+                for ((label, min, max), value) in panel.iter().zip(values.iter_mut()) {
+                    ui.add(egui::Slider::new(value, *min..=*max).text(label));
+                }
+            });
     });
     state.tweak_values = values;
 }
 
 /// One `(label, min, max)` per tweakable across every layer's chain, in the
-/// same order as `state.tweak_values`. Labels are prefixed with the layer name
-/// so sliders from different layers stay apart.
-fn panel_labels(state: &State) -> Vec<(String, f32, f32)> {
+/// same order as `tweak_values`. Labels are prefixed with the layer name so
+/// sliders from different layers stay apart.
+fn panel_labels(layers: &[LiveLayer]) -> Vec<(String, f32, f32)> {
     let mut labels = Vec::new();
-    for layer in &state.layers {
+    for layer in layers {
         let Some(chain) = &layer.chain else { continue };
         for tweakable in &chain.tweakables {
             labels.push((format!("{} · {}", layer.name, tweakable.label), tweakable.min, tweakable.max));
