@@ -38,7 +38,7 @@ use anyhow::{Context, Result, bail};
 use std::{
     borrow::Cow,
     fs::File,
-    io::{BufReader, BufWriter},
+    io::{BufReader, BufWriter, Read, Seek},
     path::{Path, PathBuf},
 };
 
@@ -159,7 +159,16 @@ impl Tex {
 
 pub fn parse(path: &Path) -> Result<Tex> {
     let file = File::open(path).with_context(|| format!("opening {}", path.display()))?;
-    let mut reader = Reader::new(BufReader::new(file));
+    parse_from(BufReader::new(file))
+}
+
+/// Parse a texture already in memory, as served straight out of a `.pkg`.
+pub fn parse_bytes(bytes: &[u8]) -> Result<Tex> {
+    parse_from(std::io::Cursor::new(bytes))
+}
+
+fn parse_from<R: Read + Seek>(source: R) -> Result<Tex> {
+    let mut reader = Reader::new(source);
 
     let version = reader.magic()?;
     if !version.starts_with("TEXV") {
@@ -300,6 +309,77 @@ fn write_png(
     encoder.set_depth(png::BitDepth::Eight);
     encoder.write_header()?.write_image_data(&pixels[..needed])?;
     Ok(())
+}
+
+/// Decode a mipmap to 8-bit RGBA, whatever it was stored as.
+///
+/// `save_mipmap` deliberately writes each format in its narrowest PNG colour
+/// type and hands embedded files through untouched, which is right for
+/// inspection. Compositing needs the opposite: one uniform buffer, so a mask
+/// and a photo can be blended by the same code.
+pub fn decode_rgba(tex: &Tex, mipmap: &Mipmap) -> Result<image::RgbaImage> {
+    let payload = mipmap_pixels(mipmap)?;
+    let (width, height) = (mipmap.width as u32, mipmap.height as u32);
+
+    // An embedded file carries its own dimensions, and they are authoritative:
+    // the mipmap header describes the texture slot, not the encoded image.
+    if tex.embedded_ext().is_some() {
+        let decoded = image::load_from_memory(&payload)
+            .context("decoding the image embedded in the texture")?;
+        return Ok(decoded.into_rgba8());
+    }
+
+    if let Some(block_format) = tex.format.block_format() {
+        let needed = block_format.compressed_size(mipmap.width, mipmap.height);
+        if payload.len() < needed {
+            bail!(
+                "{} needs {needed} bytes, got {}",
+                tex.format.label(),
+                payload.len()
+            );
+        }
+        let mut rgba = vec![0u8; mipmap.width * mipmap.height * 4];
+        block_format.decompress(&payload, mipmap.width, mipmap.height, &mut rgba);
+        return image::RgbaImage::from_raw(width, height, rgba)
+            .context("block-compressed texture did not fill its buffer");
+    }
+
+    let pixels = mipmap.width * mipmap.height;
+    let rgba = match tex.format {
+        Format::Rgba8888 => payload.as_ref().get(..pixels * 4).map(<[u8]>::to_vec),
+        // A mask: one channel replicated to grey, fully opaque. The alpha it
+        // carries is applied by whatever samples it, not by the mask itself.
+        Format::R8 => payload
+            .as_ref()
+            .get(..pixels)
+            .map(|data| data.iter().flat_map(|&v| [v, v, v, 255]).collect()),
+        Format::Rg88 => payload.as_ref().get(..pixels * 2).map(|data| {
+            data.as_chunks::<2>()
+                .0
+                .iter()
+                .flat_map(|&[grey, alpha]| [grey, grey, grey, alpha])
+                .collect()
+        }),
+        other => bail!("unsupported pixel format {}", other.label()),
+    };
+
+    let rgba = rgba.with_context(|| {
+        format!(
+            "pixel buffer too small for {}x{} {}",
+            mipmap.width,
+            mipmap.height,
+            tex.format.label()
+        )
+    })?;
+    image::RgbaImage::from_raw(width, height, rgba).context("texture did not fill its buffer")
+}
+
+/// The largest mipmap of the first image, which is the texture itself.
+pub fn largest_mipmap(tex: &Tex) -> Result<&Mipmap> {
+    tex.images
+        .first()
+        .and_then(|mipmaps| mipmaps.first())
+        .context("texture contains no images")
 }
 
 /// Write one mipmap to disk, returning the path actually written.

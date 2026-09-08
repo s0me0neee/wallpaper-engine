@@ -19,9 +19,12 @@ still to build.
 | CLI skeleton (`clap`), recursive discovery (`walkdir`) | Done |
 | `project.json` parsing and type routing | Done, all six sample wallpapers route correctly |
 | Video pipeline (still PNG + looping mp4) | Done, both sample video wallpapers export |
+| Scene model (`scene.json` / model / material) | Done |
+| Scene base composite (layers flattened to a still) | Done, both sample scenes match their previews |
 
-Crates in use: `anyhow`, `clap`, `lz4_flex`, `png`, `serde`, `serde_json`,
-`texpresso`, `walkdir`. `ffmpeg`/`ffprobe` are invoked as subprocesses.
+Crates in use: `anyhow`, `clap`, `image`, `lz4_flex`, `png`, `serde`,
+`serde_json`, `texpresso`, `walkdir`. `ffmpeg`/`ffprobe` are invoked as
+subprocesses.
 
 ---
 
@@ -86,6 +89,25 @@ src/
 ---
 
 ## 4. The Scene renderer
+
+### 4.0 Scene geometry (settled while building the composite)
+
+Two conventions had to be pinned down before anything could be placed, and
+both are easy to get backwards:
+
+- **Scene Y points up from the bottom edge.** Image rows go down, so the
+  transform is `row = ortho.height - world_y`. Confirmed against the sample by
+  where it puts the eyelash and hair layers of a portrait — the wrong sign puts
+  them at the character's feet.
+- **`camera.eye` is the editor's saved viewport, not the render view.** The
+  visible rectangle is simply `(0,0)..(ortho.width, ortho.height)`. Both samples
+  place their background layer at exactly the canvas centre with exactly the
+  canvas extent, which only lines up under this reading; honouring `camera.eye`
+  slides one of them half a screen off-centre.
+
+An object's `origin` is its centre, `size` is its extent in scene units before
+`scale`, and layer order is array order. Objects are distinguished by which of
+`image`, `particle` and `sound` is present — there is no type tag.
 
 ### 4.1 Render model (established from the sample)
 
@@ -341,7 +363,7 @@ Each phase ships something independently useful.
 | Phase | Deliverable | Risk |
 |---|---|---|
 | ~~**1. Type routing + Video passthrough**~~ | **Done.** `project.json` parsing; Video wallpapers export with no rendering at all | Low |
-| **2. Scene model + still export** | serde types for scene/effect/material; correct-resolution base PNG | Low |
+| ~~**2. Scene model + still export**~~ | **Done.** serde types for scene/effect/material; correct-resolution base PNG | Low |
 | **3. Shader pipeline** | Preprocessor, shim, wgpu, single pass, then the full chain | **High** |
 | **4. Animation + video** | `g_Time` sweep, frame capture, loop detection, ffmpeg encode | Medium |
 | **5. Web capture** | Local server, headless Chrome, virtual-time frames | Medium |

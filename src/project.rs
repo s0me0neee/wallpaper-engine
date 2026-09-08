@@ -129,78 +129,85 @@ fn locate(input: &Path) -> Result<PathBuf> {
     )
 }
 
-impl Project {
-    /// Load the wallpaper at `input`, which may be its directory or its
-    /// `project.json`.
-    pub fn load(input: &Path) -> Result<Self> {
-        let manifest_path = locate(input)?;
-        let root = manifest_path
-            .parent()
-            .unwrap_or(Path::new("."))
-            .to_path_buf();
+/// Load the wallpaper at `input`, which may be its directory or its
+/// `project.json`.
+pub fn load(input: &Path) -> Result<Project> {
+    let manifest_path = locate(input)?;
+    let root = manifest_path
+        .parent()
+        .unwrap_or(Path::new("."))
+        .to_path_buf();
 
-        let file = File::open(&manifest_path)
-            .with_context(|| format!("opening {}", manifest_path.display()))?;
-        let manifest: Manifest = serde_json::from_reader(BufReader::new(file))
-            .with_context(|| format!("parsing {}", manifest_path.display()))?;
+    let file = File::open(&manifest_path)
+        .with_context(|| format!("opening {}", manifest_path.display()))?;
+    let manifest: Manifest = serde_json::from_reader(BufReader::new(file))
+        .with_context(|| format!("parsing {}", manifest_path.display()))?;
 
-        // `file` and `preview` come from Workshop content, so they get the same
-        // traversal check as archive entries rather than a bare join.
-        let entry = manifest
-            .file
-            .as_deref()
-            .map(|name| resolve_under(&root, name))
-            .transpose()
-            .with_context(|| format!("resolving the \"file\" entry of {}", manifest_path.display()))?;
+    // `file` and `preview` come from Workshop content, so they get the same
+    // traversal check as archive entries rather than a bare join.
+    let entry = manifest
+        .file
+        .as_deref()
+        .map(|name| resolve_under(&root, name))
+        .transpose()
+        .with_context(|| format!("resolving the \"file\" entry of {}", manifest_path.display()))?;
 
-        let preview = manifest
-            .preview
-            .as_deref()
-            .and_then(|name| resolve_under(&root, name).ok())
-            .filter(|path| path.is_file());
+    let preview = manifest
+        .preview
+        .as_deref()
+        .and_then(|name| resolve_under(&root, name).ok())
+        .filter(|path| path.is_file());
 
-        let package = Some(root.join("scene.pkg")).filter(|path| path.is_file());
+    let package = Some(root.join("scene.pkg")).filter(|path| path.is_file());
 
-        Ok(Project {
-            kind: Kind::parse(&manifest.kind),
-            title: manifest.title,
-            root,
-            entry,
-            preview,
-            package,
-            oversized: manifest.oversized,
-            properties: manifest.general.properties,
-        })
+    Ok(Project {
+        kind: Kind::parse(&manifest.kind),
+        title: manifest.title,
+        root,
+        entry,
+        preview,
+        package,
+        oversized: manifest.oversized,
+        properties: manifest.general.properties,
+    })
+}
+
+/// True when the entry point is inside `scene.pkg` rather than on disk.
+pub fn entry_is_packaged(project: &Project) -> bool {
+    project.package.is_some() && project.entry.as_deref().is_some_and(|entry| !entry.exists())
+}
+
+/// The entry point, failing with a pipeline-specific message if the manifest
+/// omitted it or it is not on disk.
+pub fn require_entry(project: &Project) -> Result<&Path> {
+    let entry = project
+        .entry
+        .as_deref()
+        .context("project.json has no \"file\" entry, so there is nothing to export")?;
+    if !entry.exists() {
+        bail!("{} is named by project.json but missing", entry.display());
     }
+    Ok(entry)
+}
 
-    /// True when the entry point is inside `scene.pkg` rather than on disk.
-    pub fn entry_is_packaged(&self) -> bool {
-        self.package.is_some() && self.entry.as_deref().is_some_and(|entry| !entry.exists())
-    }
+/// The package a scene wallpaper's assets live in.
+pub fn require_package(project: &Project) -> Result<&Path> {
+    project
+        .package
+        .as_deref()
+        .context("no scene.pkg beside project.json, so there are no assets to render")
+}
 
-    /// The entry point, failing with a pipeline-specific message if the
-    /// manifest omitted it or it is not on disk.
-    pub fn require_entry(&self) -> Result<&Path> {
-        let entry = self
-            .entry
-            .as_deref()
-            .context("project.json has no \"file\" entry, so there is nothing to export")?;
-        if !entry.exists() {
-            bail!("{} is named by project.json but missing", entry.display());
-        }
-        Ok(entry)
-    }
-
-    /// A display name, falling back to the directory when the title is blank.
-    pub fn display_name(&self) -> &str {
-        if self.title.trim().is_empty() {
-            self.root
-                .file_name()
-                .and_then(|name| name.to_str())
-                .unwrap_or("<untitled>")
-        } else {
-            &self.title
-        }
+/// A display name, falling back to the directory when the title is blank.
+pub fn display_name(project: &Project) -> &str {
+    if project.title.trim().is_empty() {
+        project
+            .root
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("<untitled>")
+    } else {
+        &project.title
     }
 }
 

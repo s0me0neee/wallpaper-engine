@@ -66,11 +66,9 @@ pub struct Options {
     pub audio: bool,
 }
 
-impl Options {
-    /// True when the output cannot simply reuse the source's encoded frames.
-    pub fn needs_reencode(&self) -> bool {
-        self.resolution.is_some() || self.fps.is_some()
-    }
+/// True when the output cannot simply reuse the source's encoded frames.
+pub fn needs_reencode(options: &Options) -> bool {
+    options.resolution.is_some() || options.fps.is_some()
 }
 
 #[cfg(test)]

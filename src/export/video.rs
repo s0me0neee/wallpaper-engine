@@ -4,7 +4,7 @@
 //! the job here is packaging rather than rendering: hand the user an mp4 that
 //! an ordinary wallpaper app will accept, without needlessly degrading it.
 
-use super::{Options, ffmpeg};
+use super::{Options, ffmpeg, needs_reencode};
 use anyhow::{Context, Result};
 use std::{ffi::OsString, path::Path};
 
@@ -29,7 +29,7 @@ pub fn export(source: &Path, out: &Path, info: &ffmpeg::MediaInfo, options: &Opt
             .with_context(|| format!("creating {}", parent.display()))?;
     }
 
-    let copy = !options.needs_reencode() && is_broadly_compatible(info);
+    let copy = !needs_reencode(options) && is_broadly_compatible(info);
 
     let mut args: Vec<OsString> = vec!["-i".into(), source.into()];
 

@@ -11,12 +11,14 @@ mod paths;
 mod pkg;
 mod project;
 mod reader;
+mod scene;
 mod tex;
 
 use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand};
 use export::{Options, Resolution};
 use project::{Kind, Project};
+use scene::model;
 use std::path::PathBuf;
 use walkdir::WalkDir;
 
@@ -213,9 +215,12 @@ fn output_stem(project: &Project) -> String {
 fn unsupported_reason(project: &Project) -> Option<String> {
     match &project.kind {
         Kind::Video => None,
-        Kind::Scene => Some(
-            "scene wallpapers need the renderer, which is not built yet".to_string(),
-        ),
+        // Exportable as a still only: the layers composite, but the effect
+        // shaders that animate them do not run yet.
+        Kind::Scene if project.package.is_none() => {
+            Some("no scene.pkg beside project.json, so there are no assets to render".to_string())
+        }
+        Kind::Scene => None,
         Kind::Web => {
             if project.oversized {
                 // These are media-player apps, not wallpapers: hundreds of
@@ -235,13 +240,13 @@ fn unsupported_reason(project: &Project) -> Option<String> {
 }
 
 fn run_info(args: &InfoArgs) -> Result<()> {
-    let project = Project::load(&args.wallpaper)?;
+    let project = project::load(&args.wallpaper)?;
 
-    println!("{}", project.display_name());
+    println!("{}", project::display_name(&project));
     println!("  type       {}", project.kind);
     println!("  directory  {}", project.root.display());
     match &project.entry {
-        Some(entry) if project.entry_is_packaged() => {
+        Some(entry) if project::entry_is_packaged(&project) => {
             println!("  entry      {} (inside scene.pkg)", entry.display());
         }
         Some(entry) => {
@@ -281,8 +286,32 @@ fn run_info(args: &InfoArgs) -> Result<()> {
         );
     }
 
+    // A scene's canvas and layer count come out of the package, which is worth
+    // knowing before asking for a 33-megapixel still.
+    if project.kind == Kind::Scene
+        && let Some(package) = project.package.as_deref()
+        && let Ok(mut archive) = pkg::Archive::open(package)
+        && let Ok(scene) = scene::load(&mut archive)
+    {
+        let images = scene.objects.iter().filter(|o| model::is_image(o)).count();
+        let particles = scene.objects.iter().filter(|o| model::is_particle(o)).count();
+        let effects: usize = scene
+            .objects
+            .iter()
+            .map(|o| model::visible_effects(o).count())
+            .sum();
+
+        if let Some(ortho) = scene.general.orthographic {
+            println!("  canvas     {}x{}", ortho.width, ortho.height);
+        }
+        println!("  layers     {images} image, {particles} particle, {effects} effect(s)");
+    }
+
     match unsupported_reason(&project) {
         Some(reason) => println!("  export     no: {reason}"),
+        None if project.kind == Kind::Scene => {
+            println!("  export     still only (effects and particles are not rendered)")
+        }
         None => println!("  export     yes"),
     }
     Ok(())
@@ -290,7 +319,7 @@ fn run_info(args: &InfoArgs) -> Result<()> {
 
 /// Video wallpapers ship a finished looping file; exporting is packaging.
 fn export_video(project: &Project, stem: &str, options: &Options) -> Result<()> {
-    let source = project.require_entry()?;
+    let source = project::require_entry(project)?;
     export::ffmpeg::require()?;
 
     let info = export::ffmpeg::probe(source)?;
@@ -320,14 +349,57 @@ fn export_video(project: &Project, stem: &str, options: &Options) -> Result<()> 
     Ok(())
 }
 
-fn run_export(args: &ExportArgs) -> Result<()> {
-    let project = Project::load(&args.wallpaper)?;
+/// Scene wallpapers composite their layers into a still.
+///
+/// No video yet: the motion lives in the effect shaders, so a video of the
+/// base composite would be a still repeated, which is worse than not offering
+/// one. Anything the composite cannot represent is listed rather than dropped.
+fn export_scene(project: &Project, stem: &str, options: &Options) -> Result<()> {
+    if !options.still {
+        bail!("scene wallpapers export a still only; --video-only has nothing to produce");
+    }
+    let package = project::require_package(project)?;
+    let mut archive = pkg::Archive::open(package)?;
+    let scene = scene::load(&mut archive)?;
 
-    println!("{}", project.display_name());
+    let composite = scene::compose::render(&mut archive, &scene, options.resolution)?;
+
+    let out = options.out_dir.join(format!("{stem}.png"));
+    if let Some(parent) = out.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    composite
+        .image
+        .save(&out)
+        .with_context(|| format!("writing {}", out.display()))?;
+
+    println!(
+        "  still      {} ({}x{})",
+        out.display(),
+        composite.image.width(),
+        composite.image.height()
+    );
+
+    if !composite.omissions.is_empty() {
+        println!("  not rendered:");
+        for note in &composite.omissions {
+            println!("    - {note}");
+        }
+    }
+    Ok(())
+}
+
+fn run_export(args: &ExportArgs) -> Result<()> {
+    let project = project::load(&args.wallpaper)?;
+
+    println!("{}", project::display_name(&project));
     println!("  type       {}", project.kind);
 
     if let Some(reason) = unsupported_reason(&project) {
-        bail!("cannot export {}: {reason}", project.display_name());
+        bail!(
+            "cannot export {}: {reason}",
+            project::display_name(&project)
+        );
     }
 
     let options = Options {
@@ -344,6 +416,7 @@ fn run_export(args: &ExportArgs) -> Result<()> {
 
     match project.kind {
         Kind::Video => export_video(&project, &stem, &options),
+        Kind::Scene => export_scene(&project, &stem, &options),
         // Every other type was rejected above; this stays exhaustive so a new
         // pipeline cannot be added to the router without being wired in here.
         _ => unreachable!("unsupported types are rejected before dispatch"),

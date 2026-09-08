@@ -21,6 +21,7 @@ use crate::paths::resolve_under;
 use crate::reader::Reader;
 use anyhow::{Context, Result, bail};
 use std::{
+    collections::HashMap,
     fs::File,
     io::{self, BufReader, Read},
     path::Path,
@@ -78,6 +79,75 @@ pub fn read_header<R: Read + io::Seek>(reader: &mut Reader<R>) -> Result<Package
         entries,
         blob_start: reader.pos(),
     })
+}
+
+/// An open archive that can serve individual entries without extracting.
+///
+/// The scene renderer needs a handful of files out of a package that is often
+/// most of a gigabyte, so it reads them on demand rather than unpacking the
+/// whole thing to a temporary directory first.
+pub struct Archive {
+    file: BufReader<File>,
+    blob_start: u64,
+    total: u64,
+    index: HashMap<String, Entry>,
+}
+
+impl Archive {
+    pub fn open(path: &Path) -> Result<Self> {
+        let file = File::open(path).with_context(|| format!("opening {}", path.display()))?;
+        let total = file.metadata()?.len();
+
+        let mut reader = Reader::new(BufReader::new(file));
+        let package = read_header(&mut reader)?;
+        let blob_start = package.blob_start;
+
+        // Archive paths use '/' but Wallpaper Engine's own references are not
+        // consistent about separators, so the index is keyed on a normalized
+        // form and looked up the same way.
+        let index = package
+            .entries
+            .into_iter()
+            .map(|entry| (normalize(&entry.path), entry))
+            .collect();
+
+        Ok(Archive {
+            file: reader.into_inner(),
+            blob_start,
+            total,
+            index,
+        })
+    }
+
+    /// Read one entry into memory.
+    pub fn read(&mut self, path: &str) -> Result<Vec<u8>> {
+        let entry = self
+            .index
+            .get(&normalize(path))
+            .with_context(|| format!("{path:?} is not in the package"))?;
+
+        let start = self.blob_start + entry.offset as u64;
+        let end = start + entry.length as u64;
+        if end > self.total {
+            bail!(
+                "entry {:?} runs past end of file ({end} > {})",
+                entry.path,
+                self.total
+            );
+        }
+
+        let length = entry.length as usize;
+        let mut reader = Reader::new(&mut self.file);
+        reader.seek_to(start)?;
+        let mut buffer = vec![0u8; length];
+        reader.into_inner().read_exact(&mut buffer)?;
+        Ok(buffer)
+    }
+}
+
+/// Key archive paths on separator and case, both of which vary in the wild.
+fn normalize(path: &str) -> String {
+    path.replace('\\', "/").to_lowercase()
 }
 
 /// Extract every entry into `out_dir`, or just list them.
