@@ -233,6 +233,13 @@ needing a virtual device or a `ScreenCaptureKit` audio tap). A scene without
 the one-image-plus-effects shape just shows the static composite in the
 window rather than refusing to open one.
 
+Resizing the window doesn't stretch the image to the new shape: `State`
+records the scene's own pixel dimensions once at open time (every render
+target matches it, chain or no chain), and `pass::blit_to_screen` letterboxes
+— clears the whole window to black, then draws into a centered sub-viewport
+scaled to fit while preserving that aspect ratio (`pass::letterbox`, unit
+tested directly since it's pure arithmetic, no GL context needed).
+
 An `egui` (`egui_glow`, winit-integrated) overlay draws an "Effect
 Parameters" panel on top with one slider per range-annotated scalar `float`
 uniform any pass declares (`scene::render::Tweakable`, `collect_tweakables`)

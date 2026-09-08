@@ -325,13 +325,40 @@ pub fn compile_blit_program(gl: &glow::Context) -> Result<BlitProgram> {
     Ok(BlitProgram { program: compile_program(gl, BLIT_VERTEX, BLIT_FRAGMENT)? })
 }
 
-/// Draw `texture` fullscreen to the window (framebuffer 0), stretched to
-/// `width`x`height`. `quad` should be `build_display_quad`'s, not
+/// The sub-rectangle of a `window`-sized viewport that shows `content` at its
+/// own aspect ratio, centered, letterboxed instead of stretched — `(x, y,
+/// width, height)` in the framebuffer's own bottom-left-origin coordinates.
+fn letterbox(content: (u32, u32), window: (i32, i32)) -> (i32, i32, i32, i32) {
+    #[expect(clippy::cast_precision_loss, reason = "wallpaper/window dimensions are nowhere near f32's 2^24 exact range")]
+    let (content_w, content_h, window_w, window_h) =
+        (content.0 as f32, content.1 as f32, window.0 as f32, window.1 as f32);
+    let scale = (window_w / content_w).min(window_h / content_h);
+    #[expect(clippy::cast_possible_truncation, reason = "scaling a window-sized rect down; always fits back in i32")]
+    let (width, height) = ((content_w * scale) as i32, (content_h * scale) as i32);
+    (((window.0 - width) / 2).max(0), ((window.1 - height) / 2).max(0), width, height)
+}
+
+/// Draw `texture` to the window (framebuffer 0), letterboxed within
+/// `window`'s dimensions to preserve `content`'s own aspect ratio — the
+/// bars are cleared to black rather than stretching the image to fill an
+/// arbitrarily-resized window. `quad` should be `build_display_quad`'s, not
 /// `build_quad`'s — see the difference between the two.
-pub fn blit_to_screen(gl: &glow::Context, blit: &BlitProgram, quad: &Quad, texture: glow::Texture, width: i32, height: i32) {
+pub fn blit_to_screen(
+    gl: &glow::Context,
+    blit: &BlitProgram,
+    quad: &Quad,
+    texture: glow::Texture,
+    content: (u32, u32),
+    window: (i32, i32),
+) {
+    let (x, y, width, height) = letterbox(content, window);
     unsafe {
         gl.bind_framebuffer(glow::FRAMEBUFFER, None);
-        gl.viewport(0, 0, width, height);
+        gl.viewport(0, 0, window.0, window.1);
+        gl.clear_color(0.0, 0.0, 0.0, 1.0);
+        gl.clear(glow::COLOR_BUFFER_BIT);
+
+        gl.viewport(x, y, width, height);
         gl.use_program(Some(blit.program.handle));
         gl.bind_vertex_array(Some(quad.vertex_array));
         gl.active_texture(glow::TEXTURE0);
@@ -395,4 +422,30 @@ fn set_uniform_int(gl: &glow::Context, program: glow::Program, name: &str, value
         return;
     };
     unsafe { gl.uniform_1_i32(Some(&location), value) };
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn letterbox_pillarboxes_when_the_window_is_relatively_taller() {
+        let (x, y, width, height) = letterbox((1600, 900), (900, 900));
+        assert_eq!((width, height), (900, 506), "scaled to fit the narrower dimension");
+        assert_eq!(x, 0, "full width used, no horizontal bars");
+        assert_eq!(y, 197, "vertical bars split evenly above and below");
+    }
+
+    #[test]
+    fn letterbox_letterboxes_when_the_window_is_relatively_wider() {
+        let (x, y, width, height) = letterbox((1600, 900), (1600, 1600));
+        assert_eq!((width, height), (1600, 900), "scaled to fit the shorter dimension");
+        assert_eq!(x, 0, "full width used, no horizontal bars");
+        assert_eq!(y, 350, "vertical bars split evenly above and below");
+    }
+
+    #[test]
+    fn letterbox_fills_the_window_exactly_when_aspect_ratios_match() {
+        assert_eq!(letterbox((1920, 1080), (1920, 1080)), (0, 0, 1920, 1080));
+    }
 }

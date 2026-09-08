@@ -88,6 +88,10 @@ struct State {
     blit: pass::BlitProgram,
     chain: Option<EffectChain>,
     base_texture: glow::Texture,
+    /// The scene's own pixel dimensions — every render target matches this,
+    /// so the window is letterboxed to it rather than stretching to
+    /// whatever shape the window gets resized to.
+    content_size: (u32, u32),
     egui: egui_glow::winit::EguiGlow,
     /// One live value per `chain`'s `tweakables`, in the same order —
     /// starts at the wallpaper's own preset and moves as the panel's
@@ -163,7 +167,7 @@ impl App<'_> {
         let egui = egui_glow::winit::EguiGlow::new(event_loop, Arc::clone(&gl), None, None, true);
 
         window.request_redraw();
-        Ok(State { window, surface, context, gl, quad, blit, chain, base_texture, egui, values })
+        Ok(State { window, surface, context, gl, quad, blit, chain, base_texture, content_size: (width, height), egui, values })
     }
 }
 
@@ -200,8 +204,8 @@ fn redraw(state: &mut State, time: f32) -> Result<()> {
 
     let size = state.window.inner_size();
     #[expect(clippy::cast_possible_wrap, reason = "window dimensions are nowhere near i32::MAX")]
-    let (width, height) = (size.width as i32, size.height as i32);
-    pass::blit_to_screen(&state.gl, &state.blit, &state.quad, texture, width, height);
+    let window = (size.width as i32, size.height as i32);
+    pass::blit_to_screen(&state.gl, &state.blit, &state.quad, texture, state.content_size, window);
     state.egui.paint(&state.window);
     state.surface.swap_buffers(&state.context).context("swapping buffers")
 }

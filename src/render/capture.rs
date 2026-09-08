@@ -118,7 +118,7 @@ mod tests {
         let blit = pass::compile_blit_program(&gpu.gl).expect("compiling the blit program");
         let texture = pass::upload_texture(&gpu.gl, &base).expect("uploading the base texture");
 
-        pass::blit_to_screen(&gpu.gl, &blit, &quad, texture, 1, 2);
+        pass::blit_to_screen(&gpu.gl, &blit, &quad, texture, (1, 2), (1, 2));
 
         let mut buffer = [0u8; 8];
         unsafe {
