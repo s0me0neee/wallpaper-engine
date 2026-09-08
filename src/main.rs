@@ -24,14 +24,11 @@ use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
 
 /// Export Wallpaper Engine wallpapers to ordinary images and video.
-///
-/// With no subcommand, runs the container debugging pipeline with default
-/// paths: `papers/scene_example1/scene.pkg` -> `unpacked/` -> `textures/`
 #[derive(Parser)]
-#[command(name = "wallpaper-engine", version, about, long_about = None)]
+#[command(name = "wallpaper-engine", version, about, long_about = None, arg_required_else_help = true)]
 struct Cli {
     #[command(subcommand)]
-    command: Option<Command>,
+    command: Command,
 }
 
 #[derive(Subcommand)]
@@ -139,27 +136,6 @@ struct TexArgs {
     /// Export every mip level, not just the largest.
     #[arg(short, long)]
     all_mipmaps: bool,
-}
-
-impl Default for UnpackArgs {
-    fn default() -> Self {
-        Self {
-            pkg: PathBuf::from("papers/scene_example1/scene.pkg"),
-            out: PathBuf::from("unpacked"),
-            list: false,
-        }
-    }
-}
-
-impl Default for TexArgs {
-    fn default() -> Self {
-        Self {
-            paths: vec![PathBuf::from("unpacked")],
-            out: PathBuf::from("textures"),
-            info: false,
-            all_mipmaps: false,
-        }
-    }
 }
 
 /// Collect `.tex` files, expanding any directory argument recursively.
@@ -508,21 +484,11 @@ fn run_export(args: &ExportArgs) -> Result<()> {
 
 fn main() -> Result<()> {
     match Cli::parse().command {
-        Some(Command::Export(args)) => run_export(&args),
-        Some(Command::Info(args)) => run_info(&args),
-        Some(Command::Unpack(args)) => run_unpack(&args),
-        Some(Command::Tex(args)) => run_tex(&args),
-        Some(Command::Shaders(args)) => run_shaders(&args),
-        // No subcommand: run the whole pipeline with default paths.
-        None => {
-            let unpack_args = UnpackArgs::default();
-            run_unpack(&unpack_args)?;
-            println!();
-            run_tex(&TexArgs {
-                paths: vec![unpack_args.out.clone()],
-                ..TexArgs::default()
-            })
-        }
+        Command::Export(args) => run_export(&args),
+        Command::Info(args) => run_info(&args),
+        Command::Unpack(args) => run_unpack(&args),
+        Command::Tex(args) => run_tex(&args),
+        Command::Shaders(args) => run_shaders(&args),
     }
 }
 
