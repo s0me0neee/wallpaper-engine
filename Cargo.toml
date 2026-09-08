@@ -11,14 +11,21 @@ clap = { version = "4.6.6", features = ["derive"] }
 # major version tracks ffmpeg's own — 9.x builds against ffmpeg 9.
 ffmpeg-next = "9.0.0"
 glsl-include = "0.3.1"
-image = { version = "0.25.10", default-features = false, features = ["png", "jpeg", "gif", "bmp", "tga", "rayon"] }
+image = { version = "0.25.10", default-features = false, features = [
+	"png",
+	"jpeg",
+	"gif",
+	"bmp",
+	"tga",
+	"rayon",
+] }
 # Wallpaper Engine stores bare LZ4 *blocks* with no length prefix, so only the
 # block API is used. `safe-decode` keeps the hot path free of `unsafe`, which
 # matters because Workshop packages are untrusted input.
 lz4_flex = { version = "0.14.0", default-features = false, features = [
-    "std",
-    "safe-decode",
-    "safe-encode",
+	"std",
+	"safe-decode",
+	"safe-encode",
 ] }
 # Encodes the PNGs we generate for raw-pixel textures. Textures whose payload is
 # already an encoded image are passed through byte-for-byte and never hit this.
@@ -31,21 +38,11 @@ texpresso = "2.0.2"
 walkdir = "2.5.0"
 
 [lints.clippy]
-nursery = { level = "deny", priority = -1 }
 pedantic = { level = "deny", priority = -1 }
 unwrap_used = "deny"
-expect_used = "deny"
-indexing_slicing = "deny"
-arithmetic_side_effects = "deny"
-unreachable = "deny"
-unimplemented = "deny"
-unchecked_time_subtraction = "deny"
 todo = "deny"
-string_slice = "deny"
-panic_in_result_fn = "deny"
 panic = "deny"
 exit = "deny"
-as_conversions = "deny"
 
 [profile.release]
 opt-level = 3

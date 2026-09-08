@@ -80,6 +80,11 @@ pub fn probe(path: &Path) -> Result<MediaInfo> {
 
     // Prefer the container duration: a stream may omit it, and for our
     // purposes the whole-file length is what a loop is measured against.
+    //
+    // Durations are microsecond counts nowhere near f64's ~2^52 exact-integer
+    // range (that's ~140,000 years), so the conversion loses no precision in
+    // practice; clippy cannot see that bound.
+    #[expect(clippy::cast_precision_loss, reason = "microsecond counts, nowhere near 2^52")]
     let duration = if ictx.duration() > 0 {
         ictx.duration() as f64 / f64::from(ffmpeg::ffi::AV_TIME_BASE)
     } else if stream.duration() > 0 {

@@ -37,6 +37,7 @@ use crate::reader::Reader;
 use anyhow::{Context, Result, bail};
 use std::{
     borrow::Cow,
+    fmt::Write as _,
     fs::File,
     io::{BufReader, BufWriter, Read, Seek},
     path::{Path, PathBuf},
@@ -88,7 +89,7 @@ impl Format {
     }
 }
 
-/// FreeImage `FIF_*` values we may meet as embedded files, and their extension.
+/// `FreeImage` `FIF_*` values we may meet as embedded files, and their extension.
 fn free_image_ext(value: i32) -> Option<&'static str> {
     Some(match value {
         _ if value < 0 => return None,
@@ -210,6 +211,7 @@ fn parse_from<R: Read + Seek>(source: R) -> Result<Tex> {
         -1
     };
 
+    #[expect(clippy::cast_sign_loss, reason = "just bounded to 0..=1024 above")]
     let mut images = Vec::with_capacity(image_count as usize);
     for _ in 0..image_count {
         // Purpose unknown; 0 in every v4 sample inspected. Every sample has a
@@ -223,6 +225,7 @@ fn parse_from<R: Read + Seek>(source: R) -> Result<Tex> {
             bail!("implausible mipmap count {mipmap_count}");
         }
 
+        #[expect(clippy::cast_sign_loss, reason = "just bounded to 0..=64 above")]
         let mut mipmaps = Vec::with_capacity(mipmap_count as usize);
         for _ in 0..mipmap_count {
             let width = reader.i32()?;
@@ -239,6 +242,7 @@ fn parse_from<R: Read + Seek>(source: R) -> Result<Tex> {
                 bail!("negative mipmap dimension or size");
             }
 
+            #[expect(clippy::cast_sign_loss, reason = "just checked non-negative above")]
             mipmaps.push(Mipmap {
                 width: width as usize,
                 height: height as usize,
@@ -304,7 +308,10 @@ fn write_png(
     }
 
     let file = File::create(path).with_context(|| format!("creating {}", path.display()))?;
-    let mut encoder = png::Encoder::new(BufWriter::new(file), width as u32, height as u32);
+    // PNG dimensions are u32 by spec; anything wider would not be a valid PNG.
+    let png_width = u32::try_from(width).context("image too wide for a PNG")?;
+    let png_height = u32::try_from(height).context("image too tall for a PNG")?;
+    let mut encoder = png::Encoder::new(BufWriter::new(file), png_width, png_height);
     encoder.set_color(color);
     encoder.set_depth(png::BitDepth::Eight);
     encoder.write_header()?.write_image_data(&pixels[..needed])?;
@@ -319,7 +326,8 @@ fn write_png(
 /// and a photo can be blended by the same code.
 pub fn decode_rgba(tex: &Tex, mipmap: &Mipmap) -> Result<image::RgbaImage> {
     let payload = mipmap_pixels(mipmap)?;
-    let (width, height) = (mipmap.width as u32, mipmap.height as u32);
+    let width = u32::try_from(mipmap.width).context("texture too wide")?;
+    let height = u32::try_from(mipmap.height).context("texture too tall")?;
 
     // An embedded file carries its own dimensions, and they are authoritative:
     // the mipmap header describes the texture slot, not the encoded image.
@@ -401,7 +409,7 @@ pub fn save_mipmap(tex: &Tex, mipmap: &Mipmap, stem: &Path) -> Result<PathBuf> {
         // Two channels; greyscale+alpha is a byte-exact PNG match.
         Format::Rg88 => png::ColorType::GrayscaleAlpha,
         Format::R8 => png::ColorType::Grayscale,
-        other => bail!("unsupported pixel format {}", other.label()),
+        Format::Unknown(_) => bail!("unsupported pixel format {}", tex.format.label()),
     };
 
     match tex.format.block_format() {
@@ -500,10 +508,10 @@ pub fn convert(path: &Path, out_dir: &Path, all_mipmaps: bool, info_only: bool) 
         for (level, mipmap) in selected {
             let mut name = stem.to_string();
             if tex.images.len() > 1 {
-                name.push_str(&format!("_img{image_index}"));
+                let _ = write!(name, "_img{image_index}");
             }
             if all_mipmaps && mipmaps.len() > 1 {
-                name.push_str(&format!("_mip{level}"));
+                let _ = write!(name, "_mip{level}");
             }
             let written = save_mipmap(&tex, mipmap, &out_dir.join(name))?;
             println!("    -> {}", written.display());

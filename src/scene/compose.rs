@@ -42,6 +42,9 @@ fn canvas_for(ortho: Orthographic, resolution: Option<Resolution>) -> Result<Can
         bail!("scene has an empty {}x{} canvas", ortho.width, ortho.height);
     }
 
+    // Both sides are image dimensions, always far below f32's 2^24 exact-
+    // integer range, so the conversion loses no precision in practice.
+    #[expect(clippy::cast_precision_loss, reason = "image dimensions, nowhere near 2^24")]
     let (width, height, scale) = match resolution {
         Some(target) => {
             // Uniform scale from the width; a request with a different aspect
@@ -61,10 +64,9 @@ fn canvas_for(ortho: Orthographic, resolution: Option<Resolution>) -> Result<Can
 /// backwards puts eyelashes at the character's feet, which is how it was
 /// confirmed against the sample.
 fn to_pixels(canvas: &Canvas, world_x: f32, world_y: f32) -> (f32, f32) {
-    (
-        world_x * canvas.scale,
-        (canvas.ortho.height as f32 - world_y) * canvas.scale,
-    )
+    #[expect(clippy::cast_precision_loss, reason = "image dimensions, nowhere near 2^24")]
+    let height = canvas.ortho.height as f32;
+    (world_x * canvas.scale, (height - world_y) * canvas.scale)
 }
 
 /// Resolve an object's texture through the model and material indirection.
@@ -98,11 +100,30 @@ fn layer_texture(archive: &mut Archive, object: &Object) -> Result<Option<RgbaIm
     Ok(Some(decoded))
 }
 
+/// Scale a channel by a `0.0..=1.0` factor and round back to a byte.
+///
+/// The factor is always clamped before this is called, so the product stays
+/// within `0.0..=255.0` and the cast neither truncates nor loses a sign —
+/// clippy cannot see that bound, hence the scoped allow.
+fn scale_channel(value: u8, factor: f32) -> u8 {
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "factor is clamped to 0.0..=1.0, so the product fits in 0..=255"
+    )]
+    let scaled = (f32::from(value) * factor).round() as u8;
+    scaled
+}
+
 /// Multiply a layer by its tint, brightness and alpha, in place.
 ///
 /// Skipped entirely when the layer is untinted and opaque, which is the common
-/// case and would otherwise mean touching every pixel of an 8K texture.
+/// case and would otherwise mean touching every pixel of an 8K texture. The
+/// comparison against `1.0` is exact on purpose: these are serde defaults, not
+/// the result of arithmetic, so "equals the default" is the right question,
+/// not "is close to".
 fn apply_tint(layer: &mut RgbaImage, color: Vec3, brightness: f32, alpha: f32) {
+    #[expect(clippy::float_cmp, reason = "checking against an untouched serde default, not a computed value")]
     let neutral = color == Vec3::splat(1.0) && brightness == 1.0 && alpha == 1.0;
     if neutral {
         return;
@@ -116,16 +137,18 @@ fn apply_tint(layer: &mut RgbaImage, color: Vec3, brightness: f32, alpha: f32) {
     for pixel in layer.pixels_mut() {
         let [r, g, b, a] = pixel.0;
         pixel.0 = [
-            (r as f32 * red) as u8,
-            (g as f32 * green) as u8,
-            (b as f32 * blue) as u8,
-            (a as f32 * alpha) as u8,
+            scale_channel(r, red),
+            scale_channel(g, green),
+            scale_channel(b, blue),
+            scale_channel(a, alpha),
         ];
     }
 }
 
 /// The layer's extent in scene units, from `size` when given.
 fn extent(object: &Object, texture: &RgbaImage) -> (f32, f32) {
+    // Texture dimensions, nowhere near f32's 2^24 exact-integer range.
+    #[expect(clippy::cast_precision_loss, reason = "image dimensions, nowhere near 2^24")]
     let (width, height) = match object.size {
         Some(size) if size.x > 0.0 && size.y > 0.0 => (size.x, size.y),
         // `autosize` models omit the size and take it from the texture.
@@ -176,9 +199,9 @@ pub fn render(
     let background = if scene.general.clearenabled {
         let clear = scene.general.clearcolor;
         Rgba([
-            (clear.x.clamp(0.0, 1.0) * 255.0) as u8,
-            (clear.y.clamp(0.0, 1.0) * 255.0) as u8,
-            (clear.z.clamp(0.0, 1.0) * 255.0) as u8,
+            scale_channel(255, clear.x.clamp(0.0, 1.0)),
+            scale_channel(255, clear.y.clamp(0.0, 1.0)),
+            scale_channel(255, clear.z.clamp(0.0, 1.0)),
             255,
         ])
     } else {
@@ -204,8 +227,17 @@ pub fn render(
         };
 
         let (extent_x, extent_y) = extent(object, &texture);
-        let pixel_width = (extent_x * canvas.scale).round().max(1.0) as u32;
-        let pixel_height = (extent_y * canvas.scale).round().max(1.0) as u32;
+        // Rounded and floored at 1.0 above, so this always lands in u32's
+        // range for any wallpaper-sized canvas.
+        #[expect(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            reason = "rounded and floored at 1.0 above"
+        )]
+        let (pixel_width, pixel_height) = (
+            (extent_x * canvas.scale).round().max(1.0) as u32,
+            (extent_y * canvas.scale).round().max(1.0) as u32,
+        );
 
         let mut layer = if texture.width() == pixel_width && texture.height() == pixel_height {
             texture
@@ -226,7 +258,11 @@ pub fn render(
             object.origin.x - extent_x / 2.0,
             object.origin.y + extent_y / 2.0,
         );
-        imageops::overlay(&mut output, &layer, left.round() as i64, top.round() as i64);
+        // A wallpaper canvas is at most a few tens of thousands of pixels
+        // wide, nowhere near i64's range.
+        #[expect(clippy::cast_possible_truncation, reason = "canvas coordinates, nowhere near i64's range")]
+        let (left, top) = (left.round() as i64, top.round() as i64);
+        imageops::overlay(&mut output, &layer, left, top);
         drawn += 1;
     }
 
@@ -323,6 +359,6 @@ mod tests {
     #[test]
     fn a_plain_layer_has_nothing_to_report() {
         let object: Object = serde_json::from_str(r#"{"name":"bg","image":"models/a.json"}"#).unwrap();
-        assert!(omissions_for(&object).is_empty());
+        assert_eq!(omissions_for(&object), Vec::<String>::new());
     }
 }

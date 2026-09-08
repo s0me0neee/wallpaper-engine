@@ -68,7 +68,9 @@ impl<R: Read> Reader<R> {
         if !(0..=4096).contains(&length) {
             bail!("implausible string length {length} at offset {}", self.pos - 4);
         }
-        Ok(String::from_utf8(self.bytes(length as usize)?)?)
+        #[expect(clippy::cast_sign_loss, reason = "just bounded to 0..=4096 above")]
+        let length = length as usize;
+        Ok(String::from_utf8(self.bytes(length)?)?)
     }
 }
 

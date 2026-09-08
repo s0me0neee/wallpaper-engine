@@ -58,6 +58,10 @@ impl<'de> Deserialize<'de> for Vec3 {
             Value::String(raw) => parse_vec3(&raw)
                 .ok_or_else(|| de::Error::custom(format!("malformed vector {raw:?}"))),
             Value::Number(number) => {
+                // Scene values are small (scale factors, unit vectors); the
+                // precision f32 drops here is well below what the format
+                // itself carries (5 decimal digits, per the doc comment above).
+                #[expect(clippy::cast_possible_truncation, reason = "scene values are small")]
                 let value = number.as_f64().unwrap_or_default() as f32;
                 Ok(Vec3::splat(value))
             }

@@ -9,7 +9,7 @@ use anyhow::{Context, Result};
 use ffmpeg::format::Pixel;
 use ffmpeg::{Dictionary, Packet, Rational, codec, encoder, filter, format, media, picture};
 use ffmpeg_next as ffmpeg;
-use std::path::Path;
+use std::{fmt::Write as _, path::Path};
 
 /// Container-level compatibility. Anything else gets re-encoded.
 ///
@@ -35,21 +35,30 @@ struct Encode {
 /// Write `source` to `out` as a wallpaper-app-friendly mp4.
 ///
 /// Returns whether the video stream was copied rather than re-encoded.
-pub fn export(
+/// The stream layout and timing this export settled on, once the output's
+/// header is written — nothing about it changes for the rest of the export.
+struct Streams {
+    video_index: usize,
+    audio_index: Option<usize>,
+    video_time_base: Rational,
+    audio_time_base: Option<Rational>,
+    video_out_time_base: Rational,
+    audio_out_time_base: Option<Rational>,
+}
+
+/// Open the input, declare the output's streams, and write its header.
+///
+/// Audio is copied, never transcoded: a wallpaper's audio is already in a
+/// codec mp4 accepts, and re-encoding it would only lose quality.
+fn open_streams(
     source: &Path,
     out: &Path,
     info: &ff::MediaInfo,
     options: &Options,
-) -> Result<bool> {
-    if let Some(parent) = out.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("creating {}", parent.display()))?;
-    }
-
-    let copy = !needs_reencode(options) && is_broadly_compatible(info);
-
+    copy: bool,
+) -> Result<(format::context::Input, format::context::Output, Streams, Option<Encode>)> {
     ff::init()?;
-    let mut ictx = format::input(source)
+    let ictx = format::input(source)
         .with_context(|| format!("opening {}", source.display()))?;
     let mut octx = format::output(out)
         .with_context(|| format!("creating {}", out.display()))?;
@@ -59,14 +68,10 @@ pub fn export(
         .best(media::Type::Video)
         .with_context(|| format!("{} has no video stream", source.display()))?
         .index();
-    // Audio is copied, never transcoded: a wallpaper's audio is already in a
-    // codec mp4 accepts, and re-encoding it would only lose quality.
-    let audio_index = match options.audio && info.has_audio {
-        true => ictx
-            .streams()
-            .best(media::Type::Audio)
-            .map(|stream| stream.index()),
-        false => None,
+    let audio_index = if options.audio && info.has_audio {
+        ictx.streams().best(media::Type::Audio).map(|stream| stream.index())
+    } else {
+        None
     };
 
     let video_stream = ictx
@@ -74,12 +79,11 @@ pub fn export(
         .expect("the index came from this context");
     let video_time_base = video_stream.time_base();
 
-    let mut encode = match copy {
-        true => {
-            add_copied_stream(&mut octx, &video_stream)?;
-            None
-        }
-        false => Some(setup_encode(&video_stream, &mut octx, options)?),
+    let encode = if copy {
+        add_copied_stream(&mut octx, &video_stream)?;
+        None
+    } else {
+        Some(setup_encode(&video_stream, &mut octx, options)?)
     };
 
     let audio_time_base = match audio_index {
@@ -109,23 +113,49 @@ pub fn export(
         .time_base();
     let audio_out_time_base = octx.stream(1).map(|stream| stream.time_base());
 
-    // Trimming is a container operation, so it does not force a re-encode; on
-    // the copy path the cut lands on whole packets, which is fine for a loop.
-    let limit = options.duration;
+    Ok((
+        ictx,
+        octx,
+        Streams {
+            video_index,
+            audio_index,
+            video_time_base,
+            audio_time_base,
+            video_out_time_base,
+            audio_out_time_base,
+        },
+        encode,
+    ))
+}
+
+/// Walk the input's packets, copying or decoding+encoding each into the
+/// output, stopping once both streams have passed the requested duration.
+///
+/// Trimming is a container operation, so it does not force a re-encode; on
+/// the copy path the cut lands on whole packets, which is fine for a loop.
+fn copy_packets(
+    ictx: &mut format::context::Input,
+    octx: &mut format::context::Output,
+    streams: &Streams,
+    encode: &mut Option<Encode>,
+    limit: Option<f64>,
+) -> Result<()> {
     let mut video_done = false;
-    let mut audio_done = audio_index.is_none();
+    let mut audio_done = streams.audio_index.is_none();
 
     for (stream, mut packet) in ictx.packets() {
         let index = stream.index();
-        let is_video = index == video_index;
-        if !is_video && Some(index) != audio_index {
+        let is_video = index == streams.video_index;
+        if !is_video && Some(index) != streams.audio_index {
             continue;
         }
 
         let time_base = if is_video {
-            video_time_base
+            streams.video_time_base
         } else {
-            audio_time_base.expect("an audio stream implies its time base")
+            streams
+                .audio_time_base
+                .expect("an audio stream implies its time base")
         };
         if past_limit(&packet, time_base, limit) {
             if is_video {
@@ -145,40 +175,69 @@ pub fn export(
                     .decoder
                     .send_packet(&packet)
                     .context("decoding the source video")?;
-                drain_decoder(encode, &mut octx, video_out_time_base)?;
+                drain_decoder(encode, octx, streams.video_out_time_base)?;
             }
             (true, None) => {
-                remux(&mut packet, 0, time_base, video_out_time_base, &mut octx)?;
+                remux(&mut packet, 0, time_base, streams.video_out_time_base, octx)?;
             }
             (false, _) => {
-                let out_time_base =
-                    audio_out_time_base.expect("an audio stream implies an output stream");
-                remux(&mut packet, 1, time_base, out_time_base, &mut octx)?;
+                let out_time_base = streams
+                    .audio_out_time_base
+                    .expect("an audio stream implies an output stream");
+                remux(&mut packet, 1, time_base, out_time_base, octx)?;
             }
         }
     }
+    Ok(())
+}
+
+/// Push the decoder, filter graph and encoder to end-of-stream in turn.
+fn flush_encode(
+    encode: &mut Encode,
+    octx: &mut format::context::Output,
+    video_out_time_base: Rational,
+) -> Result<()> {
+    encode
+        .decoder
+        .send_eof()
+        .context("flushing the video decoder")?;
+    drain_decoder(encode, octx, video_out_time_base)?;
+
+    encode
+        .graph
+        .get("in")
+        .expect("the graph has a buffer source")
+        .source()
+        .flush()
+        .context("flushing the filter graph")?;
+    drain_graph(encode, octx, video_out_time_base)?;
+
+    encode
+        .encoder
+        .send_eof()
+        .context("flushing the video encoder")?;
+    drain_encoder(encode, octx, video_out_time_base)
+}
+
+pub fn export(
+    source: &Path,
+    out: &Path,
+    info: &ff::MediaInfo,
+    options: &Options,
+) -> Result<bool> {
+    if let Some(parent) = out.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating {}", parent.display()))?;
+    }
+
+    let copy = !needs_reencode(options) && is_broadly_compatible(info);
+    let (mut ictx, mut octx, streams, mut encode) =
+        open_streams(source, out, info, options, copy)?;
+
+    copy_packets(&mut ictx, &mut octx, &streams, &mut encode, options.duration)?;
 
     if let Some(encode) = encode.as_mut() {
-        encode
-            .decoder
-            .send_eof()
-            .context("flushing the video decoder")?;
-        drain_decoder(encode, &mut octx, video_out_time_base)?;
-
-        encode
-            .graph
-            .get("in")
-            .expect("the graph has a buffer source")
-            .source()
-            .flush()
-            .context("flushing the filter graph")?;
-        drain_graph(encode, &mut octx, video_out_time_base)?;
-
-        encode
-            .encoder
-            .send_eof()
-            .context("flushing the video encoder")?;
-        drain_encoder(encode, &mut octx, video_out_time_base)?;
+        flush_encode(encode, &mut octx, streams.video_out_time_base)?;
     }
 
     octx.write_trailer()
@@ -194,7 +253,11 @@ fn past_limit(packet: &Packet, time_base: Rational, limit: Option<f64>) -> bool 
     let Some(pts) = packet.pts().or_else(|| packet.dts()) else {
         return false;
     };
-    pts as f64 * f64::from(time_base) > limit
+    // Packet timestamps are frame counts at typical wallpaper lengths and
+    // rates, nowhere near f64's ~2^52 exact-integer range.
+    #[expect(clippy::cast_precision_loss, reason = "frame counts, nowhere near 2^52")]
+    let seconds = pts as f64 * f64::from(time_base);
+    seconds > limit
 }
 
 /// Declare an output stream that reuses the input stream's encoded form.
@@ -315,15 +378,14 @@ fn build_graph(
         decoder
             .format()
             .descriptor()
-            .map(|descriptor| descriptor.name())
-            .unwrap_or("yuv420p"),
+            .map_or("yuv420p", |descriptor| descriptor.name()),
         ist.time_base(),
         decoder.aspect_ratio(),
     );
     // Only pass a rate the source actually declares; `fps` needs one, and
     // 0/0 is rejected outright.
     if ff::rate_to_fps(ist.avg_frame_rate()).is_some() {
-        args.push_str(&format!(":frame_rate={}", ist.avg_frame_rate()));
+        let _ = write!(args, ":frame_rate={}", ist.avg_frame_rate());
     }
 
     let mut spec = Vec::new();

@@ -59,6 +59,7 @@ pub fn read_header<R: Read + io::Seek>(reader: &mut Reader<R>) -> Result<Package
         bail!("implausible entry count {entry_count}");
     }
 
+    #[expect(clippy::cast_sign_loss, reason = "just bounded to 0..=1_000_000 above")]
     let mut entries = Vec::with_capacity(entry_count as usize);
     for index in 0..entry_count {
         let path = reader.string()?;
@@ -67,6 +68,7 @@ pub fn read_header<R: Read + io::Seek>(reader: &mut Reader<R>) -> Result<Package
         if offset < 0 || length < 0 {
             bail!("entry {index} ({path}) has negative offset/length");
         }
+        #[expect(clippy::cast_sign_loss, reason = "just checked non-negative above")]
         entries.push(Entry {
             path,
             offset: offset as u32,
@@ -131,8 +133,8 @@ impl Archive {
             .get(&normalize(path))
             .with_context(|| format!("{path:?} is not in the package"))?;
 
-        let start = self.blob_start + entry.offset as u64;
-        let end = start + entry.length as u64;
+        let start = self.blob_start + u64::from(entry.offset);
+        let end = start + u64::from(entry.length);
         if end > self.total {
             bail!(
                 "entry {:?} runs past end of file ({end} > {})",
@@ -183,8 +185,8 @@ pub fn unpack(pkg_path: &Path, out_dir: &Path, list_only: bool) -> Result<()> {
     let mut inner = reader.into_inner();
 
     for entry in ordered {
-        let start = blob_start + entry.offset as u64;
-        let end = start + entry.length as u64;
+        let start = blob_start + u64::from(entry.offset);
+        let end = start + u64::from(entry.length);
         if end > total {
             bail!(
                 "entry {:?} runs past end of file ({end} > {total})",
@@ -204,7 +206,7 @@ pub fn unpack(pkg_path: &Path, out_dir: &Path, list_only: bool) -> Result<()> {
 
         let mut reader = Reader::new(&mut inner);
         reader.seek_to(start)?;
-        let mut chunk = reader.into_inner().take(entry.length as u64);
+        let mut chunk = reader.into_inner().take(u64::from(entry.length));
         let mut out = File::create(&target)
             .with_context(|| format!("creating {}", target.display()))?;
         io::copy(&mut chunk, &mut out)?;

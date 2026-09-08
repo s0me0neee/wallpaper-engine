@@ -36,6 +36,10 @@ pub fn from_video(
     // not mean decoding the whole file: on a 27-second 1440p60 source that is
     // the difference between instant and several seconds.
     if at_seconds > 0.0 {
+        // A wallpaper's still timestamp is always a few seconds at most, so
+        // this lands nowhere near i64's range; the truncation is deliberate —
+        // ffmpeg's seek target is in whole microseconds.
+        #[expect(clippy::cast_possible_truncation, reason = "seek target is whole microseconds")]
         let target = (at_seconds * f64::from(ffmpeg::ffi::AV_TIME_BASE)) as i64;
         ictx.seek(target, ..target)
             .with_context(|| format!("seeking to {at_seconds}s in {}", video.display()))?;
@@ -115,9 +119,11 @@ fn decode_frame_at(
 }
 
 fn frame_seconds(frame: &Video, time_base: ffmpeg::Rational) -> f64 {
+    // Timestamps are frame counts at typical wallpaper lengths and rates,
+    // nowhere near f64's ~2^52 exact-integer range.
+    #[expect(clippy::cast_precision_loss, reason = "frame counts, nowhere near 2^52")]
     frame
         .timestamp()
         .or_else(|| frame.pts())
-        .map(|pts| pts as f64 * f64::from(time_base))
-        .unwrap_or(0.0)
+        .map_or(0.0, |pts| pts as f64 * f64::from(time_base))
 }

@@ -20,13 +20,13 @@ use clap::{Args, Parser, Subcommand};
 use export::{Options, Resolution};
 use project::{Kind, Project};
 use scene::model;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
 
 /// Export Wallpaper Engine wallpapers to ordinary images and video.
 ///
 /// With no subcommand, runs the container debugging pipeline with default
-/// paths: papers/scene_example1/scene.pkg -> unpacked/ -> textures/
+/// paths: `papers/scene_example1/scene.pkg` -> `unpacked/` -> `textures/`
 #[derive(Parser)]
 #[command(name = "wallpaper-engine", version, about, long_about = None)]
 struct Cli {
@@ -86,7 +86,7 @@ struct ExportArgs {
     #[arg(long, conflicts_with = "png_only")]
     video_only: bool,
 
-    /// Output size as WIDTHxHEIGHT. Defaults to the source resolution.
+    /// Output size as `WIDTHxHEIGHT`. Defaults to the source resolution.
     #[arg(long)]
     resolution: Option<Resolution>,
 
@@ -227,11 +227,12 @@ fn run_shaders(args: &ShadersArgs) -> Result<()> {
         None => shader::shim::headers(),
     };
 
-    let mut targets: Vec<String> = archive
-        .paths()
-        .filter(|path| path.ends_with(".frag") || path.ends_with(".vert"))
-        .map(str::to_string)
-        .collect();
+    let is_shader = |path: &&str| {
+        Path::new(path)
+            .extension()
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("frag") || extension.eq_ignore_ascii_case("vert"))
+    };
+    let mut targets: Vec<String> = archive.paths().filter(is_shader).map(str::to_string).collect();
     targets.sort();
 
     if targets.is_empty() {
@@ -241,7 +242,10 @@ fn run_shaders(args: &ShadersArgs) -> Result<()> {
 
     let mut failures = 0;
     for name in &targets {
-        let stage = if name.ends_with(".vert") {
+        let is_vertex = Path::new(name)
+            .extension()
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("vert"));
+        let stage = if is_vertex {
             shader::preprocess::Stage::Vertex
         } else {
             shader::preprocess::Stage::Fragment
@@ -294,13 +298,12 @@ fn output_stem(project: &Project) -> String {
 /// the reasons stay in one readable list as pipelines land.
 fn unsupported_reason(project: &Project) -> Option<String> {
     match &project.kind {
-        Kind::Video => None,
-        // Exportable as a still only: the layers composite, but the effect
-        // shaders that animate them do not run yet.
+        // Scene is exportable as a still only: the layers composite, but the
+        // effect shaders that animate them do not run yet.
         Kind::Scene if project.package.is_none() => {
             Some("no scene.pkg beside project.json, so there are no assets to render".to_string())
         }
-        Kind::Scene => None,
+        Kind::Video | Kind::Scene => None,
         Kind::Web => {
             if project.oversized {
                 // These are media-player apps, not wallpapers: hundreds of
@@ -390,7 +393,7 @@ fn run_info(args: &InfoArgs) -> Result<()> {
     match unsupported_reason(&project) {
         Some(reason) => println!("  export     no: {reason}"),
         None if project.kind == Kind::Scene => {
-            println!("  export     still only (effects and particles are not rendered)")
+            println!("  export     still only (effects and particles are not rendered)");
         }
         None => println!("  export     yes"),
     }
