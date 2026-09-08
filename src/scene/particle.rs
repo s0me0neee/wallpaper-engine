@@ -32,6 +32,7 @@ use anyhow::{Context, Result};
 use glam::{Vec2, Vec3};
 use image::RgbaImage;
 use noise::{NoiseFn, Perlin};
+use rayon::prelude::*;
 use rand::{RngExt, SeedableRng};
 use rand_pcg::Pcg64Mcg;
 use serde::Deserialize;
@@ -596,8 +597,11 @@ fn draw_particle(pixmap: &mut Pixmap, place: &Placement, renderer: &Renderer, li
     }
 }
 
-/// Render one preset (and its children) into `pixmap`. `origin_shift` moves the
-/// system's local origin, used to hang an `eventfollow` child off its parent.
+/// Render one preset and its child systems into `pixmap`.
+///
+/// A plain (sibling) child system is independent of the parent's particles and
+/// is rendered **once**; an `eventfollow` child rides each parent particle, so
+/// it is rendered once per live parent with its origin moved to that particle.
 #[expect(clippy::too_many_arguments, reason = "recursion carries the full render context")]
 fn render_preset(
     presets: &HashMap<String, Preset>,
@@ -621,53 +625,45 @@ fn render_preset(
     let renderer = preset.renderer.first().unwrap_or(&Renderer::Sprite);
     let flow = Perlin::new((salt & 0xFFFF_FFFF) as u32);
     let em = emission(preset, emitter, &place.overrides, starttime);
+    let speed = place.overrides.speed.max(0.0);
+    let children = preset.children.iter().flatten();
 
-    for slot in 0..em.maxcount {
-        let Some((n, birth)) = slot_particle(&em, slot, time) else {
-            continue;
-        };
-        let age = time - birth;
-        let rolled = roll(preset, emitter, &flow, seed(salt, n));
-        if age >= rolled.lifetime {
-            continue;
-        }
-        let live = simulate(preset, &rolled, &flow, place.overrides.speed.max(0.0), age);
-        draw_particle(pixmap, place, renderer, &live);
-
-        if depth + 1 < MAX_DEPTH {
-            render_children(presets, preset, pixmap, place, time, birth, salt ^ n, depth, unsupported, &live);
+    // Sibling child systems: rendered once, alongside the parent system.
+    if depth + 1 < MAX_DEPTH {
+        for child in children.clone().filter(|child| child.r#type != "eventfollow") {
+            render_preset(
+                presets, &child.name, pixmap, place, time, starttime,
+                salt ^ fnv1a(&child.name), depth + 1, unsupported,
+            );
         }
     }
-}
 
-#[expect(clippy::too_many_arguments, reason = "recursion carries the full render context")]
-fn render_children(
-    presets: &HashMap<String, Preset>,
-    parent: &Preset,
-    pixmap: &mut Pixmap,
-    place: &Placement,
-    time: f32,
-    parent_birth: f32,
-    salt: u64,
-    depth: u32,
-    unsupported: &mut Vec<String>,
-    parent_live: &Live,
-) {
-    let Some(children) = &parent.children else {
-        return;
-    };
-    for child in children {
-        // An `eventfollow` child rides its parent: its emitter origin moves to
-        // where the parent particle is now, and it starts at the parent's
-        // birth. Any other child is an independent sibling at the same place.
-        let mut child_place = place.clone();
-        if child.r#type == "eventfollow" {
-            let at = to_screen(place, parent_live.pos);
-            child_place.origin_px = Vec2::new(at.x, at.y);
+    // Each slot's whole trajectory is re-integrated from birth (the stateless
+    // design that keeps frames independently addressable), which gets costly as
+    // particles age — so integrate every alive slot in parallel, then rasterize
+    // and hang `eventfollow` children serially since `Pixmap` is not `Sync`.
+    let alive: Vec<(u64, f32, Live)> = (0..em.maxcount)
+        .into_par_iter()
+        .filter_map(|slot| {
+            let (n, birth) = slot_particle(&em, slot, time)?;
+            let age = time - birth;
+            let rolled = roll(preset, emitter, &flow, seed(salt, n));
+            (age < rolled.lifetime).then(|| (n, birth, simulate(preset, &rolled, &flow, speed, age)))
+        })
+        .collect();
+
+    for (n, birth, live) in &alive {
+        draw_particle(pixmap, place, renderer, live);
+        if depth + 1 < MAX_DEPTH {
+            for child in children.clone().filter(|child| child.r#type == "eventfollow") {
+                let at = to_screen(place, live.pos);
+                let child_place = Placement { origin_px: Vec2::new(at.x, at.y), ..place.clone() };
+                render_preset(
+                    presets, &child.name, pixmap, &child_place, time, *birth,
+                    salt ^ n.wrapping_mul(0x9E37_79B9), depth + 1, unsupported,
+                );
+            }
         }
-        render_preset(
-            presets, &child.name, pixmap, &child_place, time, parent_birth, salt, depth + 1, unsupported,
-        );
     }
 }
 

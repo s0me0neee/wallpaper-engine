@@ -135,18 +135,22 @@ pub fn upload_repeating_texture(gl: &glow::Context, image: &image::RgbaImage) ->
 /// Replace the pixels of an existing texture, which must already be `image`'s
 /// dimensions. The live simulator re-uploads a puppet or particle layer's
 /// image every frame; reusing the texture object avoids churning GL handles.
+///
+/// The full re-spec via `tex_image_2d` (rather than `tex_sub_image_2d`) is
+/// deliberate: it orphans the old storage so the driver does not stall this
+/// upload behind the previous frame's sampling of the same texture.
 pub fn update_texture(gl: &glow::Context, texture: glow::Texture, image: &image::RgbaImage) {
     #[expect(clippy::cast_possible_wrap, reason = "wallpaper textures are nowhere near i32::MAX")]
     let (width, height) = (image.width() as i32, image.height() as i32);
     unsafe {
         gl.bind_texture(glow::TEXTURE_2D, Some(texture));
-        gl.tex_sub_image_2d(
+        gl.tex_image_2d(
             glow::TEXTURE_2D,
             0,
-            0,
-            0,
+            gl_enum(glow::RGBA8),
             width,
             height,
+            0,
             glow::RGBA,
             glow::UNSIGNED_BYTE,
             glow::PixelUnpackData::Slice(Some(image.as_raw())),

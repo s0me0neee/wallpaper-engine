@@ -78,8 +78,87 @@ enum LiveKind {
     Image,
     /// A puppet-warp layer: `static_scene.items[usize]` is re-skinned each frame.
     Puppet(usize),
-    /// A particle system: `static_scene.items[usize]` is re-simulated each frame.
-    Particle(usize),
+    /// A particle system, re-simulated each frame into `placement`'s canvas —
+    /// which may be a fraction of the real one (soft glows survive a bilinear
+    /// upscale, and a full-res tiny-skia raster every frame is what pins a big
+    /// scene to single digits). The compositor stretches it back to full size.
+    Particle { placement: particle::Placement, preset_path: String },
+}
+
+/// Simulate particles into a canvas this fraction of the real one when the real
+/// one is large. The soft additive sprites these presets use survive a bilinear
+/// upscale, and the raster + per-frame texture upload both scale with the pixel
+/// count, so a big scene drops to ~0.4 (≈1/6 the pixels).
+fn particle_sim_scale(canvas: (u32, u32)) -> f32 {
+    match canvas.0.max(canvas.1) {
+        0..=1999 => 1.0,
+        2000..=3199 => 0.5,
+        _ => 0.4,
+    }
+}
+
+/// `place` rescaled so a `scale`-of-canvas simulation lands in the same spots.
+fn scaled_placement(place: &particle::Placement, scale: f32) -> particle::Placement {
+    let down = |side: u32| -> u32 {
+        #[expect(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            reason = "a wallpaper canvas side is a few thousand px; scaled down and rounded it stays a small positive integer"
+        )]
+        let scaled = (f64::from(side) * f64::from(scale)).round().max(1.0) as u32;
+        scaled
+    };
+    particle::Placement {
+        origin_px: place.origin_px * scale,
+        px_per_unit: place.px_per_unit * scale,
+        canvas_px: (down(place.canvas_px.0), down(place.canvas_px.1)),
+        ..place.clone()
+    }
+}
+
+/// The texture(s) behind a layer: one uploaded once for a static image layer,
+/// or a two-deep ring for a puppet / particle layer whose image is re-uploaded
+/// every frame — alternating targets so a frame's upload never stalls behind
+/// the previous frame still sampling the same texture.
+struct LayerTextures {
+    ring: Vec<glow::Texture>,
+    next: usize,
+    size: (u32, u32),
+}
+
+impl LayerTextures {
+    fn once(gl: &glow::Context, image: &RgbaImage) -> Result<Self> {
+        Ok(LayerTextures { ring: vec![pass::upload_texture(gl, image)?], next: 0, size: image.dimensions() })
+    }
+
+    fn ring(gl: &glow::Context, image: &RgbaImage) -> Result<Self> {
+        Ok(LayerTextures {
+            ring: vec![pass::upload_texture(gl, image)?, pass::upload_texture(gl, image)?],
+            next: 0,
+            size: image.dimensions(),
+        })
+    }
+
+    fn current(&self) -> glow::Texture {
+        self.ring[self.next]
+    }
+
+    /// Advance to the next texture in the ring and upload `image` into it,
+    /// reallocating the whole ring only if the dimensions changed.
+    fn refresh(&mut self, gl: &glow::Context, image: &RgbaImage) -> Result<()> {
+        self.next = (self.next + 1) % self.ring.len();
+        if image.dimensions() == self.size {
+            pass::update_texture(gl, self.ring[self.next], image);
+        } else {
+            for texture in self.ring.drain(..) {
+                pass::delete_texture(gl, texture);
+            }
+            self.ring = vec![pass::upload_texture(gl, image)?, pass::upload_texture(gl, image)?];
+            self.next = 0;
+            self.size = image.dimensions();
+        }
+        Ok(())
+    }
 }
 
 /// One scene layer, in z-order, with everything the redraw loop needs.
@@ -92,10 +171,9 @@ struct LiveLayer {
     chain: Option<EffectChain>,
     /// This chain's slice of `State::tweak_values`, one entry per tweakable.
     tweaks: Range<usize>,
-    /// The current image: uploaded once for `Image`, re-uploaded each frame for
+    /// The current image: a single texture for `Image`, a re-uploaded ring for
     /// `Puppet` / `Particle`.
-    texture: glow::Texture,
-    texture_size: (u32, u32),
+    textures: LayerTextures,
     /// Placement on the canvas — `(left, top, width, height)` in pixels,
     /// measured from the top-left. Re-derived each frame for `Puppet`.
     rect: (i32, i32, i32, i32),
@@ -121,6 +199,8 @@ struct State {
     /// One live value per tweakable across every chain, concatenated in layer
     /// order; each `LiveLayer::tweaks` indexes its own span.
     tweak_values: Vec<f32>,
+    /// Rolling frame counter for the once-a-second FPS line.
+    frames_since: (Instant, u32),
 }
 
 /// `(left, top, width, height)` in canvas pixels for an image placed with its
@@ -203,6 +283,7 @@ impl App<'_> {
             layers,
             egui,
             tweak_values,
+            frames_since: (Instant::now(), 0),
         })
     }
 
@@ -225,6 +306,10 @@ impl App<'_> {
             .filter(|note| !note.ends_with("effect(s) not applied"))
             .cloned()
             .collect();
+
+        let sim_scale = particle_sim_scale((static_scene.width, static_scene.height));
+        #[expect(clippy::cast_possible_wrap, reason = "wallpaper canvas dims are nowhere near i32::MAX")]
+        let full_rect = (0, 0, static_scene.width as i32, static_scene.height as i32);
 
         for (index, item) in static_scene.items.iter().enumerate() {
             let (image, rect, blend, kind, object) = match item {
@@ -253,8 +338,12 @@ impl App<'_> {
                     (image, rect, puppet.blend, LiveKind::Puppet(index), puppet.object)
                 }
                 StaticItem::Particle(system) => {
-                    let rect = rect_of(0, 0, &system.initial);
-                    (system.initial.clone(), rect, system.blend, LiveKind::Particle(index), system.object)
+                    let placement = scaled_placement(&system.place, sim_scale);
+                    let image = particle::render_system(archive, &system.preset_path, &placement, 0.0)
+                        .with_context(|| format!("simulating {}", system.preset_path))?
+                        .image;
+                    let kind = LiveKind::Particle { placement, preset_path: system.preset_path.clone() };
+                    (image, full_rect, system.blend, kind, system.object)
                 }
             };
 
@@ -276,14 +365,18 @@ impl App<'_> {
                 tweak_values.extend(chain.tweakables.iter().map(|tweakable| tweakable.default));
             }
 
+            let textures = if matches!(kind, LiveKind::Image) {
+                LayerTextures::once(gl, &image)?
+            } else {
+                LayerTextures::ring(gl, &image)?
+            };
             layers.push(LiveLayer {
                 kind,
                 name: model::label(object),
                 additive: blend == Blend::Add,
                 chain,
                 tweaks: start..tweak_values.len(),
-                texture: pass::upload_texture(gl, &image)?,
-                texture_size: (image.width(), image.height()),
+                textures,
                 rect,
             });
         }
@@ -307,47 +400,35 @@ fn swap_note(notes: &mut [String], stale: &str, replacement: String) {
     }
 }
 
-/// Re-upload `image` into `layer`'s existing texture, reallocating only if the
-/// dimensions changed (a warp raster can grow or shrink by a pixel).
-fn refresh_texture(gl: &glow::Context, layer: &mut LiveLayer, image: &RgbaImage) -> Result<()> {
-    if (image.width(), image.height()) == layer.texture_size {
-        pass::update_texture(gl, layer.texture, image);
-    } else {
-        pass::delete_texture(gl, layer.texture);
-        layer.texture = pass::upload_texture(gl, image)?;
-        layer.texture_size = (image.width(), image.height());
-    }
-    Ok(())
-}
-
 fn redraw(app: &mut App, time: f32) -> Result<()> {
     let App { archive, static_scene, state, .. } = app;
     let Some(state) = state.as_mut() else { return Ok(()) };
 
     run_panel(state);
 
-    // Per-frame CPU work: re-skin puppets, re-simulate particles.
+    // Per-frame CPU work: re-skin puppets, re-simulate particles, then upload
+    // each fresh image into the next texture in its ring.
     for layer in &mut state.layers {
-        match layer.kind {
-            LiveKind::Image => {}
+        let refreshed = match &layer.kind {
+            LiveKind::Image => None,
             LiveKind::Puppet(index) => {
-                let StaticItem::Puppet(puppet) = &static_scene.items[index] else {
+                let StaticItem::Puppet(puppet) = &static_scene.items[*index] else {
                     unreachable!("a Puppet LiveKind always points at a Puppet item")
                 };
                 let (image, left, top) = compose::warp_frame(puppet, time);
-                layer.rect = rect_of(left, top, &image);
-                refresh_texture(&state.gl, layer, &image)?;
+                let rect = rect_of(left, top, &image);
+                Some((image, rect))
             }
-            LiveKind::Particle(index) => {
-                let StaticItem::Particle(system) = &static_scene.items[index] else {
-                    unreachable!("a Particle LiveKind always points at a Particle item")
-                };
-                let image = particle::render_system(archive, &system.preset_path, &system.place, time)
-                    .with_context(|| format!("simulating {}", system.preset_path))?
+            LiveKind::Particle { placement, preset_path } => {
+                let image = particle::render_system(archive, preset_path, placement, time)
+                    .with_context(|| format!("simulating {preset_path}"))?
                     .image;
-                layer.rect = rect_of(0, 0, &image);
-                refresh_texture(&state.gl, layer, &image)?;
+                Some((image, layer.rect))
             }
+        };
+        if let Some((image, rect)) = refreshed {
+            layer.rect = rect;
+            layer.textures.refresh(&state.gl, &image)?;
         }
     }
 
@@ -360,13 +441,13 @@ fn redraw(app: &mut App, time: f32) -> Result<()> {
                 // particle layer's image changed this frame, so re-feed it.
                 let base = match layer.kind {
                     LiveKind::Image => None,
-                    LiveKind::Puppet(_) | LiveKind::Particle(_) => Some(layer.texture),
+                    LiveKind::Puppet(_) | LiveKind::Particle { .. } => Some(layer.textures.current()),
                 };
                 chain
                     .render_over(&state.gl, base, time, &state.tweak_values[layer.tweaks.clone()])?
                     .texture
             }
-            None => layer.texture,
+            None => layer.textures.current(),
         };
         pass::composite_layer(&state.gl, &state.compositor, &state.composite, source, layer.rect, layer.additive);
     }
@@ -376,7 +457,22 @@ fn redraw(app: &mut App, time: f32) -> Result<()> {
     let window = (size.width as i32, size.height as i32);
     pass::blit_to_screen(&state.gl, &state.blit, &state.display_quad, state.composite.texture, state.content_size, window);
     state.egui.paint(&state.window);
-    state.surface.swap_buffers(&state.context).context("swapping buffers")
+    state.surface.swap_buffers(&state.context).context("swapping buffers")?;
+
+    report_fps(&mut state.frames_since);
+    Ok(())
+}
+
+/// Print a frame-rate line about once a second so a slow scene is visible
+/// without a profiler.
+fn report_fps(counter: &mut (Instant, u32)) {
+    counter.1 += 1;
+    let elapsed = counter.0.elapsed();
+    if elapsed.as_secs() >= 1 {
+        let fps = f64::from(counter.1) / elapsed.as_secs_f64();
+        println!("  {fps:.0} fps");
+        *counter = (Instant::now(), 0);
+    }
 }
 
 /// Run the egui pass and copy the slider values back into `state.tweak_values`.

@@ -2978,6 +2978,7 @@ dependencies = [
  "rand 0.10.2",
  "rand_pcg",
  "raw-window-handle",
+ "rayon",
  "regex",
  "serde",
  "serde_json",

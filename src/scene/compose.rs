@@ -106,15 +106,12 @@ pub struct StaticPuppet<'a> {
 }
 
 /// A particle system: its resolved placement and preset path, re-simulated
-/// each frame, plus the t=0 frame produced while probing what the preset uses.
+/// each frame.
 pub struct StaticParticle<'a> {
     pub object: &'a Object,
     pub preset_path: String,
     pub place: particle::Placement,
     pub blend: Blend,
-    /// The system rendered at t=0 — reused as the initial frame so the live
-    /// simulator does not have to simulate it twice at startup.
-    pub initial: RgbaImage,
 }
 
 /// The visible rectangle, in scene units.
@@ -603,10 +600,7 @@ fn static_particle<'a>(
     let rendered = particle::render_system(archive, &preset_path, &place, 0.0)
         .with_context(|| format!("simulating {preset_path}"))?;
 
-    Ok((
-        StaticParticle { object, preset_path, place, blend, initial: rendered.image },
-        rendered.unsupported,
-    ))
+    Ok((StaticParticle { object, preset_path, place, blend }, rendered.unsupported))
 }
 
 /// `omissions_for` flags every object with animation layers as "keyframe
