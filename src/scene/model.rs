@@ -191,6 +191,15 @@ pub fn is_sound(object: &Object) -> bool {
     object.sound.is_some()
 }
 
+/// A human name for an object: its `name` when it has one, else `object <id>`.
+pub fn label(object: &Object) -> String {
+    if object.name.is_empty() {
+        format!("object {}", object.id)
+    } else {
+        object.name.clone()
+    }
+}
+
 /// Effects that would actually be drawn.
 pub fn visible_effects(object: &Object) -> impl Iterator<Item = &Effect> {
     object.effects.iter().filter(|effect| effect.visible)

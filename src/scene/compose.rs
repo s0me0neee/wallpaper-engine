@@ -22,6 +22,30 @@ pub struct Composite {
     pub omissions: Vec<String>,
 }
 
+/// One visible image layer, decoded, scaled to its on-canvas pixel extent and
+/// tinted — plus where its top-left corner lands in the output.
+///
+/// This is the point `scene::render` takes over: it runs the layer's own
+/// effect chain over `image` before the layers are flattened together, where
+/// `compose::render` just overlays them as they are.
+pub struct PreparedLayer<'a> {
+    pub object: &'a Object,
+    pub image: RgbaImage,
+    pub left: i64,
+    pub top: i64,
+}
+
+/// A scene resolved as far as a plain flatten can take it: the output canvas
+/// size, its background fill, every visible image layer prepared in draw
+/// order, and the notes for whatever still cannot be represented.
+pub struct Layered<'a> {
+    pub width: u32,
+    pub height: u32,
+    pub background: Rgba<u8>,
+    pub layers: Vec<PreparedLayer<'a>>,
+    pub omissions: Vec<String>,
+}
+
 /// The visible rectangle, in scene units.
 ///
 /// The camera in `scene.json` is the editor's saved viewport, not the render
@@ -160,11 +184,7 @@ fn extent(object: &Object, texture: &RgbaImage) -> (f32, f32) {
 /// Note anything about an object that this composite cannot represent.
 fn omissions_for(object: &Object) -> Vec<String> {
     let mut notes = Vec::new();
-    let name = if object.name.is_empty() {
-        format!("object {}", object.id)
-    } else {
-        object.name.clone()
-    };
+    let name = model::label(object);
 
     if is_particle(object) {
         notes.push(format!("{name}: particle system not rendered"));
@@ -184,19 +204,10 @@ fn omissions_for(object: &Object) -> Vec<String> {
     notes
 }
 
-/// Flatten every visible image layer into one image.
-pub fn render(
-    archive: &mut Archive,
-    scene: &Scene,
-    resolution: Option<Resolution>,
-) -> Result<Composite> {
-    let ortho = scene
-        .general
-        .orthographic
-        .context("scene has no orthographic projection, so it is not a flat wallpaper")?;
-    let canvas = canvas_for(ortho, resolution)?;
-
-    let background = if scene.general.clearenabled {
+/// The scene's background fill: the clear colour when clearing is on, fully
+/// transparent when it is off.
+fn background_pixel(scene: &Scene) -> Rgba<u8> {
+    if scene.general.clearenabled {
         let clear = scene.general.clearcolor;
         Rgba([
             scale_channel(255, clear.x.clamp(0.0, 1.0)),
@@ -206,11 +217,77 @@ pub fn render(
         ])
     } else {
         Rgba([0, 0, 0, 0])
-    };
-    let mut output = RgbaImage::from_pixel(canvas.width, canvas.height, background);
+    }
+}
 
+/// Decode one image object's texture and place it: scaled to its on-canvas
+/// pixel extent, tinted, and positioned by its `origin`. `None` when the
+/// object resolves to no texture (a solid-colour or effect-only layer).
+fn prepare_layer<'a>(
+    archive: &mut Archive,
+    canvas: &Canvas,
+    object: &'a Object,
+) -> Result<Option<PreparedLayer<'a>>> {
+    let Some(texture) = layer_texture(archive, object)? else {
+        return Ok(None);
+    };
+
+    let (extent_x, extent_y) = extent(object, &texture);
+    // Rounded and floored at 1.0, so this always lands in u32's range for any
+    // wallpaper-sized canvas.
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "rounded and floored at 1.0 below"
+    )]
+    let (pixel_width, pixel_height) = (
+        (extent_x * canvas.scale).round().max(1.0) as u32,
+        (extent_y * canvas.scale).round().max(1.0) as u32,
+    );
+
+    let mut image = if texture.width() == pixel_width && texture.height() == pixel_height {
+        texture
+    } else {
+        imageops::resize(
+            &texture,
+            pixel_width,
+            pixel_height,
+            imageops::FilterType::Lanczos3,
+        )
+    };
+    apply_tint(&mut image, object.color, object.brightness, object.alpha);
+
+    // `origin` is the centre of the layer, and the top edge is the one with
+    // the larger scene Y.
+    let (left, top) = to_pixels(
+        canvas,
+        object.origin.x - extent_x / 2.0,
+        object.origin.y + extent_y / 2.0,
+    );
+    // A wallpaper canvas is at most a few tens of thousands of pixels wide,
+    // nowhere near i64's range.
+    #[expect(clippy::cast_possible_truncation, reason = "canvas coordinates, nowhere near i64's range")]
+    let (left, top) = (left.round() as i64, top.round() as i64);
+
+    Ok(Some(PreparedLayer { object, image, left, top }))
+}
+
+/// Resolve a scene into its canvas plus every visible image layer, prepared
+/// for placement but not yet flattened. `compose::render` overlays these
+/// straight; `scene::render` runs each layer's effect chain first.
+pub fn prepare<'a>(
+    archive: &mut Archive,
+    scene: &'a Scene,
+    resolution: Option<Resolution>,
+) -> Result<Layered<'a>> {
+    let ortho = scene
+        .general
+        .orthographic
+        .context("scene has no orthographic projection, so it is not a flat wallpaper")?;
+    let canvas = canvas_for(ortho, resolution)?;
+
+    let mut layers = Vec::new();
     let mut omissions = Vec::new();
-    let mut drawn = 0usize;
 
     for object in &scene.objects {
         if !object.visible || is_sound(object) {
@@ -221,56 +298,36 @@ pub fn render(
         if !is_image(object) {
             continue;
         }
-
-        let Some(texture) = layer_texture(archive, object)? else {
-            continue;
-        };
-
-        let (extent_x, extent_y) = extent(object, &texture);
-        // Rounded and floored at 1.0 above, so this always lands in u32's
-        // range for any wallpaper-sized canvas.
-        #[expect(
-            clippy::cast_possible_truncation,
-            clippy::cast_sign_loss,
-            reason = "rounded and floored at 1.0 above"
-        )]
-        let (pixel_width, pixel_height) = (
-            (extent_x * canvas.scale).round().max(1.0) as u32,
-            (extent_y * canvas.scale).round().max(1.0) as u32,
-        );
-
-        let mut layer = if texture.width() == pixel_width && texture.height() == pixel_height {
-            texture
-        } else {
-            imageops::resize(
-                &texture,
-                pixel_width,
-                pixel_height,
-                imageops::FilterType::Lanczos3,
-            )
-        };
-        apply_tint(&mut layer, object.color, object.brightness, object.alpha);
-
-        // `origin` is the centre of the layer, and the top edge is the one with
-        // the larger scene Y.
-        let (left, top) = to_pixels(
-            &canvas,
-            object.origin.x - extent_x / 2.0,
-            object.origin.y + extent_y / 2.0,
-        );
-        // A wallpaper canvas is at most a few tens of thousands of pixels
-        // wide, nowhere near i64's range.
-        #[expect(clippy::cast_possible_truncation, reason = "canvas coordinates, nowhere near i64's range")]
-        let (left, top) = (left.round() as i64, top.round() as i64);
-        imageops::overlay(&mut output, &layer, left, top);
-        drawn += 1;
+        if let Some(layer) = prepare_layer(archive, &canvas, object)? {
+            layers.push(layer);
+        }
     }
 
-    if drawn == 0 {
+    if layers.is_empty() {
         bail!("scene has no visible image layers to draw");
     }
 
-    Ok(Composite { image: output, omissions })
+    Ok(Layered {
+        width: canvas.width,
+        height: canvas.height,
+        background: background_pixel(scene),
+        layers,
+        omissions,
+    })
+}
+
+/// Flatten every visible image layer into one image.
+pub fn render(
+    archive: &mut Archive,
+    scene: &Scene,
+    resolution: Option<Resolution>,
+) -> Result<Composite> {
+    let layered = prepare(archive, scene, resolution)?;
+    let mut output = RgbaImage::from_pixel(layered.width, layered.height, layered.background);
+    for layer in &layered.layers {
+        imageops::overlay(&mut output, &layer.image, layer.left, layer.top);
+    }
+    Ok(Composite { image: output, omissions: layered.omissions })
 }
 
 #[cfg(test)]

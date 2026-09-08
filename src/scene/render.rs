@@ -1,11 +1,13 @@
-//! Running a scene's post-process effect chain on the GPU.
+//! Running a scene's post-process effect chains on the GPU.
 //!
-//! Scene wallpapers of the common shape (plan.md §4.1) are one fullscreen
-//! base image with a chain of effect shader passes over it, each sampling the
-//! previous result as `g_Texture0`. This flattens that chain for a scene
-//! that fits the shape exactly — one visible image layer — and falls back to
-//! the plain composite (with the omission still noted) for anything richer,
-//! same as `compose::render` already did on its own.
+//! Scene wallpapers of the common shape (plan.md §4.1) are an image layer with
+//! a chain of effect shader passes over it, each sampling the previous result
+//! as `g_Texture0`. A scene may have several such layers, each with its own
+//! chain: `render_frame` prepares every visible image layer (`compose::prepare`),
+//! runs that layer's own chain over its texture, then alpha-composites the
+//! processed layers together in order. Layers without effects pass straight
+//! through. Particles, keyframe animation and rotation are still left to the
+//! plain composite and reported as omissions (plan.md §4.7).
 
 use super::compose::{self, Composite};
 use super::model::{self, Effect, EffectDefinition, Material, Object, Scene};
@@ -16,7 +18,7 @@ use crate::shader::annotations::Declarations;
 use crate::shader::bind::UniformValue;
 use crate::shader::{annotations, bind, preprocess, shim};
 use anyhow::{Context, Result, bail};
-use image::RgbaImage;
+use image::{RgbaImage, imageops};
 use serde_json::Value;
 use std::collections::HashMap;
 
@@ -66,29 +68,68 @@ pub fn effect_chain_shape(scene: &Scene) -> Option<(&Object, Vec<&Effect>)> {
 
 /// Render one frame of a scene at `time` seconds.
 ///
-/// Runs the GPU effect chain when the scene is exactly one visible image
-/// layer carrying effects — the shape the chain in plan.md §4.1 describes —
-/// and otherwise returns the plain composite unchanged, same as before this
-/// existed.
+/// Every visible image layer that carries effects gets its own chain run over
+/// its texture before the layers are flattened together; layers without
+/// effects are composited as-is. A scene with no effects anywhere comes back
+/// as the plain composite, untouched.
+///
+/// One layer's chain failing (an effect helper we don't implement, a missing
+/// engine-builtin texture) doesn't sink the whole frame: that layer is
+/// composited unprocessed and the reason is recorded as an omission, the same
+/// way the plain composite reports what it left out.
 pub fn render_frame(archive: &mut Archive, scene: &Scene, resolution: Option<Resolution>, time: f64) -> Result<Composite> {
-    let mut composite = compose::render(archive, scene, resolution)?;
+    let mut layered = compose::prepare(archive, scene, resolution)?;
 
-    let Some((object, effects)) = effect_chain_shape(scene) else {
-        return Ok(composite);
-    };
+    let effected: Vec<usize> = layered
+        .layers
+        .iter()
+        .enumerate()
+        .filter(|(_, layer)| model::visible_effects(layer.object).next().is_some())
+        .map(|(index, _)| index)
+        .collect();
 
-    let gpu = Gpu::new().context("opening a headless GL context")?;
-    let headers = shim::headers();
-    #[expect(clippy::cast_possible_truncation, reason = "a wallpaper's timestamp is always a few seconds at most")]
-    let time = time as f32;
-    let chain = prepare_effect_chain(&gpu.gl, archive, &effects, &composite.image, &headers)
-        .with_context(|| format!("preparing the effect chain on {:?}", object.name))?;
-    let target = chain
-        .render(&gpu.gl, time, &[])
-        .with_context(|| format!("running the effect chain on {:?}", object.name))?;
-    composite.image = capture::read_rgba(&gpu.gl, target.framebuffer, target.width, target.height)?;
-    composite.omissions.retain(|note| !note.ends_with("effect(s) not applied"));
-    Ok(composite)
+    if !effected.is_empty() {
+        let gpu = Gpu::new().context("opening a headless GL context")?;
+        let headers = shim::headers();
+        #[expect(clippy::cast_possible_truncation, reason = "a wallpaper's timestamp is always a few seconds at most")]
+        let time = time as f32;
+
+        // The per-object "N effect(s) not applied" notes are about to become
+        // wrong for every layer whose chain runs; drop them and let each
+        // failed layer below re-add a note of its own.
+        layered.omissions.retain(|note| !note.ends_with("effect(s) not applied"));
+
+        for index in effected {
+            let name = model::label(layered.layers[index].object);
+            match run_layer_chain(&gpu, archive, &layered.layers[index], &headers, time) {
+                Ok(processed) => layered.layers[index].image = processed,
+                Err(error) => layered.omissions.push(format!("{name}: effect chain skipped ({error:#})")),
+            }
+        }
+    }
+
+    let mut output = RgbaImage::from_pixel(layered.width, layered.height, layered.background);
+    for layer in &layered.layers {
+        imageops::overlay(&mut output, &layer.image, layer.left, layer.top);
+    }
+
+    Ok(Composite { image: output, omissions: layered.omissions })
+}
+
+/// Compile and run one layer's effect chain over its own texture, returning
+/// the processed pixels.
+fn run_layer_chain(
+    gpu: &Gpu,
+    archive: &mut Archive,
+    layer: &compose::PreparedLayer,
+    headers: &HashMap<String, String>,
+    time: f32,
+) -> Result<RgbaImage> {
+    let effects: Vec<&Effect> = model::visible_effects(layer.object).collect();
+    let chain = prepare_effect_chain(&gpu.gl, archive, &effects, &layer.image, headers)
+        .context("preparing the effect chain")?;
+    let target = chain.render(&gpu.gl, time, &[]).context("running the effect chain")?;
+    capture::read_rgba(&gpu.gl, target.framebuffer, target.width, target.height)
 }
 
 /// One compiled effect pass: everything about it is fixed once prepared —
@@ -324,6 +365,13 @@ fn resolve_slot_texture(
     default: Option<&Value>,
 ) -> Result<(glow::Texture, (u32, u32))> {
     if let Some(name) = name {
+        // A pass may positionally name an engine builtin (`util/white`,
+        // `util/noflow`, ...); those ship with Wallpaper Engine, not the
+        // package, so synthesize the flat ones rather than reading them.
+        if let Some(solid) = builtin_solid(name) {
+            return Ok((pass::solid_texture(gl, solid)?, (1, 1)));
+        }
+
         let texture_path = format!("materials/{name}.tex");
         let bytes = archive.read(&texture_path).with_context(|| format!("reading {texture_path}"))?;
         let tex = crate::tex::parse_bytes(&bytes).with_context(|| format!("parsing {texture_path}"))?;
