@@ -9,8 +9,8 @@
 //! precisely what it left out.
 
 use super::model::{
-    self, Material, Model, Object, Orthographic, Scene, Vec3, base_texture, is_image, is_particle,
-    is_sound,
+    self, Blend, Material, Model, Object, Orthographic, Scene, Vec3, base_blend, base_texture,
+    is_image, is_particle, is_sound,
 };
 use super::puppet;
 use crate::{export::Resolution, pkg::Archive, tex};
@@ -36,6 +36,8 @@ pub struct PreparedLayer<'a> {
     pub image: RgbaImage,
     pub left: i64,
     pub top: i64,
+    /// How this layer combines with the layers already drawn beneath it.
+    pub blend: Blend,
     /// True when a puppet-warp deformation produced `image`.
     pub warped: bool,
     /// Set when a warp was attempted but failed; the layer falls back to its
@@ -101,9 +103,17 @@ fn to_pixels(canvas: &Canvas, world_x: f32, world_y: f32) -> (f32, f32) {
     (world_x * canvas.scale, (height - world_y) * canvas.scale)
 }
 
-/// Resolve an object's texture through the model and material indirection,
-/// along with the model's puppet path when it has one.
-fn layer_texture(archive: &mut Archive, object: &Object) -> Result<Option<(RgbaImage, Option<String>)>> {
+/// An object's base texture plus the two things the material tells us about
+/// how to draw it: the model's puppet path (when it is a warp puppet) and the
+/// pass's blend mode.
+struct LayerTexture {
+    image: RgbaImage,
+    puppet: Option<String>,
+    blend: Blend,
+}
+
+/// Resolve an object's texture through the model and material indirection.
+fn layer_texture(archive: &mut Archive, object: &Object) -> Result<Option<LayerTexture>> {
     let Some(model_path) = object.image.as_deref() else {
         return Ok(None);
     };
@@ -130,7 +140,7 @@ fn layer_texture(archive: &mut Archive, object: &Object) -> Result<Option<(RgbaI
     let decoded = tex::decode_rgba(&texture, mipmap)
         .with_context(|| format!("decoding {texture_path}"))?;
 
-    Ok(Some((decoded, model.puppet)))
+    Ok(Some(LayerTexture { image: decoded, puppet: model.puppet, blend: base_blend(&material) }))
 }
 
 /// Scale a channel by a `0.0..=1.0` factor and round back to a byte.
@@ -244,7 +254,9 @@ fn prepare_layer<'a>(
     object: &'a Object,
     time: f32,
 ) -> Result<Option<PreparedLayer<'a>>> {
-    let Some((texture, puppet_path)) = layer_texture(archive, object)? else {
+    let Some(LayerTexture { image: texture, puppet: puppet_path, blend }) =
+        layer_texture(archive, object)?
+    else {
         return Ok(None);
     };
 
@@ -260,7 +272,7 @@ fn prepare_layer<'a>(
     // A puppet layer replaces the flat scale with a skinned-mesh deformation.
     let mut warp_error = None;
     if let (Some(path), Some(clip)) = (puppet_path.as_deref(), model::visible_animation_layer(object)) {
-        match warp_layer(archive, canvas, object, path, &texture, (extent_x, extent_y), (rect_left, rect_top), clip, time) {
+        match warp_layer(archive, canvas, object, path, &texture, (extent_x, extent_y), (rect_left, rect_top), clip, time, blend) {
             Ok(layer) => return Ok(Some(layer)),
             Err(error) => warp_error = Some(format!("{error:#}")),
         }
@@ -295,7 +307,7 @@ fn prepare_layer<'a>(
     #[expect(clippy::cast_possible_truncation, reason = "canvas coordinates, nowhere near i64's range")]
     let (left, top) = (rect_left.round() as i64, rect_top.round() as i64);
 
-    Ok(Some(PreparedLayer { object, image, left, top, warped: false, warp_error }))
+    Ok(Some(PreparedLayer { object, image, left, top, blend, warped: false, warp_error }))
 }
 
 /// Skin a puppet mesh at `time` and rasterize it through `texture`, returning
@@ -311,6 +323,7 @@ fn warp_layer<'a>(
     (rect_left, rect_top): (f32, f32),
     clip: &model::AnimationLayer,
     time: f32,
+    blend: Blend,
 ) -> Result<PreparedLayer<'a>> {
     let data = archive.read(puppet_path).with_context(|| format!("reading {puppet_path}"))?;
     let puppet = puppet::parse(&data).with_context(|| format!("parsing {puppet_path}"))?;
@@ -346,7 +359,7 @@ fn warp_layer<'a>(
         (rect_top - WARP_PAD * rect_px.1).round() as i64,
     );
 
-    Ok(PreparedLayer { object, image, left, top, warped: true, warp_error: None })
+    Ok(PreparedLayer { object, image, left, top, blend, warped: true, warp_error: None })
 }
 
 /// Resolve a scene into its canvas plus every visible image layer, prepared
@@ -411,6 +424,57 @@ fn reconcile_warp_note(omissions: &mut Vec<String>, layer: &PreparedLayer) {
     }
 }
 
+/// Draw every prepared layer onto the background in order, each under its own
+/// blend mode. This is the one place layer compositing happens — `scene::render`
+/// swaps processed images into the layers first, then calls here.
+pub fn flatten(layered: &Layered) -> RgbaImage {
+    let mut output = RgbaImage::from_pixel(layered.width, layered.height, layered.background);
+    for layer in &layered.layers {
+        blit(&mut output, &layer.image, layer.left, layer.top, layer.blend);
+    }
+    output
+}
+
+/// `dst + src·factor`, saturating at 255.
+fn add_channel(dst: u8, src: u8, factor: f32) -> u8 {
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "clamped to 0.0..=255.0 immediately before the cast"
+    )]
+    let sum = (f32::from(dst) + f32::from(src) * factor).round().clamp(0.0, 255.0) as u8;
+    sum
+}
+
+/// Composite `layer` onto `canvas` at `(left, top)` under `blend`. `Over` is
+/// exactly `image::imageops::overlay`; `Add` accumulates `dst + src·srcAlpha`
+/// per colour channel and lifts the canvas alpha to the brighter of the two,
+/// so an additive glow still shows over a transparent background.
+fn blit(canvas: &mut RgbaImage, layer: &RgbaImage, left: i64, top: i64, blend: Blend) {
+    if blend == Blend::Over {
+        imageops::overlay(canvas, layer, left, top);
+        return;
+    }
+
+    let (canvas_w, canvas_h) = (i64::from(canvas.width()), i64::from(canvas.height()));
+    for (lx, ly, pixel) in layer.enumerate_pixels() {
+        let (x, y) = (left + i64::from(lx), top + i64::from(ly));
+        if x < 0 || y < 0 || x >= canvas_w || y >= canvas_h {
+            continue;
+        }
+        #[expect(clippy::cast_sign_loss, clippy::cast_possible_truncation, reason = "bounds-checked to 0..width/height just above")]
+        let target = canvas.get_pixel_mut(x as u32, y as u32);
+        let [sr, sg, sb, sa] = pixel.0;
+        let factor = f32::from(sa) / 255.0;
+        target.0 = [
+            add_channel(target.0[0], sr, factor),
+            add_channel(target.0[1], sg, factor),
+            add_channel(target.0[2], sb, factor),
+            target.0[3].max(sa),
+        ];
+    }
+}
+
 /// Flatten every visible image layer into one image. Puppet layers show their
 /// bind pose (nothing else in a still moves either).
 pub fn render(
@@ -419,11 +483,7 @@ pub fn render(
     resolution: Option<Resolution>,
 ) -> Result<Composite> {
     let layered = prepare(archive, scene, resolution, 0.0)?;
-    let mut output = RgbaImage::from_pixel(layered.width, layered.height, layered.background);
-    for layer in &layered.layers {
-        imageops::overlay(&mut output, &layer.image, layer.left, layer.top);
-    }
-    Ok(Composite { image: output, omissions: layered.omissions })
+    Ok(Composite { image: flatten(&layered), omissions: layered.omissions })
 }
 
 #[cfg(test)]
@@ -507,6 +567,34 @@ mod tests {
         )
         .unwrap();
         assert_eq!(omissions_for(&effected), vec!["bg: 1 effect(s) not applied"]);
+    }
+
+    #[test]
+    fn over_blit_matches_imageops_overlay() {
+        let mut a = RgbaImage::from_pixel(2, 2, Rgba([10, 20, 30, 255]));
+        let mut b = a.clone();
+        let layer = RgbaImage::from_pixel(2, 2, Rgba([200, 100, 50, 128]));
+        blit(&mut a, &layer, 0, 0, Blend::Over);
+        imageops::overlay(&mut b, &layer, 0, 0);
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn additive_blit_accumulates_and_saturates() {
+        let mut canvas = RgbaImage::from_pixel(1, 1, Rgba([100, 0, 200, 0]));
+        // src 128 at alpha 128: contributes 128 * (128/255) ≈ 64.25 per channel.
+        blit(&mut canvas, &RgbaImage::from_pixel(1, 1, Rgba([128, 128, 128, 128])), 0, 0, Blend::Add);
+        assert_eq!(canvas.get_pixel(0, 0).0, [164, 64, 255, 128]);
+    }
+
+    #[test]
+    fn additive_blit_clips_to_the_canvas() {
+        let mut canvas = RgbaImage::from_pixel(2, 2, Rgba([0, 0, 0, 255]));
+        // Placed one pixel off the top-left: only the (1,1) texel lands.
+        blit(&mut canvas, &RgbaImage::from_pixel(2, 2, Rgba([50, 50, 50, 255])), -1, -1, Blend::Add);
+        assert_eq!(canvas.get_pixel(0, 0).0, [50, 50, 50, 255]);
+        assert_eq!(canvas.get_pixel(1, 0).0, [0, 0, 0, 255]);
+        assert_eq!(canvas.get_pixel(1, 1).0, [0, 0, 0, 255]);
     }
 
     #[test]

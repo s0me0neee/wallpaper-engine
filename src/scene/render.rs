@@ -18,7 +18,7 @@ use crate::shader::annotations::Declarations;
 use crate::shader::bind::UniformValue;
 use crate::shader::{annotations, bind, preprocess, shim};
 use anyhow::{Context, Result, bail};
-use image::{RgbaImage, imageops};
+use image::RgbaImage;
 use serde_json::Value;
 use std::collections::HashMap;
 
@@ -108,12 +108,7 @@ pub fn render_frame(archive: &mut Archive, scene: &Scene, resolution: Option<Res
         }
     }
 
-    let mut output = RgbaImage::from_pixel(layered.width, layered.height, layered.background);
-    for layer in &layered.layers {
-        imageops::overlay(&mut output, &layer.image, layer.left, layer.top);
-    }
-
-    Ok(Composite { image: output, omissions: layered.omissions })
+    Ok(Composite { image: compose::flatten(&layered), omissions: layered.omissions })
 }
 
 /// Compile and run one layer's effect chain over its own texture, returning

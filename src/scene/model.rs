@@ -304,6 +304,31 @@ pub fn base_texture(material: &Material) -> Option<&str> {
         .filter(|name| !name.is_empty())
 }
 
+/// How a layer's pixels combine with what is already on the canvas.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Blend {
+    /// Standard alpha "over". WE's `translucent`, and also `normal` — no
+    /// corpus scene leans on `normal`'s opaque-replace nuance, so folding it
+    /// in here keeps flat scenes byte-identical.
+    #[default]
+    Over,
+    /// `dst + src·srcAlpha`, saturating. How WE draws glow and particle layers.
+    Add,
+}
+
+/// The blend mode string WE records for a material pass.
+pub fn parse_blend(name: &str) -> Blend {
+    match name {
+        "additive" => Blend::Add,
+        _ => Blend::Over,
+    }
+}
+
+/// The blend mode of the layer's base pass (slot 0 of the first pass).
+pub fn base_blend(material: &Material) -> Blend {
+    material.passes.first().map_or(Blend::Over, |pass| parse_blend(&pass.blending))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -369,6 +394,23 @@ mod tests {
         )
         .unwrap();
         assert_eq!(base_texture(&material), Some("yilaina"));
+    }
+
+    #[test]
+    fn blend_mode_comes_from_the_first_pass() {
+        let additive: Material =
+            serde_json::from_str(r#"{"passes":[{"blending":"additive","textures":["glow"]}]}"#).unwrap();
+        assert_eq!(base_blend(&additive), Blend::Add);
+
+        // `translucent`, `normal` and an absent string all mean plain "over".
+        for value in ["translucent", "normal", ""] {
+            let material: Material =
+                serde_json::from_str(&format!(r#"{{"passes":[{{"blending":{value:?}}}]}}"#)).unwrap();
+            assert_eq!(base_blend(&material), Blend::Over, "for {value:?}");
+        }
+
+        let no_pass: Material = serde_json::from_str(r#"{"passes":[]}"#).unwrap();
+        assert_eq!(base_blend(&no_pass), Blend::Over);
     }
 
     #[test]
