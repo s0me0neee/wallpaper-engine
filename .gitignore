@@ -3,6 +3,9 @@
 # Derived output — regenerate with `cargo run`
 /unpacked
 /textures
+# `export`'s default --out is the current directory, so its own output lands
+# in a folder named after the wallpaper's title, not a fixed path — ignore the
+# common choice of running it from the repo root with `--out export`.
 /export
 
 # Python reference implementation

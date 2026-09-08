@@ -331,7 +331,8 @@ wallpaper-engine export  <wallpaper-dir> [OPTIONS]
 wallpaper-engine shaders <wallpaper-dir> [OPTIONS]
 
   --out DIR              parent directory for the wallpaper's own output
-                         folder (default: export/), named after its title
+                         folder (default: the current directory), named
+                         after its title
   --png-only             skip the video; write only the requested --frame(s)
   --frame SECS           export a still at this timestamp; repeatable
   --resolution WxH       default: keep the source resolution

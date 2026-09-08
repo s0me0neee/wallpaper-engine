@@ -72,7 +72,7 @@ struct ExportArgs {
     wallpaper: PathBuf,
 
     /// Directory the wallpaper's own output folder is created under.
-    #[arg(short, long, default_value = "export")]
+    #[arg(short, long, default_value = ".")]
     out: PathBuf,
 
     /// Skip the video; write only the still(s) named by `--frame`.
@@ -495,9 +495,14 @@ fn run_export(args: &ExportArgs) -> Result<()> {
     // Each wallpaper gets its own named folder rather than dumping stem-named
     // files into a shared one: the title is what the user recognises the
     // wallpaper by, and it is what `info` already shows first.
-    let out_dir = args
-        .out
-        .join(sanitize_component(project::display_name(&project)));
+    let name = sanitize_component(project::display_name(&project));
+    // `--out .` is the default, and `Path::join` would otherwise print every
+    // path with a `./` nobody asked for.
+    let out_dir = if args.out == Path::new(".") {
+        PathBuf::from(&name)
+    } else {
+        args.out.join(&name)
+    };
     println!("  output     {}", out_dir.display());
 
     let options = Options {
