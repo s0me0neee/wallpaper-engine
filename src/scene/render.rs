@@ -19,8 +19,11 @@ use crate::shader::bind::UniformValue;
 use crate::shader::{annotations, bind, preprocess, shim};
 use anyhow::{Context, Result, bail};
 use image::RgbaImage;
+use noise::{NoiseFn, Perlin};
 use serde_json::Value;
 use std::collections::HashMap;
+use std::f64::consts::TAU;
+use std::sync::OnceLock;
 
 /// No transform: the fixed fullscreen quad already spans clip space, so the
 /// vertex shader's `g_ModelViewProjectionMatrix * a_Position` is a no-op.
@@ -32,11 +35,8 @@ const IDENTITY: [f32; 16] = [
 ];
 
 /// One WE-builtin utility texture the shim's shader annotations reference by
-/// name but which ships with the engine, not with any wallpaper.
-///
-/// Only the flat ones are covered; `util/noise` has no synthesized equivalent
-/// yet, so a shader defaulting to it degrades to flat black rather than a
-/// noise-driven wobble — a documented gap, not a silent one.
+/// name but which ships with the engine, not with any wallpaper. Only the flat
+/// ones; the noise builtins are `builtin_noise`.
 fn builtin_solid(name: &str) -> Option<[u8; 4]> {
     match name {
         "util/noflow" => Some([127, 127, 0, 255]),
@@ -44,6 +44,65 @@ fn builtin_solid(name: &str) -> Option<[u8; 4]> {
         "util/white" => Some([255, 255, 255, 255]),
         _ => None,
     }
+}
+
+/// The synthesized stand-in for WE's builtin noise textures (`util/noise`,
+/// `util/clouds_256`), which also ship with the engine, not the wallpaper.
+/// Without it a shader that samples one for a wobble or dither — `pulse`,
+/// `godrays_downsample2`, `foliagesway` — degrades to flat black.
+///
+/// 256x256 RGBA, four octaves of value noise per channel, built once. Tiling
+/// is exact: each octave samples 4D Perlin (`noise` has no seamless 2D
+/// generator) on a torus embedding of the UV square at integer angular
+/// frequencies, so the wrap is continuous by construction — which matters
+/// because these are sampled `REPEAT` well outside `[0, 1]`.
+fn builtin_noise(name: &str) -> Option<RgbaImage> {
+    static TEXTURE: OnceLock<RgbaImage> = OnceLock::new();
+    matches!(name, "util/noise" | "util/clouds_256" | "util/clouds")
+        .then(|| TEXTURE.get_or_init(build_noise_texture).clone())
+}
+
+fn build_noise_texture() -> RgbaImage {
+    const SIZE: u32 = 256;
+    let channels = [Perlin::new(1), Perlin::new(2), Perlin::new(3), Perlin::new(4)];
+
+    RgbaImage::from_fn(SIZE, SIZE, |x, y| {
+        let u = f64::from(x) / f64::from(SIZE) * TAU;
+        let v = f64::from(y) / f64::from(SIZE) * TAU;
+        let mut pixel = [0u8; 4];
+        for (slot, perlin) in channels.iter().enumerate() {
+            let level = noise_sample(perlin, u, v);
+            #[expect(
+                clippy::cast_possible_truncation,
+                clippy::cast_sign_loss,
+                reason = "clamped to 0.0..=1.0, then scaled by 255"
+            )]
+            let byte = (level * 255.0).round() as u8;
+            pixel[slot] = byte;
+        }
+        image::Rgba(pixel)
+    })
+}
+
+/// One channel's value at UV angles `(u, v)` on the torus: four octaves of
+/// Perlin summed and remapped to `[0, 1]`. Periodic in `u` and `v` with
+/// period `TAU`, since each octave uses an integer angular frequency.
+fn noise_sample(perlin: &Perlin, u: f64, v: f64) -> f64 {
+    const OCTAVES: u32 = 4;
+    let (mut sum, mut norm, mut amplitude, mut frequency) = (0.0, 0.0, 1.0, 1.0_f64);
+    for _ in 0..OCTAVES {
+        sum += amplitude
+            * perlin.get([
+                (frequency * u).cos(),
+                (frequency * u).sin(),
+                (frequency * v).cos(),
+                (frequency * v).sin(),
+            ]);
+        norm += amplitude;
+        amplitude *= 0.5;
+        frequency *= 2.0;
+    }
+    ((sum / norm) * 0.5 + 0.5).clamp(0.0, 1.0)
 }
 
 /// The scene's effect chain, if it has the shape plan.md §4.1 describes:
@@ -266,7 +325,16 @@ pub fn prepare_effect_chain(
                 let vertex_declarations = annotations::parse(&vertex_source);
                 let fragment_declarations = annotations::parse(&fragment_source);
 
-                let mut combos = bind::texture_combos(&fragment_declarations, &effect_pass.textures);
+                // A combo's `[COMBO]` default is usually declared in one stage
+                // (typically the fragment) but governs both. `godrays_downsample2`
+                // keeps `v_NoiseTexCoord` under `#if NOISE == 1` in the vertex
+                // shader too, yet only its fragment carries the `NOISE default:1`
+                // line — so without merging the pair's defaults the vertex stage
+                // defaults NOISE to 0, never writes the varying, and the program
+                // fails to link. Feed the union of both stages' defaults to each.
+                let mut combos = annotations::combo_defaults(&vertex_declarations);
+                combos.extend(annotations::combo_defaults(&fragment_declarations));
+                combos.extend(bind::texture_combos(&fragment_declarations, &effect_pass.textures));
                 combos.extend(bind::texture_combos(&vertex_declarations, &effect_pass.textures));
 
                 let vertex_glsl = preprocess::build(&vertex_source, preprocess::Stage::Vertex, headers, &combos)
@@ -361,10 +429,14 @@ fn resolve_slot_texture(
 ) -> Result<(glow::Texture, (u32, u32))> {
     if let Some(name) = name {
         // A pass may positionally name an engine builtin (`util/white`,
-        // `util/noflow`, ...); those ship with Wallpaper Engine, not the
-        // package, so synthesize the flat ones rather than reading them.
+        // `util/noflow`, `util/noise`, ...); those ship with Wallpaper Engine,
+        // not the package, so synthesize them rather than reading them.
         if let Some(solid) = builtin_solid(name) {
             return Ok((pass::solid_texture(gl, solid)?, (1, 1)));
+        }
+        if let Some(noise) = builtin_noise(name) {
+            let size = (noise.width(), noise.height());
+            return Ok((pass::upload_repeating_texture(gl, &noise)?, size));
         }
 
         let texture_path = format!("materials/{name}.tex");
@@ -376,7 +448,12 @@ fn resolve_slot_texture(
         return Ok((pass::upload_texture(gl, &decoded)?, size));
     }
 
-    let builtin = default.and_then(Value::as_str).and_then(builtin_solid).unwrap_or([0, 0, 0, 255]);
+    let default_name = default.and_then(Value::as_str);
+    if let Some(noise) = default_name.and_then(builtin_noise) {
+        let size = (noise.width(), noise.height());
+        return Ok((pass::upload_repeating_texture(gl, &noise)?, size));
+    }
+    let builtin = default_name.and_then(builtin_solid).unwrap_or([0, 0, 0, 255]);
     Ok((pass::solid_texture(gl, builtin)?, (1, 1)))
 }
 
@@ -396,4 +473,35 @@ fn uniform_ints(declarations: &Declarations, material: &serde_json::Map<String, 
             _ => None,
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn builtin_noise_matches_only_the_known_names() {
+        assert!(builtin_noise("util/noise").is_some());
+        assert!(builtin_noise("util/clouds_256").is_some());
+        assert!(builtin_noise("util/noflow").is_none());
+        assert!(builtin_noise("masks/pulse_mask").is_none());
+    }
+
+    #[test]
+    fn the_noise_field_is_periodic_so_repeat_sampling_has_no_seam() {
+        let perlin = Perlin::new(1);
+        for step in 0..16 {
+            let angle = f64::from(step) / 16.0 * TAU;
+            // One full turn brings the torus sample back exactly.
+            assert!((noise_sample(&perlin, angle, 0.3) - noise_sample(&perlin, angle + TAU, 0.3)).abs() < 1e-9);
+            assert!((noise_sample(&perlin, 0.7, angle) - noise_sample(&perlin, 0.7, angle + TAU)).abs() < 1e-9);
+        }
+    }
+
+    #[test]
+    fn the_synthesized_noise_texture_is_not_flat() {
+        let texture = build_noise_texture();
+        let first = texture.get_pixel(0, 0).0[0];
+        assert!(texture.pixels().any(|pixel| pixel.0[0] != first), "noise texture has no variation");
+    }
 }

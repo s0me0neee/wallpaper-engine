@@ -122,6 +122,17 @@ impl Target {
 
 /// Upload an RGBA image as a `CLAMP_TO_EDGE`, linearly filtered texture.
 pub fn upload_texture(gl: &glow::Context, image: &image::RgbaImage) -> Result<glow::Texture> {
+    upload_with_wrap(gl, image, glow::CLAMP_TO_EDGE)
+}
+
+/// As `upload_texture`, but `REPEAT` — for the synthesized tiling noise
+/// builtins, which shaders sample well outside `[0, 1]` (scaled by
+/// `g_NoiseScale` and offset by `g_Time`).
+pub fn upload_repeating_texture(gl: &glow::Context, image: &image::RgbaImage) -> Result<glow::Texture> {
+    upload_with_wrap(gl, image, glow::REPEAT)
+}
+
+fn upload_with_wrap(gl: &glow::Context, image: &image::RgbaImage, wrap: u32) -> Result<glow::Texture> {
     #[expect(clippy::cast_possible_wrap, reason = "wallpaper textures are nowhere near i32::MAX")]
     let (width, height) = (image.width() as i32, image.height() as i32);
 
@@ -141,8 +152,8 @@ pub fn upload_texture(gl: &glow::Context, image: &image::RgbaImage) -> Result<gl
         );
         gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MIN_FILTER, gl_enum(glow::LINEAR));
         gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MAG_FILTER, gl_enum(glow::LINEAR));
-        gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_WRAP_S, gl_enum(glow::CLAMP_TO_EDGE));
-        gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_WRAP_T, gl_enum(glow::CLAMP_TO_EDGE));
+        gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_WRAP_S, gl_enum(wrap));
+        gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_WRAP_T, gl_enum(wrap));
     }
     Ok(texture)
 }
