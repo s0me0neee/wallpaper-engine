@@ -11,6 +11,7 @@ mod paths;
 mod pkg;
 mod project;
 mod reader;
+mod render;
 mod scene;
 mod shader;
 mod tex;
@@ -294,8 +295,9 @@ fn still_name(time: f64, multiple: bool) -> String {
 /// the reasons stay in one readable list as pipelines land.
 fn unsupported_reason(project: &Project) -> Option<String> {
     match &project.kind {
-        // Scene is exportable as a still only: the layers composite, but the
-        // effect shaders that animate them do not run yet.
+        // Scene is always exportable as a still: the layers composite even
+        // where the effect chain doesn't apply (see `scene_runs_effects` in
+        // `run_info` for exactly which scenes that is).
         Kind::Scene if project.package.is_none() => {
             Some("no scene.pkg beside project.json, so there are no assets to render".to_string())
         }
@@ -366,19 +368,29 @@ fn run_info(args: &InfoArgs) -> Result<()> {
     }
 
     // A scene's canvas and layer count come out of the package, which is worth
-    // knowing before asking for a 33-megapixel still.
+    // knowing before asking for a 33-megapixel still. It also decides which
+    // "export" message below is honest: the effect chain only runs for the
+    // one-image-layer shape plan.md §4.1 describes.
+    let mut scene_runs_effects = false;
     if project.kind == Kind::Scene
         && let Some(package) = project.package.as_deref()
         && let Ok(mut archive) = pkg::Archive::open(package)
         && let Ok(scene) = scene::load(&mut archive)
     {
-        let images = scene.objects.iter().filter(|o| model::is_image(o)).count();
+        let visible_images: Vec<_> = scene
+            .objects
+            .iter()
+            .filter(|o| o.visible && model::is_image(o))
+            .collect();
+        let images = visible_images.len();
         let particles = scene.objects.iter().filter(|o| model::is_particle(o)).count();
         let effects: usize = scene
             .objects
             .iter()
             .map(|o| model::visible_effects(o).count())
             .sum();
+        scene_runs_effects =
+            images == 1 && model::visible_effects(visible_images[0]).next().is_some();
 
         if let Some(ortho) = scene.general.orthographic {
             println!("  canvas     {}x{}", ortho.width, ortho.height);
@@ -388,6 +400,9 @@ fn run_info(args: &InfoArgs) -> Result<()> {
 
     match unsupported_reason(&project) {
         Some(reason) => println!("  export     no: {reason}"),
+        None if project.kind == Kind::Scene && scene_runs_effects => {
+            println!("  export     yes (effect chain rendered; particles are not)");
+        }
         None if project.kind == Kind::Scene => {
             println!("  export     still only (effects and particles are not rendered)");
         }
@@ -440,19 +455,21 @@ fn export_video(project: &Project, options: &Options) -> Result<()> {
     Ok(())
 }
 
-/// Scene wallpapers composite their layers into a still.
+/// Scene wallpapers composite their layers, running the effect chain over
+/// them where the scene fits the shape `scene::render` handles.
 ///
-/// No video yet: the motion lives in the effect shaders, so a video of the
-/// base composite would be a still repeated, which is worse than not offering
-/// one. Anything the composite cannot represent is listed rather than dropped.
-/// The scene has no timeline to address, so `--frame`/`--png-only` do not
-/// apply here and are silently ignored — there is only ever the one still.
+/// Still video-less: the effect chain gives one frame at a time, not a loop,
+/// so `--frame` picks which moment `g_Time` sees (the first one given; a
+/// second still would need a second run) and `--png-only` is moot — there was
+/// never a video path here. Anything the still cannot represent is listed
+/// rather than dropped.
 fn export_scene(project: &Project, options: &Options) -> Result<()> {
     let package = project::require_package(project)?;
     let mut archive = pkg::Archive::open(package)?;
     let scene = scene::load(&mut archive)?;
 
-    let composite = scene::compose::render(&mut archive, &scene, options.resolution)?;
+    let time = options.frames.first().copied().unwrap_or(0.0);
+    let composite = scene::render::render_frame(&mut archive, &scene, options.resolution, time)?;
 
     let out = options.out_dir.join("still.png");
     if let Some(parent) = out.parent() {

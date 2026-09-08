@@ -10,7 +10,10 @@ clap = { version = "4.6.6", features = ["derive"] }
 # ffmpeg development libraries at build time (`brew install ffmpeg`), and the
 # major version tracks ffmpeg's own — 9.x builds against ffmpeg 9.
 ffmpeg-next = "9.0.0"
+# GL function loader/bindings, driven through a context glutin opens.
+glow = "0.18.0"
 glsl-include = "0.3.1"
+glutin = "0.32.3"
 image = { version = "0.25.10", default-features = false, features = [
 	"png",
 	"jpeg",
@@ -27,9 +30,15 @@ lz4_flex = { version = "0.14.0", default-features = false, features = [
 	"safe-decode",
 	"safe-encode",
 ] }
+# CGL has no true surfaceless or pbuffer surface, only a window's; these three
+# build the one never-shown NSWindow the GL context attaches to.
+objc2 = "0.6"
+objc2-app-kit = { version = "0.3", features = ["NSWindow", "NSGraphics", "NSView", "NSResponder"] }
+objc2-foundation = "0.3"
 # Encodes the PNGs we generate for raw-pixel textures. Textures whose payload is
 # already an encoded image are passed through byte-for-byte and never hit this.
 png = "0.18.1"
+raw-window-handle = "0.6.2"
 regex = "1.13.1"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"

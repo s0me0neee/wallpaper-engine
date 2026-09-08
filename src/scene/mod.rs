@@ -5,6 +5,7 @@
 
 pub mod compose;
 pub mod model;
+pub mod render;
 
 use anyhow::{Context, Result};
 use model::Scene;

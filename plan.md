@@ -5,8 +5,10 @@ looping video that any ordinary wallpaper app can consume, with the animated
 effects baked in.
 
 **Status.** Container layer, type routing and the Video pipeline are built and
-verified against a six-wallpaper corpus. The Scene renderer and Web capture are
-still to build.
+verified against a six-wallpaper corpus. The Scene renderer now runs the real
+GPU effect chain for the common one-image-plus-effects shape (§4); richer
+scenes (multiple image layers, particles) still fall back to the effect-free
+composite. Web capture is still to build.
 
 ---
 
@@ -21,10 +23,13 @@ still to build.
 | Video pipeline (still PNG + looping mp4) | Done, both sample video wallpapers export |
 | Scene model (`scene.json` / model / material) | Done |
 | Scene base composite (layers flattened to a still) | Done, both sample scenes match their previews |
+| Shader preprocessor + shim (`#include`, combos, dialect rewrite) | Done, 28/28 corpus shaders compile |
+| Headless GL renderer + effect chain | Done for one image layer + effects (§4); multi-layer/particle scenes fall back to the composite |
 
-Crates in use: `anyhow`, `clap`, `image`, `lz4_flex`, `png`, `serde`,
-`serde_json`, `texpresso`, `walkdir`. `ffmpeg`/`ffprobe` are invoked as
-subprocesses.
+Crates in use: `anyhow`, `clap`, `ffmpeg-next`, `glow`, `glsl-include`,
+`glutin`, `image`, `lz4_flex`, `objc2`/`objc2-app-kit`/`objc2-foundation`
+(headless GL context on macOS), `png`, `raw-window-handle`, `regex`, `serde`,
+`serde_json`, `texpresso`, `walkdir`.
 
 ---
 
@@ -163,6 +168,34 @@ All motion is a pure function of the `g_Time` uniform. There is no simulation
 state. Frames are therefore **independently addressable** — render frame `n` at
 `t = n / fps` — which makes the renderer stateless, trivially parallel, and
 exactly reproducible. This is a large simplification and we should preserve it.
+Confirmed in practice: re-rendering the same timestamp twice is byte-identical.
+
+### 4.5 What building the chain actually settled
+
+- **Vertex stage: option (b), always.** Every pass draws one fixed clip-space
+  quad (`render/pass.rs::build_quad`) with `g_ModelViewProjectionMatrix` set to
+  the identity, rather than running Wallpaper Engine's own vertex shader. It
+  still expects that vertex shader's declared attributes/uniforms
+  (`a_Position`, `a_TexCoord`, `g_TextureNResolution`) to exist and be fed, so
+  its varyings come out identical to running the real thing — cheaper than
+  option (a) without losing correctness, for the fullscreen case.
+- **`g_TextureNResolution` is `(width, height, width, height)`.** Two shaders
+  read it two different ways — `shake.vert` takes the ratio `.z/.x` (an
+  atlas-packing remap, which is 1 when nothing is atlas-packed, as here) and
+  `foliagesway.vert` takes `.z/.w` directly (the texture's real aspect ratio).
+  Both are satisfied at once by setting all four components to the texture's
+  actual pixel size.
+- **A texture slot's combo switches on exactly when the slot is bound.** A
+  sampler's own annotation can name a combo (`{"combo":"MASK"}`); it must read
+  `1` exactly when `scene.json`'s positional `textures[]` actually names
+  something for that slot, `0` otherwise — not from any value in `scene.json`
+  itself, which never mentions combo names. (`shader::bind::texture_combos`.)
+- **`textures[i]` binds `g_Texture{i+1}`; `g_Texture0` is always the running
+  chain result**, never a positional entry — confirmed against
+  `scene_example1`'s three effects, none of which puts a texture at index 0.
+- **`util/noise` has no synthesized default yet**, unlike `util/noflow` and
+  `util/black`; `foliagesway`'s noise-driven wobble falls back to flat black
+  until one exists. Documented gap, not a silent one.
 
 ---
 
@@ -246,11 +279,26 @@ The preprocessor must therefore: resolve `#include`s against our shim, inject
 | **wgpu + naga**, translating to GLSL 330 | Cross-platform (Metal/Vulkan/DX12), actively maintained, future-proof on macOS | naga's GLSL *frontend* is less mature than its WGSL path; may hit unsupported constructs |
 | **glow + glutin** (OpenGL 3.3/4.1) | Accepts near-source GLSL, least translation work | OpenGL is deprecated on macOS (capped at 4.1); a dead end long-term |
 
-**Recommendation: wgpu.** We need a preprocessor regardless (includes, combos,
-shim), so `varying`→`in`/`out` and `gl_FragColor`→a declared output is a small
-increment on work already required. If naga's GLSL frontend proves too limited,
-the escape hatch is compiling GLSL→SPIR-V with `shaderc`/glslang and feeding
-SPIR-V to wgpu — same renderer, different front end.
+**Decision: glow + glutin, reversing the recommendation below.** Measured
+against the real corpus rather than assumed: naga's GLSL frontend rejects
+combined `uniform sampler2D` declarations and bare (non-block) global
+uniforms, both used throughout, so 0 of 12 sampled shaders parsed. glow+glutin
+compiles all 28 corpus shaders through a real GL 3.3 core context with only
+the mechanical dialect rewrite `preprocess.rs` already does. OpenGL's macOS
+deprecation is a real long-term cost, accepted for now; `naga`'s SPIR-V path
+remains the documented escape hatch if a future macOS drops OpenGL outright.
+
+*(Superseded reasoning, kept for the record: "We need a preprocessor
+regardless… so `varying`→`in`/`out` and `gl_FragColor`→a declared output is a
+small increment on work already required" — true, but it assumed naga's GLSL
+frontend would accept the corpus's shaders at all, which it did not.)*
+
+**macOS has no true surfaceless or pbuffer GL surface.** `glutin`'s CGL backend
+(checked against 0.31 and 0.32) rejects both outright —
+`create_pbuffer_surface` returns `NotSupported`. The only surface CGL offers
+is a window's. The renderer therefore builds one real, one-pixel `NSWindow`
+via `objc2-app-kit`, never orders it onto the screen, and attaches the GL
+context to its content view — see `render/gpu.rs`.
 
 ---
 
@@ -357,6 +405,12 @@ since a `--out` used across many exports would otherwise collide or blur
 together. Titles carry `/`, `|` and other filesystem-hostile punctuation, so
 the folder name is sanitized, not the raw string.
 
+**Deviation, third round:** for a Scene wallpaper that runs the effect chain
+(§4.5), `--frame` now means something different than for Video — it is the
+`g_Time` the chain renders at (first value if several are given), not a seek
+into an existing file. `--png-only` stays moot there: Scene has never had a
+video path.
+
 Still to add:
 
 ```
@@ -375,8 +429,8 @@ Each phase ships something independently useful.
 |---|---|---|
 | ~~**1. Type routing + Video passthrough**~~ | **Done.** `project.json` parsing; Video wallpapers export with no rendering at all | Low |
 | ~~**2. Scene model + still export**~~ | **Done.** serde types for scene/effect/material; correct-resolution base PNG | Low |
-| **3. Shader pipeline** | Preprocessor, shim, wgpu, single pass, then the full chain | **High** |
-| **4. Animation + video** | `g_Time` sweep, frame capture, loop detection, ffmpeg encode | Medium |
+| ~~**3. Shader pipeline**~~ | **Done** for the one-image-layer shape: preprocessor, shim, headless glow/glutin context, the full effect chain per `--frame` timestamp. Verified deterministic (byte-identical re-renders) and animated (distinct frames at t=0 vs t=30 on `scene_example1`). Multi-layer/particle scenes (`scene_example2`) still fall back to the effect-free composite | **High**, now landed |
+| **4. Animation + video** | `g_Time` sweep across a whole video's worth of frames, loop detection, feeding the chain's output into `export::video` instead of one still | Medium |
 | **5. Web capture** | Local server, headless Chrome, virtual-time frames | Medium |
 
 Phase 3 is the project. Phases 1–2 are worth doing first anyway because they

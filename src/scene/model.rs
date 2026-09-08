@@ -214,9 +214,26 @@ pub struct EffectPass {
     /// Material keys bound to shader uniforms for this pass.
     #[serde(default)]
     pub constantshadervalues: Map<String, Value>,
-    /// Texture slots. `null` means "whatever the previous pass produced".
+    /// Texture slots, positionally bound to `g_Texture1`, `g_Texture2`, ...
+    /// (`g_Texture0` is always the previous pass and never appears here).
+    /// `null` means "use the shader's own annotation default", e.g.
+    /// `util/noflow`.
     #[serde(default)]
     pub textures: Vec<Option<String>>,
+}
+
+/// `effects/<name>/effect.json` — names the material(s) an effect instance's
+/// passes run, one per entry in `EffectPass` above, in the same order.
+#[derive(Debug, Deserialize)]
+pub struct EffectDefinition {
+    #[serde(default)]
+    pub passes: Vec<EffectDefinitionPass>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct EffectDefinitionPass {
+    /// Path to the `materials/*.json` this pass renders with.
+    pub material: String,
 }
 
 /// `models/*.json` — the indirection between an object and its material.
