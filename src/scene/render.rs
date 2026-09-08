@@ -256,6 +256,20 @@ impl EffectChain {
     /// same order — pass `&[]` to just use the wallpaper's own presets, as
     /// export does.
     pub fn render(&self, gl: &glow::Context, time: f32, overrides: &[f32]) -> Result<&pass::Target> {
+        self.render_over(gl, None, time, overrides)
+    }
+
+    /// As `render`, but the first pass reads `base` as `g_Texture0` instead of
+    /// the texture baked in at prepare time. A puppet-warp layer's image
+    /// changes every frame, so its chain's input has to be re-fed each frame
+    /// rather than uploaded once.
+    pub fn render_over(
+        &self,
+        gl: &glow::Context,
+        base: Option<glow::Texture>,
+        time: f32,
+        overrides: &[f32],
+    ) -> Result<&pass::Target> {
         for (pass_index, pass) in self.passes.iter().enumerate() {
             let mut floats = pass.floats.clone();
             floats.push(("g_Time".to_string(), vec![time]));
@@ -267,8 +281,17 @@ impl EffectChain {
                 }
             }
 
-            let texture_refs: Vec<(&str, glow::Texture)> =
-                pass.textures.iter().map(|(name, texture)| (name.as_str(), *texture)).collect();
+            let texture_refs: Vec<(&str, glow::Texture)> = pass
+                .textures
+                .iter()
+                .map(|(name, texture)| {
+                    let texture = match (pass_index, base) {
+                        (0, Some(base)) if name == "g_Texture0" => base,
+                        _ => *texture,
+                    };
+                    (name.as_str(), texture)
+                })
+                .collect();
             let float_refs: Vec<(&str, &[f32])> = floats.iter().map(|(n, v)| (n.as_str(), v.as_slice())).collect();
             let int_refs: Vec<(&str, i32)> = pass.ints.iter().map(|(n, v)| (n.as_str(), *v)).collect();
 

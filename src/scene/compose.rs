@@ -57,6 +57,63 @@ pub struct Layered<'a> {
     pub omissions: Vec<String>,
 }
 
+/// A scene's time-independent groundwork: every layer's pixels decoded, every
+/// puppet mesh parsed, every particle placement resolved. The live simulator
+/// builds this once when the window opens and calls `animate` every frame;
+/// `prepare` (and the still exporter under it) runs both back to back.
+pub struct StaticScene<'a> {
+    pub width: u32,
+    pub height: u32,
+    pub background: Rgba<u8>,
+    pub items: Vec<StaticItem<'a>>,
+    pub omissions: Vec<String>,
+}
+
+/// One scene object, resolved as far as time-independent work allows.
+pub enum StaticItem<'a> {
+    Image(StaticImage<'a>),
+    Puppet(StaticPuppet<'a>),
+    Particle(StaticParticle<'a>),
+}
+
+/// A plain image layer: texture already scaled to its on-canvas pixel extent
+/// and tinted, so every frame draws it unchanged.
+pub struct StaticImage<'a> {
+    pub object: &'a Object,
+    pub image: RgbaImage,
+    pub left: i64,
+    pub top: i64,
+    pub blend: Blend,
+    /// Set when this object *is* a puppet but its mesh failed to load, so it
+    /// fell back to the flat texture — surfaced as an omission by `animate`.
+    pub warp_error: Option<String>,
+}
+
+/// A puppet-warp layer: the parsed mesh and everything `warp_frame` needs to
+/// re-skin it at a new time without touching the archive again.
+pub struct StaticPuppet<'a> {
+    pub object: &'a Object,
+    pub puppet: puppet::Puppet,
+    /// Source texture, untinted — the tint is re-applied after each raster.
+    pub texture: RgbaImage,
+    pub animation: Option<u32>,
+    pub rate: f32,
+    /// Rest-rectangle extent and top-left, in canvas pixels.
+    pub rect_px: (f32, f32),
+    pub rect_left: f32,
+    pub rect_top: f32,
+    pub blend: Blend,
+}
+
+/// A particle system: its resolved placement and preset path, re-simulated
+/// each frame.
+pub struct StaticParticle<'a> {
+    pub object: &'a Object,
+    pub preset_path: String,
+    pub place: particle::Placement,
+    pub blend: Blend,
+}
+
 /// The visible rectangle, in scene units.
 ///
 /// The camera in `scene.json` is the editor's saved viewport, not the render
@@ -245,16 +302,43 @@ fn background_pixel(scene: &Scene) -> Rgba<u8> {
 /// that. Puppet motion in practice is a few percent; 30% is comfortably safe.
 const WARP_PAD: f32 = 0.3;
 
-/// Decode one image object's texture and place it: scaled to its on-canvas
-/// pixel extent, tinted, and positioned by its `origin`. A puppet-warp layer
-/// is deformed at `time` instead of scaled. `None` when the object resolves to
-/// no texture (a solid-colour or effect-only layer).
-fn prepare_layer<'a>(
+/// Round a scene-unit extent to a whole pixel count, floored at 1.
+#[expect(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "rounded and floored at 1.0 before the cast"
+)]
+fn to_pixel_size(width: f32, height: f32) -> (u32, u32) {
+    (width.round().max(1.0) as u32, height.round().max(1.0) as u32)
+}
+
+/// The layer's source texture scaled to its on-canvas pixel extent and tinted.
+fn scaled_tinted(object: &Object, texture: RgbaImage, pixel_width: u32, pixel_height: u32) -> RgbaImage {
+    let mut image = if texture.width() == pixel_width && texture.height() == pixel_height {
+        texture
+    } else {
+        imageops::resize(&texture, pixel_width, pixel_height, imageops::FilterType::Lanczos3)
+    };
+    apply_tint(&mut image, object.color, object.brightness, object.alpha);
+    image
+}
+
+/// A wallpaper canvas is at most a few tens of thousands of pixels wide.
+#[expect(clippy::cast_possible_truncation, reason = "canvas coordinates, nowhere near i64's range")]
+fn round_to_i64(x: f32) -> i64 {
+    x.round() as i64
+}
+
+/// Decode one image object's texture and resolve it as far as time-independent
+/// work allows: a `Puppet` item carrying the parsed mesh when it is a warp
+/// puppet whose mesh loads, an `Image` item otherwise (including a puppet whose
+/// mesh failed to load, which falls back to the flat texture). `None` when the
+/// object resolves to no texture (a solid-colour or effect-only layer).
+fn static_image_or_puppet<'a>(
     archive: &mut Archive,
     canvas: &Canvas,
     object: &'a Object,
-    time: f32,
-) -> Result<Option<PreparedLayer<'a>>> {
+) -> Result<Option<StaticItem<'a>>> {
     let Some(LayerTexture { image: texture, puppet: puppet_path, blend }) =
         layer_texture(archive, object)?
     else {
@@ -270,73 +354,60 @@ fn prepare_layer<'a>(
         object.origin.y + extent_y / 2.0,
     );
 
-    // A puppet layer replaces the flat scale with a skinned-mesh deformation.
+    // A puppet layer replaces the flat scale with a skinned-mesh deformation
+    // re-run every frame; keep the parsed mesh rather than the flat image.
     let mut warp_error = None;
     if let (Some(path), Some(clip)) = (puppet_path.as_deref(), model::visible_animation_layer(object)) {
-        match warp_layer(archive, canvas, object, path, &texture, (extent_x, extent_y), (rect_left, rect_top), clip, time, blend) {
-            Ok(layer) => return Ok(Some(layer)),
+        match load_puppet_mesh(archive, path) {
+            Ok(puppet) => {
+                return Ok(Some(StaticItem::Puppet(StaticPuppet {
+                    object,
+                    puppet,
+                    texture,
+                    animation: clip.animation,
+                    rate: clip.rate,
+                    rect_px: (extent_x * canvas.scale, extent_y * canvas.scale),
+                    rect_left,
+                    rect_top,
+                    blend,
+                })));
+            }
             Err(error) => warp_error = Some(format!("{error:#}")),
         }
     }
 
-    // Rounded and floored at 1.0, so this always lands in u32's range for any
-    // wallpaper-sized canvas.
-    #[expect(
-        clippy::cast_possible_truncation,
-        clippy::cast_sign_loss,
-        reason = "rounded and floored at 1.0 below"
-    )]
-    let (pixel_width, pixel_height) = (
-        (extent_x * canvas.scale).round().max(1.0) as u32,
-        (extent_y * canvas.scale).round().max(1.0) as u32,
-    );
-
-    let mut image = if texture.width() == pixel_width && texture.height() == pixel_height {
-        texture
-    } else {
-        imageops::resize(
-            &texture,
-            pixel_width,
-            pixel_height,
-            imageops::FilterType::Lanczos3,
-        )
-    };
-    apply_tint(&mut image, object.color, object.brightness, object.alpha);
-
-    // A wallpaper canvas is at most a few tens of thousands of pixels wide,
-    // nowhere near i64's range.
-    #[expect(clippy::cast_possible_truncation, reason = "canvas coordinates, nowhere near i64's range")]
-    let (left, top) = (rect_left.round() as i64, rect_top.round() as i64);
-
-    Ok(Some(PreparedLayer { object, image, left, top, blend, warped: false, warp_error }))
+    let (pixel_width, pixel_height) = to_pixel_size(extent_x * canvas.scale, extent_y * canvas.scale);
+    let image = scaled_tinted(object, texture, pixel_width, pixel_height);
+    Ok(Some(StaticItem::Image(StaticImage {
+        object,
+        image,
+        left: round_to_i64(rect_left),
+        top: round_to_i64(rect_top),
+        blend,
+        warp_error,
+    })))
 }
 
-/// Skin a puppet mesh at `time` and rasterize it through `texture`, returning
-/// a layer whose image covers the rest rectangle plus a deformation margin.
-#[expect(clippy::too_many_arguments, reason = "all of it is placement state the caller already has computed")]
-fn warp_layer<'a>(
-    archive: &mut Archive,
-    canvas: &Canvas,
-    object: &'a Object,
-    puppet_path: &str,
-    texture: &RgbaImage,
-    (extent_x, extent_y): (f32, f32),
-    (rect_left, rect_top): (f32, f32),
-    clip: &model::AnimationLayer,
-    time: f32,
-    blend: Blend,
-) -> Result<PreparedLayer<'a>> {
+/// Read and parse a puppet `.mdl`, rejecting an empty mesh.
+fn load_puppet_mesh(archive: &mut Archive, puppet_path: &str) -> Result<puppet::Puppet> {
     let data = archive.read(puppet_path).with_context(|| format!("reading {puppet_path}"))?;
     let puppet = puppet::parse(&data).with_context(|| format!("parsing {puppet_path}"))?;
     if puppet.vertices.is_empty() || puppet.triangles.len() < 3 {
         bail!("puppet mesh is empty");
     }
+    Ok(puppet)
+}
 
-    let skins = puppet::skin_transforms(&puppet, clip.animation, time, clip.rate);
-    let positions = puppet::deform(&puppet, &skins);
-    let (u_slope, u_intercept, v_slope, v_intercept) = puppet::uv_fit(&puppet);
+/// Skin `item`'s mesh at `time` and rasterize it through the source texture —
+/// the whole of a puppet layer's per-frame work, touching no files. Returns the
+/// deformed image (covering the rest rectangle plus a margin) and its canvas
+/// top-left.
+pub fn warp_frame(item: &StaticPuppet, time: f32) -> (RgbaImage, i64, i64) {
+    let skins = puppet::skin_transforms(&item.puppet, item.animation, time, item.rate);
+    let positions = puppet::deform(&item.puppet, &skins);
+    let (u_slope, u_intercept, v_slope, v_intercept) = puppet::uv_fit(&item.puppet);
 
-    let rect_px = (extent_x * canvas.scale, extent_y * canvas.scale);
+    let rect_px = item.rect_px;
     #[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss, reason = "layer extents are at most a few thousand px")]
     let (out_w, out_h) = (
         ((rect_px.0 * (1.0 + 2.0 * WARP_PAD)).ceil() as u32).clamp(1, 16384),
@@ -351,35 +422,47 @@ fn warp_layer<'a>(
         ((WARP_PAD + u) * rect_px.0, (WARP_PAD + v) * rect_px.1)
     };
 
-    let mut image = puppet::rasterize(&puppet, &positions, texture, out_w, out_h, place);
-    apply_tint(&mut image, object.color, object.brightness, object.alpha);
+    let mut image = puppet::rasterize(&item.puppet, &positions, &item.texture, out_w, out_h, place);
+    apply_tint(&mut image, item.object.color, item.object.brightness, item.object.alpha);
 
-    #[expect(clippy::cast_possible_truncation, reason = "canvas coordinates, nowhere near i64's range")]
-    let (left, top) = (
-        (rect_left - WARP_PAD * rect_px.0).round() as i64,
-        (rect_top - WARP_PAD * rect_px.1).round() as i64,
-    );
-
-    Ok(PreparedLayer { object, image, left, top, blend, warped: true, warp_error: None })
+    let left = round_to_i64(item.rect_left - WARP_PAD * rect_px.0);
+    let top = round_to_i64(item.rect_top - WARP_PAD * rect_px.1);
+    (image, left, top)
 }
 
 /// Resolve a scene into its canvas plus every visible image layer, prepared
 /// for placement but not yet flattened. `compose::render` overlays these
 /// straight; `scene::render` runs each layer's effect chain first. Puppet
 /// layers are deformed at `time` (pass 0 for the bind pose / a plain still).
+///
+/// This is `prepare_static` followed by `animate`; the live simulator splits
+/// the two so the decode/parse half runs once and only `animate` runs per
+/// frame.
 pub fn prepare<'a>(
     archive: &mut Archive,
     scene: &'a Scene,
     resolution: Option<Resolution>,
     time: f32,
 ) -> Result<Layered<'a>> {
+    let static_scene = prepare_static(archive, scene, resolution)?;
+    Ok(animate(archive, &static_scene, time))
+}
+
+/// The time-independent half of `prepare`: decode every layer's texture, parse
+/// every puppet mesh, resolve every particle placement. `animate` turns the
+/// result into a frame.
+pub fn prepare_static<'a>(
+    archive: &mut Archive,
+    scene: &'a Scene,
+    resolution: Option<Resolution>,
+) -> Result<StaticScene<'a>> {
     let ortho = scene
         .general
         .orthographic
         .context("scene has no orthographic projection, so it is not a flat wallpaper")?;
     let canvas = canvas_for(ortho, resolution)?;
 
-    let mut layers = Vec::new();
+    let mut items = Vec::new();
     let mut omissions = Vec::new();
 
     for object in &scene.objects {
@@ -389,10 +472,12 @@ pub fn prepare<'a>(
         omissions.extend(omissions_for(object));
 
         if is_particle(object) {
-            let outcome = prepare_particle_layer(archive, &canvas, object, time);
-            reconcile_particle_note(&mut omissions, object, &outcome);
-            if let Ok((layer, _)) = outcome {
-                layers.push(layer);
+            match static_particle(archive, &canvas, object) {
+                Ok((item, unsupported)) => {
+                    reconcile_particle_note(&mut omissions, object, Ok(&unsupported));
+                    items.push(StaticItem::Particle(item));
+                }
+                Err(error) => reconcile_particle_note(&mut omissions, object, Err(&error)),
             }
             continue;
         }
@@ -400,23 +485,122 @@ pub fn prepare<'a>(
         if !is_image(object) {
             continue;
         }
-        if let Some(layer) = prepare_layer(archive, &canvas, object, time)? {
-            reconcile_warp_note(&mut omissions, &layer);
-            layers.push(layer);
+        if let Some(item) = static_image_or_puppet(archive, &canvas, object)? {
+            items.push(item);
         }
     }
 
-    if layers.is_empty() {
+    if items.is_empty() {
         bail!("scene has no visible image layers to draw");
     }
 
-    Ok(Layered {
+    Ok(StaticScene {
         width: canvas.width,
         height: canvas.height,
         background: background_pixel(scene),
-        layers,
+        items,
         omissions,
     })
+}
+
+/// Produce the frame at `time`: puppet layers re-skinned, particle systems
+/// re-simulated, plain image layers passed straight through. Omission notes
+/// that `prepare_static` could not settle (a warp that will fail, a particle
+/// preset feature) are reconciled here against what actually happened.
+pub fn animate<'a>(archive: &mut Archive, static_scene: &StaticScene<'a>, time: f32) -> Layered<'a> {
+    let mut omissions = static_scene.omissions.clone();
+    let mut layers = Vec::with_capacity(static_scene.items.len());
+
+    for item in &static_scene.items {
+        let layer = match item {
+            StaticItem::Image(image) => PreparedLayer {
+                object: image.object,
+                image: image.image.clone(),
+                left: image.left,
+                top: image.top,
+                blend: image.blend,
+                warped: false,
+                warp_error: image.warp_error.clone(),
+            },
+            StaticItem::Puppet(puppet) => {
+                let (image, left, top) = warp_frame(puppet, time);
+                PreparedLayer {
+                    object: puppet.object,
+                    image,
+                    left,
+                    top,
+                    blend: puppet.blend,
+                    warped: true,
+                    warp_error: None,
+                }
+            }
+            StaticItem::Particle(particle) => {
+                match particle::render_system(archive, &particle.preset_path, &particle.place, time) {
+                    Ok(rendered) => {
+                        reconcile_particle_note(&mut omissions, particle.object, Ok(&rendered.unsupported));
+                        PreparedLayer {
+                            object: particle.object,
+                            image: rendered.image,
+                            left: 0,
+                            top: 0,
+                            blend: particle.blend,
+                            warped: false,
+                            warp_error: None,
+                        }
+                    }
+                    Err(error) => {
+                        reconcile_particle_note(&mut omissions, particle.object, Err(&error));
+                        continue;
+                    }
+                }
+            }
+        };
+        reconcile_warp_note(&mut omissions, &layer);
+        layers.push(layer);
+    }
+
+    Layered {
+        width: static_scene.width,
+        height: static_scene.height,
+        background: static_scene.background,
+        layers,
+        omissions,
+    }
+}
+
+/// Resolve a particle object's placement and blend, and run one simulation at
+/// t=0 to learn which preset features it uses that we do not simulate.
+fn static_particle<'a>(
+    archive: &mut Archive,
+    canvas: &Canvas,
+    object: &'a Object,
+) -> Result<(StaticParticle<'a>, Vec<String>)> {
+    let preset_path = object
+        .particle
+        .as_deref()
+        .context("particle object names no preset")?
+        .to_string();
+
+    let (origin_x, origin_y) = to_pixels(canvas, object.origin.x, object.origin.y);
+    let place = particle::Placement {
+        origin_px: Vec2::new(origin_x, origin_y),
+        scale: Vec2::new(object.scale.x, object.scale.y),
+        px_per_unit: canvas.scale,
+        canvas_px: (canvas.width, canvas.height),
+        tint: GVec3::new(
+            object.color.x * object.brightness,
+            object.color.y * object.brightness,
+            object.color.z * object.brightness,
+        ),
+        alpha: object.alpha,
+        overrides: object.instanceoverride.unwrap_or_default(),
+    };
+
+    let blend = particle::layer_blend(archive, &preset_path);
+    let rendered = particle::render_system(archive, &preset_path, &place, 0.0)
+        .with_context(|| format!("simulating {preset_path}"))?;
+
+    Ok((StaticParticle { object, preset_path, place, blend }, rendered.unsupported))
 }
 
 /// `omissions_for` flags every object with animation layers as "keyframe
@@ -434,64 +618,19 @@ fn reconcile_warp_note(omissions: &mut Vec<String>, layer: &PreparedLayer) {
     }
 }
 
-/// Simulate and rasterize a particle object into a full-canvas additive layer
-/// placed at the object's z-order. Returns the layer and the list of preset
-/// features that were parsed but not simulated.
-fn prepare_particle_layer<'a>(
-    archive: &mut Archive,
-    canvas: &Canvas,
-    object: &'a Object,
-    time: f32,
-) -> Result<(PreparedLayer<'a>, Vec<String>)> {
-    let preset_path = object
-        .particle
-        .as_deref()
-        .context("particle object names no preset")?;
-
-    let (origin_x, origin_y) = to_pixels(canvas, object.origin.x, object.origin.y);
-    let place = particle::Placement {
-        origin_px: Vec2::new(origin_x, origin_y),
-        scale: Vec2::new(object.scale.x, object.scale.y),
-        px_per_unit: canvas.scale,
-        canvas_px: (canvas.width, canvas.height),
-        tint: GVec3::new(
-            object.color.x * object.brightness,
-            object.color.y * object.brightness,
-            object.color.z * object.brightness,
-        ),
-        alpha: object.alpha,
-        overrides: object.instanceoverride.unwrap_or_default(),
-    };
-
-    let blend = particle::layer_blend(archive, preset_path);
-    let rendered = particle::render_system(archive, preset_path, &place, time)
-        .with_context(|| format!("simulating {preset_path}"))?;
-
-    let layer = PreparedLayer {
-        object,
-        image: rendered.image,
-        left: 0,
-        top: 0,
-        blend,
-        warped: false,
-        warp_error: None,
-    };
-    Ok((layer, rendered.unsupported))
-}
-
 /// `omissions_for` flags every particle object as "particle system not
 /// rendered". Replace that once we've tried: drop it when the system rendered
 /// clean, or swap in what was skipped or why it failed.
 fn reconcile_particle_note(
     omissions: &mut Vec<String>,
     object: &Object,
-    outcome: &Result<(PreparedLayer, Vec<String>)>,
+    outcome: Result<&[String], &anyhow::Error>,
 ) {
     let name = model::label(object);
     let stale = format!("{name}: particle system not rendered");
     let replacement = match outcome {
-        Ok((_, unsupported)) if unsupported.is_empty() => None,
-        Ok((_, unsupported)) => {
+        Ok([]) => None,
+        Ok(unsupported) => {
             Some(format!("{name}: particle system rendered without {}", unsupported.join(", ")))
         }
         Err(error) => Some(format!("{name}: particle system skipped ({error:#})")),
