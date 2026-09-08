@@ -17,6 +17,8 @@ lz4_flex = { version = "0.14.0", default-features = false, features = [
 # Encodes the PNGs we generate for raw-pixel textures. Textures whose payload is
 # already an encoded image are passed through byte-for-byte and never hit this.
 png = "0.18.1"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
 # BC1/BC2/BC3 decoding for DXT1/DXT3/DXT5 textures.
 texpresso = "2.0.2"
 walkdir = "2.5.0"

@@ -1,19 +1,29 @@
-//! Wallpaper Engine scene analyzer: unpacks `.pkg` archives and decodes the
-//! `.tex` textures inside them.
+//! Turn a Wallpaper Engine wallpaper into a still PNG and a looping video that
+//! an ordinary wallpaper app can use.
+//!
+//! `project.json` selects the pipeline. Video wallpapers already contain a
+//! finished loop and are packaged directly; scene and web wallpapers need
+//! rendering and are not built yet. `unpack` and `tex` remain as the debugging
+//! tools the container work was built with.
 
+mod export;
+mod paths;
 mod pkg;
+mod project;
 mod reader;
 mod tex;
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand};
+use export::{Options, Resolution};
+use project::{Kind, Project};
 use std::path::PathBuf;
 use walkdir::WalkDir;
 
-/// Unpack and inspect Wallpaper Engine scene packages.
+/// Export Wallpaper Engine wallpapers to ordinary images and video.
 ///
-/// With no subcommand, runs the whole pipeline with default paths:
-/// papers/scene_example1/scene.pkg -> unpacked/ -> textures/
+/// With no subcommand, runs the container debugging pipeline with default
+/// paths: papers/scene_example1/scene.pkg -> unpacked/ -> textures/
 #[derive(Parser)]
 #[command(name = "wallpaper-engine", version, about, long_about = None)]
 struct Cli {
@@ -23,10 +33,58 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Convert a wallpaper to a still PNG and a looping video.
+    Export(ExportArgs),
+    /// Report what a wallpaper is and whether we can export it.
+    Info(InfoArgs),
     /// Extract the contents of a .pkg archive.
     Unpack(UnpackArgs),
     /// Decode .tex textures to PNG.
     Tex(TexArgs),
+}
+
+#[derive(Args)]
+struct InfoArgs {
+    /// Wallpaper directory, or its project.json.
+    wallpaper: PathBuf,
+}
+
+#[derive(Args)]
+struct ExportArgs {
+    /// Wallpaper directory, or its project.json.
+    wallpaper: PathBuf,
+
+    /// Directory to write the exported files into.
+    #[arg(short, long, default_value = "export")]
+    out: PathBuf,
+
+    /// Write only the still PNG.
+    #[arg(long, conflicts_with = "video_only")]
+    png_only: bool,
+
+    /// Write only the looping video.
+    #[arg(long, conflicts_with = "png_only")]
+    video_only: bool,
+
+    /// Output size as WIDTHxHEIGHT. Defaults to the source resolution.
+    #[arg(long)]
+    resolution: Option<Resolution>,
+
+    /// Output frame rate. Defaults to the source rate.
+    #[arg(long)]
+    fps: Option<f64>,
+
+    /// Trim the video to this many seconds.
+    #[arg(long)]
+    duration: Option<f64>,
+
+    /// Timestamp in seconds for the still frame.
+    #[arg(long, default_value_t = 0.0)]
+    time: f64,
+
+    /// Keep the audio track. Off by default; wallpaper apps ignore it.
+    #[arg(long)]
+    audio: bool,
 }
 
 #[derive(Args)]
@@ -133,8 +191,169 @@ fn run_tex(args: &TexArgs) -> Result<()> {
     Ok(())
 }
 
+/// A filesystem-safe stem for the exported files.
+///
+/// Titles are unusable here: real ones contain `/`, `|`, brackets and CJK.
+/// The wallpaper's own directory name is already a valid filename and is what
+/// the user recognises it by.
+fn output_stem(project: &Project) -> String {
+    project
+        .root
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.is_empty() && *name != ".")
+        .unwrap_or("wallpaper")
+        .to_string()
+}
+
+/// Explain why a wallpaper cannot be exported, or `None` if it can.
+///
+/// Kept separate from the export itself so `info` and `export` agree, and so
+/// the reasons stay in one readable list as pipelines land.
+fn unsupported_reason(project: &Project) -> Option<String> {
+    match &project.kind {
+        Kind::Video => None,
+        Kind::Scene => Some(
+            "scene wallpapers need the renderer, which is not built yet".to_string(),
+        ),
+        Kind::Web => {
+            if project.oversized {
+                // These are media-player apps, not wallpapers: hundreds of
+                // megabytes of bundled video and audio with no canonical
+                // frame. Capturing one would record whatever happened to be
+                // playing, which is worse than declining.
+                Some("oversized web wallpapers bundle their own media player".to_string())
+            } else {
+                Some("web wallpapers need headless capture, which is not built yet".to_string())
+            }
+        }
+        Kind::Application => {
+            Some("application wallpapers are Windows executables and cannot be rendered".to_string())
+        }
+        Kind::Unknown(raw) => Some(format!("unrecognized wallpaper type {raw:?}")),
+    }
+}
+
+fn run_info(args: &InfoArgs) -> Result<()> {
+    let project = Project::load(&args.wallpaper)?;
+
+    println!("{}", project.display_name());
+    println!("  type       {}", project.kind);
+    println!("  directory  {}", project.root.display());
+    match &project.entry {
+        Some(entry) if project.entry_is_packaged() => {
+            println!("  entry      {} (inside scene.pkg)", entry.display());
+        }
+        Some(entry) => {
+            let missing = if entry.exists() { "" } else { "  (MISSING)" };
+            println!("  entry      {}{missing}", entry.display());
+        }
+        None => println!("  entry      <none>"),
+    }
+    if let Some(package) = &project.package {
+        println!("  package    {}", package.display());
+    }
+    if let Some(preview) = &project.preview {
+        println!("  preview    {}", preview.display());
+    }
+    if project.oversized {
+        println!("  oversized  yes");
+    }
+    if !project.properties.is_empty() {
+        println!("  settings   {}", project.properties.len());
+    }
+
+    // A probe is cheap and is the thing you actually want to know about a
+    // video wallpaper before exporting it.
+    if project.kind == Kind::Video
+        && let Some(entry) = project.entry.as_deref().filter(|entry| entry.exists())
+        && let Ok(info) = export::ffmpeg::probe(entry)
+    {
+        println!(
+            "  video      {}x{} {:.3} fps, {:.2}s, {} / {}{}",
+            info.width,
+            info.height,
+            info.fps,
+            info.duration,
+            info.codec,
+            info.pixel_format,
+            if info.has_audio { ", audio" } else { "" }
+        );
+    }
+
+    match unsupported_reason(&project) {
+        Some(reason) => println!("  export     no: {reason}"),
+        None => println!("  export     yes"),
+    }
+    Ok(())
+}
+
+/// Video wallpapers ship a finished looping file; exporting is packaging.
+fn export_video(project: &Project, stem: &str, options: &Options) -> Result<()> {
+    let source = project.require_entry()?;
+    export::ffmpeg::require()?;
+
+    let info = export::ffmpeg::probe(source)?;
+    println!(
+        "  source     {}x{} {:.3} fps, {:.2}s, {}",
+        info.width, info.height, info.fps, info.duration, info.codec
+    );
+
+    if options.still {
+        let out = options.out_dir.join(format!("{stem}.png"));
+        let size = options
+            .resolution
+            .map(|resolution| (resolution.width, resolution.height));
+        export::still::from_video(source, &out, options.still_time, size)
+            .with_context(|| format!("writing the still frame of {}", source.display()))?;
+        println!("  still      {}", out.display());
+    }
+
+    if options.video {
+        let out = options.out_dir.join(format!("{stem}.mp4"));
+        let copied = export::video::export(source, &out, &info, options)
+            .with_context(|| format!("writing the video of {}", source.display()))?;
+        let how = if copied { "stream copy" } else { "re-encoded" };
+        println!("  video      {} ({how})", out.display());
+    }
+
+    Ok(())
+}
+
+fn run_export(args: &ExportArgs) -> Result<()> {
+    let project = Project::load(&args.wallpaper)?;
+
+    println!("{}", project.display_name());
+    println!("  type       {}", project.kind);
+
+    if let Some(reason) = unsupported_reason(&project) {
+        bail!("cannot export {}: {reason}", project.display_name());
+    }
+
+    let options = Options {
+        out_dir: args.out.clone(),
+        still: !args.video_only,
+        video: !args.png_only,
+        resolution: args.resolution,
+        fps: args.fps,
+        duration: args.duration,
+        still_time: args.time,
+        audio: args.audio,
+    };
+    let stem = output_stem(&project);
+
+    match project.kind {
+        Kind::Video => export_video(&project, &stem, &options),
+        // Every other type was rejected above; this stays exhaustive so a new
+        // pipeline cannot be added to the router without being wired in here.
+        _ => unreachable!("unsupported types are rejected before dispatch"),
+    }
+}
+
 fn main() -> Result<()> {
     match Cli::parse().command {
+        Some(Command::Export(args)) => run_export(&args),
+        Some(Command::Info(args)) => run_info(&args),
         Some(Command::Unpack(args)) => run_unpack(&args),
         Some(Command::Tex(args)) => run_tex(&args),
         // No subcommand: run the whole pipeline with default paths.

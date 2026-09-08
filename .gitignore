@@ -3,6 +3,7 @@
 # Derived output — regenerate with `cargo run`
 /unpacked
 /textures
+/export
 
 # Python reference implementation
 __pycache__/

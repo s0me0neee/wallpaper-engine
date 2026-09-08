@@ -4,8 +4,9 @@
 looping video that any ordinary wallpaper app can consume, with the animated
 effects baked in.
 
-**Status.** Container layer is built and verified. Everything below the
-"Foundation" line is still to design and build.
+**Status.** Container layer, type routing and the Video pipeline are built and
+verified against a six-wallpaper corpus. The Scene renderer and Web capture are
+still to build.
 
 ---
 
@@ -16,8 +17,11 @@ effects baked in.
 | `.pkg` archive parsing + extraction | Done, verified byte-exact |
 | `.tex` texture decode (RGBA8888 / RG88 / R8 / DXT1/3/5, LZ4, embedded PNG passthrough) | Done, verified pixel-identical against an independent implementation |
 | CLI skeleton (`clap`), recursive discovery (`walkdir`) | Done |
+| `project.json` parsing and type routing | Done, all six sample wallpapers route correctly |
+| Video pipeline (still PNG + looping mp4) | Done, both sample video wallpapers export |
 
-Crates in use: `anyhow`, `clap`, `lz4_flex`, `png`, `texpresso`, `walkdir`.
+Crates in use: `anyhow`, `clap`, `lz4_flex`, `png`, `serde`, `serde_json`,
+`texpresso`, `walkdir`. `ffmpeg`/`ffprobe` are invoked as subprocesses.
 
 ---
 
@@ -25,6 +29,10 @@ Crates in use: `anyhow`, `clap`, `lz4_flex`, `png`, `texpresso`, `walkdir`.
 
 `project.json` carries a `type` field. It is the first thing the tool reads,
 and it selects the entire downstream pipeline.
+
+**Matching is case-insensitive.** Wallpaper Engine does not normalize what it
+writes: the corpus contains both `"Scene"` and `"scene"`. Exact matching would
+silently route half of it to the unknown branch.
 
 | Type | Pipeline | Effort | Notes |
 |---|---|---|---|
@@ -293,16 +301,33 @@ Expect to stub WE's JS API (`window.wallpaperPropertyListener`,
 
 ## 10. CLI shape
 
-```
-we-export <input.pkg | unpacked-dir> [OPTIONS]
+Built:
 
-  --out DIR              output directory
-  --format png|mp4|both  default: both
-  --resolution WxH       default: source aspect at 1920 wide
-  --fps N                default: 30
-  --duration SECS        fixed length, or:
-  --auto-loop            detect the best loop point (default)
+```
+wallpaper-engine info   <wallpaper-dir>
+wallpaper-engine export <wallpaper-dir> [OPTIONS]
+
+  --out DIR              output directory (default: export/)
+  --png-only             still frame only
+  --video-only           looping video only
+  --resolution WxH       default: keep the source resolution
+  --fps N                default: keep the source rate
+  --duration SECS        trim to this length
   --time SECS            timestamp for the still (default 0)
+  --audio                keep the audio track (default: drop it)
+```
+
+`unpack` and `tex` remain as debugging subcommands.
+
+**Deviation from the original sketch:** the default resolution keeps the source
+rather than forcing 1920 wide. For a video wallpaper that default would
+re-encode a finished 4K file down to 1080p unasked, which is both lossy and
+slow; the scene renderer will want the opposite default and can set it itself.
+
+Still to add:
+
+```
+  --auto-loop            detect the best loop point (default, once built)
   --no-effects           export the base image only, skip the renderer
   --we-assets PATH       read real common*.h from a WE install (fallback)
 ```
@@ -315,7 +340,7 @@ Each phase ships something independently useful.
 
 | Phase | Deliverable | Risk |
 |---|---|---|
-| **1. Type routing + Video passthrough** | `project.json` parsing; Video wallpapers export with no rendering at all | Low |
+| ~~**1. Type routing + Video passthrough**~~ | **Done.** `project.json` parsing; Video wallpapers export with no rendering at all | Low |
 | **2. Scene model + still export** | serde types for scene/effect/material; correct-resolution base PNG | Low |
 | **3. Shader pipeline** | Preprocessor, shim, wgpu, single pass, then the full chain | **High** |
 | **4. Animation + video** | `g_Time` sweep, frame capture, loop detection, ffmpeg encode | Medium |
@@ -355,8 +380,23 @@ equivalent standard, because "looks about right" is not a test.
 | 8K textures | GPU memory | Downscale at load to output resolution |
 | WE JS API surface for Web | Web wallpapers fail to load | Stub incrementally against real wallpapers |
 
-**Open:** we have exactly one wallpaper to test against. A corpus of Scene
-wallpapers covering varied effects is needed before phase 3 can be called done.
+**Open:** the corpus is six wallpapers — two scene, two video, two web. Enough
+to have built and checked the router against, not enough for phase 3: only two
+are scenes, and one of those needs particle systems (see below). More scene
+wallpapers covering varied effects are needed before phase 3 can be called done.
+
+**Scope gap found in the corpus.** The second scene sample is not the shape
+this plan was written against. It has 12 objects — nine layered images with
+per-object effects, one carrying 13 — plus two particle systems (`Fireflies`,
+`Ember`) and an audio object. Particle systems are visible motion, so skipping
+them changes the output rather than merely simplifying it. Decide before phase 3
+whether they are in scope or a documented gap.
+
+**Oversized web wallpapers are declined, not attempted.** One sample is 3.1 GB
+with `"oversized": true`: 167 background stills, 15 music videos, 689 MB of
+audio, driven by a `data.json` playlist. There is no canonical frame to capture
+— a recording would catch whatever track happened to be playing. The router
+rejects these with a clear message instead of producing something wrong.
 
 **Legal:** WE's shader headers and engine assets are not redistributable. The
 shim is our own work; `--we-assets` reads the user's own install. Output is the

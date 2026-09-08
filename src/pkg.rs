@@ -17,12 +17,13 @@
 //! Some very old packages have no version string; there the first int32 is the
 //! entry count itself. We detect that by checking for a "PKGV" prefix.
 
+use crate::paths::resolve_under;
 use crate::reader::Reader;
 use anyhow::{Context, Result, bail};
 use std::{
     fs::File,
     io::{self, BufReader, Read},
-    path::{Component, Path, PathBuf},
+    path::Path,
 };
 
 #[derive(Debug, Clone)]
@@ -79,25 +80,7 @@ pub fn read_header<R: Read + io::Seek>(reader: &mut Reader<R>) -> Result<Package
     })
 }
 
-/// Resolve an archive path under `root`, refusing anything that escapes it.
-fn sanitize(path: &str, root: &Path) -> Result<PathBuf> {
-    let normalized = path.replace('\\', "/");
-    let mut out = root.to_path_buf();
-
-    for component in Path::new(&normalized).components() {
-        match component {
-            Component::Normal(part) => out.push(part),
-            Component::CurDir => {}
-            _ => bail!("entry escapes output directory: {path:?}"),
-        }
-    }
-
-    if out == root {
-        bail!("entry has an empty path");
-    }
-    Ok(out)
-}
-
+/// Extract every entry into `out_dir`, or just list them.
 pub fn unpack(pkg_path: &Path, out_dir: &Path, list_only: bool) -> Result<()> {
     let file = File::open(pkg_path)
         .with_context(|| format!("opening {}", pkg_path.display()))?;
@@ -139,7 +122,7 @@ pub fn unpack(pkg_path: &Path, out_dir: &Path, list_only: bool) -> Result<()> {
             continue;
         }
 
-        let target = sanitize(&entry.path, out_dir)?;
+        let target = resolve_under(out_dir, &entry.path)?;
         if let Some(parent) = target.parent() {
             std::fs::create_dir_all(parent)?;
         }
