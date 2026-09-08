@@ -18,7 +18,7 @@
 //! parameter away from the wallpaper's own preset, live.
 
 use crate::pkg::Archive;
-use crate::render::pass;
+use crate::render::{capture, pass};
 use crate::scene::compose::{self, StaticItem};
 use crate::scene::model::{self, Blend, Scene};
 use crate::scene::particle;
@@ -400,9 +400,11 @@ fn swap_note(notes: &mut [String], stale: &str, replacement: String) {
     }
 }
 
-fn redraw(app: &mut App, time: f32) -> Result<()> {
+/// Returns `true` when the caller should close the window (the debug dump hook
+/// asks for this after writing its frame).
+fn redraw(app: &mut App, time: f32) -> Result<bool> {
     let App { archive, static_scene, state, .. } = app;
-    let Some(state) = state.as_mut() else { return Ok(()) };
+    let Some(state) = state.as_mut() else { return Ok(false) };
 
     run_panel(state);
 
@@ -452,6 +454,25 @@ fn redraw(app: &mut App, time: f32) -> Result<()> {
         pass::composite_layer(&state.gl, &state.compositor, &state.composite, source, layer.rect, layer.additive);
     }
 
+    // Debug hook: `SIMULATE_DUMP=<path>` writes the composited frame (the live
+    // pipeline's own output, before the window blit) and exits, so the
+    // per-layer chains + GPU compositing can be eyeballed headlessly.
+    // Pair with `SIMULATE_TIME=<secs>` to pin `g_Time`.
+    if let Ok(path) = std::env::var("SIMULATE_DUMP") {
+        state.frames_since.1 += 1;
+        if state.frames_since.1 >= 2 {
+            let frame = capture::read_rgba(
+                &state.gl,
+                state.composite.framebuffer,
+                state.composite.width,
+                state.composite.height,
+            )?;
+            frame.save(&path).with_context(|| format!("writing {path}"))?;
+            println!("  wrote {path}");
+            return Ok(true);
+        }
+    }
+
     let size = state.window.inner_size();
     #[expect(clippy::cast_possible_wrap, reason = "window dimensions are nowhere near i32::MAX")]
     let window = (size.width as i32, size.height as i32);
@@ -460,7 +481,7 @@ fn redraw(app: &mut App, time: f32) -> Result<()> {
     state.surface.swap_buffers(&state.context).context("swapping buffers")?;
 
     report_fps(&mut state.frames_since);
-    Ok(())
+    Ok(false)
 }
 
 /// Print a frame-rate line about once a second so a slow scene is visible
@@ -557,10 +578,17 @@ impl ApplicationHandler for App<'_> {
                 }
             }
             WindowEvent::RedrawRequested => {
-                let time = self.start.elapsed().as_secs_f32();
-                if let Err(error) = redraw(self, time) {
-                    eprintln!("Error: drawing a frame\nCaused by: {error:#}");
-                    event_loop.exit();
+                let time = std::env::var("SIMULATE_TIME")
+                    .ok()
+                    .and_then(|value| value.parse().ok())
+                    .unwrap_or_else(|| self.start.elapsed().as_secs_f32());
+                match redraw(self, time) {
+                    Ok(true) => event_loop.exit(),
+                    Ok(false) => {}
+                    Err(error) => {
+                        eprintln!("Error: drawing a frame\nCaused by: {error:#}");
+                        event_loop.exit();
+                    }
                 }
             }
             _ => {}
