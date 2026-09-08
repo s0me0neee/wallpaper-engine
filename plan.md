@@ -326,25 +326,35 @@ Expect to stub WE's JS API (`window.wallpaperPropertyListener`,
 Built:
 
 ```
-wallpaper-engine info   <wallpaper-dir>
-wallpaper-engine export <wallpaper-dir> [OPTIONS]
+wallpaper-engine info    <wallpaper-dir>
+wallpaper-engine export  <wallpaper-dir> [OPTIONS]
+wallpaper-engine shaders <wallpaper-dir> [OPTIONS]
 
-  --out DIR              output directory (default: export/)
-  --png-only             still frame only
-  --video-only           looping video only
+  --out DIR              parent directory for the wallpaper's own output
+                         folder (default: export/), named after its title
+  --png-only             skip the video; write only the requested --frame(s)
+  --frame SECS           export a still at this timestamp; repeatable
   --resolution WxH       default: keep the source resolution
   --fps N                default: keep the source rate
   --duration SECS        trim to this length
-  --time SECS            timestamp for the still (default 0)
   --audio                keep the audio track (default: drop it)
 ```
 
-`unpack` and `tex` remain as debugging subcommands.
+`unpack` and `tex` remain as debugging subcommands, alongside `shaders`.
 
 **Deviation from the original sketch:** the default resolution keeps the source
 rather than forcing 1920 wide. For a video wallpaper that default would
 re-encode a finished 4K file down to 1080p unasked, which is both lossy and
 slow; the scene renderer will want the opposite default and can set it itself.
+
+**Deviation, second round:** a video export writes only the video by default —
+no automatic still. The wallpaper already contains a finished loop, so there
+is no single frame more canonical than any other to default to; `--frame` (or
+several) opts in explicitly. Each wallpaper's output also lands in its own
+folder named after its title rather than stem-named files in a flat directory,
+since a `--out` used across many exports would otherwise collide or blur
+together. Titles carry `/`, `|` and other filesystem-hostile punctuation, so
+the folder name is sanitized, not the raw string.
 
 Still to add:
 

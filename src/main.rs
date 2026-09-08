@@ -71,17 +71,19 @@ struct ExportArgs {
     /// Wallpaper directory, or its project.json.
     wallpaper: PathBuf,
 
-    /// Directory to write the exported files into.
+    /// Directory the wallpaper's own output folder is created under.
     #[arg(short, long, default_value = "export")]
     out: PathBuf,
 
-    /// Write only the still PNG.
-    #[arg(long, conflicts_with = "video_only")]
+    /// Skip the video; write only the still(s) named by `--frame`.
+    #[arg(long)]
     png_only: bool,
 
-    /// Write only the looping video.
-    #[arg(long, conflicts_with = "png_only")]
-    video_only: bool,
+    /// Export a still at this timestamp, in seconds. Repeatable, so several
+    /// frames can be exported in one run. A video wallpaper exports the video
+    /// only unless at least one `--frame` is given.
+    #[arg(long = "frame", value_name = "SECS")]
+    frames: Vec<f64>,
 
     /// Output size as `WIDTHxHEIGHT`. Defaults to the source resolution.
     #[arg(long)]
@@ -94,10 +96,6 @@ struct ExportArgs {
     /// Trim the video to this many seconds.
     #[arg(long)]
     duration: Option<f64>,
-
-    /// Timestamp in seconds for the still frame.
-    #[arg(long, default_value_t = 0.0)]
-    time: f64,
 
     /// Keep the audio track. Off by default; wallpaper apps ignore it.
     #[arg(long)]
@@ -253,19 +251,41 @@ fn run_shaders(args: &ShadersArgs) -> Result<()> {
     Ok(())
 }
 
-/// A filesystem-safe stem for the exported files.
+/// Turn a wallpaper's title into a safe directory name.
 ///
-/// Titles are unusable here: real ones contain `/`, `|`, brackets and CJK.
-/// The wallpaper's own directory name is already a valid filename and is what
-/// the user recognises it by.
-fn output_stem(project: &Project) -> String {
-    project
-        .root
-        .file_name()
-        .and_then(|name| name.to_str())
-        .filter(|name| !name.is_empty() && *name != ".")
-        .unwrap_or("wallpaper")
-        .to_string()
+/// Titles are free text: real ones carry `/`, `|`, quotes and any Unicode
+/// script. Path separators and the handful of characters Windows forbids in a
+/// filename become `-`; CJK and other non-ASCII text is left alone, since it
+/// is exactly what makes the folder recognisable.
+fn sanitize_component(name: &str) -> String {
+    let replaced: String = name
+        .chars()
+        .map(|c| match c {
+            '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|' => '-',
+            c if c.is_control() => '-',
+            c => c,
+        })
+        .collect();
+
+    // Windows also rejects trailing dots and spaces on a directory name.
+    let trimmed = replaced.trim().trim_end_matches('.').trim();
+    if trimmed.is_empty() {
+        "wallpaper".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+/// The name of the still a video timestamp produces.
+///
+/// Plain `still.png` unless more than one `--frame` was requested, since then
+/// each needs to be told apart.
+fn still_name(time: f64, multiple: bool) -> String {
+    if multiple {
+        format!("still_t{time}s.png")
+    } else {
+        "still.png".to_string()
+    }
 }
 
 /// Explain why a wallpaper cannot be exported, or `None` if it can.
@@ -377,7 +397,12 @@ fn run_info(args: &InfoArgs) -> Result<()> {
 }
 
 /// Video wallpapers ship a finished looping file; exporting is packaging.
-fn export_video(project: &Project, stem: &str, options: &Options) -> Result<()> {
+///
+/// The video is always written unless `--png-only` says otherwise; a still is
+/// written only for each `--frame` explicitly asked for, since the wallpaper
+/// already contains a finished loop and there is no single canonical frame to
+/// default to.
+fn export_video(project: &Project, options: &Options) -> Result<()> {
     let source = project::require_entry(project)?;
     export::ffmpeg::init()?;
 
@@ -387,18 +412,25 @@ fn export_video(project: &Project, stem: &str, options: &Options) -> Result<()> 
         info.width, info.height, info.fps, info.duration, info.codec
     );
 
-    if options.still {
-        let out = options.out_dir.join(format!("{stem}.png"));
-        let size = options
-            .resolution
-            .map(|resolution| (resolution.width, resolution.height));
-        export::still::from_video(source, &out, options.still_time, size)
-            .with_context(|| format!("writing the still frame of {}", source.display()))?;
-        println!("  still      {}", out.display());
+    if !options.video && options.frames.is_empty() {
+        bail!(
+            "nothing to export: pass --frame <SECS> for a still, or drop --png-only for the video"
+        );
+    }
+
+    let multiple = options.frames.len() > 1;
+    let size = options
+        .resolution
+        .map(|resolution| (resolution.width, resolution.height));
+    for &time in &options.frames {
+        let out = options.out_dir.join(still_name(time, multiple));
+        export::still::from_video(source, &out, time, size)
+            .with_context(|| format!("writing the frame at {time}s of {}", source.display()))?;
+        println!("  still      {} (t={time}s)", out.display());
     }
 
     if options.video {
-        let out = options.out_dir.join(format!("{stem}.mp4"));
+        let out = options.out_dir.join("video.mp4");
         let copied = export::video::export(source, &out, &info, options)
             .with_context(|| format!("writing the video of {}", source.display()))?;
         let how = if copied { "stream copy" } else { "re-encoded" };
@@ -413,17 +445,16 @@ fn export_video(project: &Project, stem: &str, options: &Options) -> Result<()> 
 /// No video yet: the motion lives in the effect shaders, so a video of the
 /// base composite would be a still repeated, which is worse than not offering
 /// one. Anything the composite cannot represent is listed rather than dropped.
-fn export_scene(project: &Project, stem: &str, options: &Options) -> Result<()> {
-    if !options.still {
-        bail!("scene wallpapers export a still only; --video-only has nothing to produce");
-    }
+/// The scene has no timeline to address, so `--frame`/`--png-only` do not
+/// apply here and are silently ignored — there is only ever the one still.
+fn export_scene(project: &Project, options: &Options) -> Result<()> {
     let package = project::require_package(project)?;
     let mut archive = pkg::Archive::open(package)?;
     let scene = scene::load(&mut archive)?;
 
     let composite = scene::compose::render(&mut archive, &scene, options.resolution)?;
 
-    let out = options.out_dir.join(format!("{stem}.png"));
+    let out = options.out_dir.join("still.png");
     if let Some(parent) = out.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -461,21 +492,27 @@ fn run_export(args: &ExportArgs) -> Result<()> {
         );
     }
 
+    // Each wallpaper gets its own named folder rather than dumping stem-named
+    // files into a shared one: the title is what the user recognises the
+    // wallpaper by, and it is what `info` already shows first.
+    let out_dir = args
+        .out
+        .join(sanitize_component(project::display_name(&project)));
+    println!("  output     {}", out_dir.display());
+
     let options = Options {
-        out_dir: args.out.clone(),
-        still: !args.video_only,
+        out_dir,
         video: !args.png_only,
+        frames: args.frames.clone(),
         resolution: args.resolution,
         fps: args.fps,
         duration: args.duration,
-        still_time: args.time,
         audio: args.audio,
     };
-    let stem = output_stem(&project);
 
     match project.kind {
-        Kind::Video => export_video(&project, &stem, &options),
-        Kind::Scene => export_scene(&project, &stem, &options),
+        Kind::Video => export_video(&project, &options),
+        Kind::Scene => export_scene(&project, &options),
         // Every other type was rejected above; this stays exhaustive so a new
         // pipeline cannot be added to the router without being wired in here.
         _ => unreachable!("unsupported types are rejected before dispatch"),
@@ -500,5 +537,61 @@ mod tests {
     fn cli_definition_is_valid() {
         use clap::CommandFactory;
         Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn frame_can_be_repeated() {
+        use clap::Parser;
+        let cli = Cli::parse_from([
+            "wallpaper-engine",
+            "export",
+            "wp",
+            "--frame",
+            "0",
+            "--frame",
+            "5.5",
+        ]);
+        let Command::Export(args) = cli.command else {
+            panic!("expected the export subcommand");
+        };
+        assert_eq!(args.frames, vec![0.0, 5.5]);
+    }
+
+    #[test]
+    fn hostile_title_characters_become_dashes() {
+        // Real Workshop titles carry exactly this kind of punctuation.
+        assert_eq!(
+            sanitize_component("[2k] Code 81800 | Biboo Outro"),
+            "[2k] Code 81800 - Biboo Outro"
+        );
+        assert_eq!(sanitize_component("a/b\\c:d*e?f\"g<h>i"), "a-b-c-d-e-f-g-h-i");
+    }
+
+    #[test]
+    fn non_ascii_titles_pass_through_unchanged() {
+        // CJK and other scripts are exactly what makes a folder recognisable;
+        // only the filesystem-hostile ASCII punctuation is replaced.
+        assert_eq!(sanitize_component("亚托莉 [アトリ] 8K"), "亚托莉 [アトリ] 8K");
+    }
+
+    #[test]
+    fn an_empty_or_dot_only_title_falls_back() {
+        // Both are what's left after Windows-illegal trailing dots/spaces are
+        // trimmed; a title of pure path separators is not this case — `-` is
+        // a perfectly legal directory name character, so `///` becomes `---`.
+        assert_eq!(sanitize_component(""), "wallpaper");
+        assert_eq!(sanitize_component("..."), "wallpaper");
+        assert_eq!(sanitize_component("  "), "wallpaper");
+    }
+
+    #[test]
+    fn a_single_frame_gets_the_plain_still_name() {
+        assert_eq!(still_name(3.0, false), "still.png");
+    }
+
+    #[test]
+    fn multiple_frames_are_disambiguated_by_timestamp() {
+        assert_eq!(still_name(0.0, true), "still_t0s.png");
+        assert_eq!(still_name(5.5, true), "still_t5.5s.png");
     }
 }

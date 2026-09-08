@@ -50,17 +50,20 @@ impl std::fmt::Display for Resolution {
 /// What to produce, and how.
 #[derive(Debug, Clone)]
 pub struct Options {
+    /// Directory this wallpaper's own files land in — already named for it,
+    /// so nothing written under it needs to repeat the name.
     pub out_dir: PathBuf,
-    pub still: bool,
     pub video: bool,
+    /// Timestamps (in seconds) to export as still PNGs. Empty means no
+    /// stills: a video wallpaper already has a finished loop, so unless a
+    /// frame is asked for there is nothing else to produce.
+    pub frames: Vec<f64>,
     /// Target size. `None` keeps the source resolution.
     pub resolution: Option<Resolution>,
     /// Target frame rate. `None` keeps the source rate.
     pub fps: Option<f64>,
     /// Trim the output to this many seconds.
     pub duration: Option<f64>,
-    /// Timestamp for the still frame.
-    pub still_time: f64,
     /// Keep the audio track. Off by default: wallpaper apps ignore it and it
     /// is usually the bulk of the file size.
     pub audio: bool,
