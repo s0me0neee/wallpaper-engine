@@ -842,6 +842,72 @@ each cover most of a 4K canvas. The next move for it is one of
   canvas resolution, which is what Wallpaper Engine itself does and would help
   every layer, not just particles.
 
+### 4.18 Render resolution is the next lever, and it is the *chains* that matter
+
+Measured, not built — the implementation is written up at the end of this
+section along with the bug that stopped it.
+
+`scene_example8` is not particle-bound and never was after §4.17. Ablations,
+all at `g_Time` 6 s:
+
+| `scene_example8` | GPU/frame |
+|---|---|
+| full | 46 ms |
+| particle pass disabled entirely | 41 ms |
+| particle coverage shrunk 4x | 45 ms |
+
+So the whole particle pass is 5 ms of 46, and its *fill* is nearly free. Its
+batching is already tight as well: 1343 instances in 37 draw calls across 40
+systems, so draw-call count is not it either.
+
+What is left is resolution — but only if the **layer images** scale with it.
+This distinction cost a wrong conclusion and is the point of writing it down.
+Scaling the composite target and every layer rect while leaving each layer's
+own image at canvas size leaves every effect chain running at 4K, because a
+chain's passes are sized from the image it was compiled against:
+
+| `scene_example8` render scale | composite + rects only | + layer images |
+|---|---|---|
+| 1.0 | 44 ms | 45 ms |
+| 0.667 | 39 ms | **21 ms** |
+| 0.5 | 37 ms | **11 ms** |
+
+Quartering the pixel count is worth 16% if the chains stay at 4K and **4x** if
+they do not — 20 fps to 66. The chains are the cost, and they are only reachable
+through the image handed to `prepare_effect_chain`.
+
+This is also what Wallpaper Engine does. Captures from a real install on a
+1080p machine come back 1920x1080 for `scene_example8`, whose authored canvas
+is 3840x2160 — it renders at the display, not at the canvas, and 0.5 is exactly
+the scale that gives us 66 fps.
+
+**The attempt, and why it is not in.** A `render_scale` taken once from
+`window.current_monitor()` (capped at 1.0 and at the canvas), layer images
+resized to it before upload and chain compile, every rect, particle placement,
+composite and bloom target in render pixels — all inside `simulate.rs`, no
+`compose.rs` change needed. It compiles clean, keeps all 171 tests, and leaves
+`scene_example3` untouched at 120 fps because its canvas is already 1080p so
+the scale is exactly 1.0.
+
+It renders wrong. `scene_example8` at 0.89 comes out with large right-angled
+transparent blocks — 10.5 dB PSNR against the same frame rendered full-size and
+downscaled, with the *alpha* channel at 6.5 dB, which is the tell: something is
+writing alpha 0 over the frame. The only path that writes without blending is
+the `colorBlendMode` arm of `composite_layer_blended`, which replaces the
+destination with `dst.a` taken from the backdrop copy. So the suspect is a
+layer whose backdrop rectangle and backdrop *target* now disagree about which
+space they are in — `blend_backdrop` is still handed the authored canvas size
+for particle layers while `full_rect` is in render pixels, and
+`scene_example8`'s layer 30 is a soft-light layer whose rect (`-152,884
+5877x3306`) extends outside the canvas on three sides, which is exactly where a
+space mismatch would show up first. Not yet confirmed.
+
+Whoever picks this up: every canvas-space quantity has to move to render space
+in one go, and the ones that are easy to miss are the ones not derived from an
+image — `full_rect`, `blend_backdrop`'s size, a composition layer's `region`
+target, and both particle scales, which must compose with the render scale
+rather than replace it.
+
 ---
 
 ## 5. The `common.h` problem
