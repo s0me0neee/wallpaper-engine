@@ -21,8 +21,16 @@ default settings — `cargo fmt` would reflow ~3200 lines. Match the surrounding
 up to ~120 chars) by hand.
 
 Build needs the ffmpeg development libraries (`brew install ffmpeg`); `ffmpeg-next`'s major version
-tracks ffmpeg's own, so 9.x means ffmpeg 9. macOS only in practice: the GL contexts go through CGL
-and AppKit.
+tracks ffmpeg's own, so 9.x means ffmpeg 9.
+
+Rendering is plain GL 3.3 core throughout — no Metal, no compute, nothing above 3.3 (see
+`render/particles.rs` on why `glDrawArraysInstancedBaseInstance` is out) — so the renderer itself is
+portable. Only the *context* is per-platform, and only for the headless `export` path
+(`render/gpu.rs`): CGL rejects surfaceless and pbuffer surfaces, so macOS anchors to a never-shown
+one-pixel `NSWindow`, while everything else takes an EGL pbuffer, with the AppKit crates scoped to
+macOS in `Cargo.toml`. `simulate` takes its context from a real window via `glutin-winit` and is
+portable already. **The non-macOS backend has not been compiled on Linux** — it is written against
+glutin 0.32's API but only macOS has been built and run here.
 
 ### Debugging subcommands
 

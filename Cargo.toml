@@ -45,11 +45,6 @@ lz4_flex = { version = "0.14.0", default-features = false, features = [
 	"safe-decode",
 	"safe-encode",
 ] }
-# CGL has no true surfaceless or pbuffer surface, only a window's; these three
-# build the one never-shown NSWindow the GL context attaches to.
-objc2 = "0.6"
-objc2-app-kit = { version = "0.3", features = ["NSWindow", "NSGraphics", "NSView", "NSResponder"] }
-objc2-foundation = "0.3"
 # Encodes the PNGs we generate for raw-pixel textures. Textures whose payload is
 # already an encoded image are passed through byte-for-byte and never hit this.
 png = "0.18.1"
@@ -73,6 +68,15 @@ noise = "0.9.0"
 rayon = "1.12.0"
 ab_glyph = "0.2.32"
 fontdb = "0.24.0"
+
+# CGL has no true surfaceless or pbuffer surface, only a window's; these three
+# build the one never-shown NSWindow the headless GL context attaches to
+# (`render/gpu.rs`). Scoped to macOS so the crate does not drag AppKit onto
+# platforms where EGL's pbuffer does the same job with no window at all.
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-app-kit = { version = "0.3", features = ["NSWindow", "NSGraphics", "NSView", "NSResponder"] }
+objc2-foundation = "0.3"
 
 [lints.clippy]
 pedantic = { level = "deny", priority = -1 }
