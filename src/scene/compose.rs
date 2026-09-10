@@ -18,6 +18,7 @@ use anyhow::{Context, Result, bail};
 use glam::{Vec2, Vec3 as GVec3};
 use image::{Rgba, RgbaImage, imageops};
 use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
 
 /// A finished still, plus what could not be represented in it.
 pub struct Composite {
@@ -77,6 +78,10 @@ pub struct StaticScene<'a> {
     pub hdr: bool,
     pub items: Vec<StaticItem<'a>>,
     pub omissions: Vec<String>,
+    /// A Wallpaper Engine asset tree to resolve stock textures and fonts from,
+    /// kept so `animate` re-simulates particles against the same sprites
+    /// `prepare_static` resolved them with.
+    pub assets: Option<PathBuf>,
 }
 
 /// One scene object, resolved as far as time-independent work allows.
@@ -439,6 +444,7 @@ fn static_composition<'a>(
 /// layer, so its type size has to travel with it.
 fn static_text<'a>(
     archive: &mut Archive,
+    assets: Option<&Path>,
     canvas: &Canvas,
     object: &'a Object,
     anchor: &Anchor,
@@ -455,7 +461,7 @@ fn static_text<'a>(
         anchor.origin.y + extent_y / 2.0,
     );
     let (width, height) = to_pixel_size(extent_x * canvas.scale, extent_y * canvas.scale);
-    let rendered = text::render(archive, None, object, (width, height))?;
+    let rendered = text::render(archive, assets, object, (width, height))?;
     Ok(StaticImage {
         object,
         image: rendered.image,
@@ -733,10 +739,11 @@ pub fn warp_frame(item: &StaticPuppet, time: f32) -> (RgbaImage, i64, i64) {
 pub fn prepare<'a>(
     archive: &mut Archive,
     scene: &'a Scene,
+    assets: Option<&Path>,
     resolution: Option<Resolution>,
     time: f32,
 ) -> Result<Layered<'a>> {
-    let static_scene = prepare_static(archive, scene, resolution)?;
+    let static_scene = prepare_static(archive, scene, assets, resolution)?;
     Ok(animate(archive, &static_scene, time))
 }
 
@@ -746,6 +753,7 @@ pub fn prepare<'a>(
 pub fn prepare_static<'a>(
     archive: &mut Archive,
     scene: &'a Scene,
+    assets: Option<&Path>,
     resolution: Option<Resolution>,
 ) -> Result<StaticScene<'a>> {
     let ortho = scene
@@ -763,7 +771,7 @@ pub fn prepare_static<'a>(
             continue;
         }
         if is_text(object) {
-            match static_text(archive, &canvas, object, anchor) {
+            match static_text(archive, assets, &canvas, object, anchor) {
                 Ok(item) => {
                     omissions.extend(omissions_for(object));
                     items.push(StaticItem::Image(item));
@@ -801,7 +809,7 @@ pub fn prepare_static<'a>(
         omissions.extend(omissions_for(object));
 
         if is_particle(object) {
-            match static_particle(archive, &canvas, object, anchor) {
+            match static_particle(archive, assets, &canvas, object, anchor) {
                 Ok((item, unsupported)) => {
                     reconcile_particle_note(&mut omissions, object, Ok(&unsupported));
                     items.push(StaticItem::Particle(item));
@@ -831,6 +839,7 @@ pub fn prepare_static<'a>(
         hdr: scene.general.hdr,
         items,
         omissions,
+        assets: assets.map(Path::to_path_buf),
     })
 }
 
@@ -868,7 +877,8 @@ pub fn animate<'a>(archive: &mut Archive, static_scene: &StaticScene<'a>, time: 
                 }
             }
             StaticItem::Particle(particle) => {
-                match particle::render_system(archive, &particle.preset_path, &particle.place, time) {
+                let assets = static_scene.assets.as_deref();
+                match particle::render_system(archive, assets, &particle.preset_path, &particle.place, time) {
                     Ok(rendered) => {
                         reconcile_particle_note(&mut omissions, particle.object, Ok(&rendered.unsupported));
                         PreparedLayer {
@@ -906,6 +916,7 @@ pub fn animate<'a>(archive: &mut Archive, static_scene: &StaticScene<'a>, time: 
 /// t=0 to learn which preset features it uses that we do not simulate.
 fn static_particle<'a>(
     archive: &mut Archive,
+    assets: Option<&Path>,
     canvas: &Canvas,
     object: &'a Object,
     anchor: &Anchor,
@@ -934,7 +945,7 @@ fn static_particle<'a>(
     };
 
     let blend = particle::layer_blend(archive, &preset_path);
-    let rendered = particle::render_system(archive, &preset_path, &place, 0.0)
+    let rendered = particle::render_system(archive, assets, &preset_path, &place, 0.0)
         .with_context(|| format!("simulating {preset_path}"))?;
 
     let refract = particle::layer_refracts(archive, &preset_path);

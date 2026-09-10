@@ -36,6 +36,7 @@ use std::collections::HashMap;
 use std::ffi::CString;
 use std::num::NonZeroU32;
 use std::ops::Range;
+use std::path::Path;
 use std::sync::Arc;
 use rayon::prelude::*;
 use std::time::{Duration, Instant};
@@ -46,8 +47,8 @@ use winit::keyboard::{Key, NamedKey};
 use winit::window::{Window, WindowId};
 
 /// Open a window and play `scene` in it until it is closed.
-pub fn run(archive: &mut Archive, scene: &Scene, title: &str) -> Result<()> {
-    let static_scene = compose::prepare_static(archive, scene, None)?;
+pub fn run(archive: &mut Archive, scene: &Scene, assets: Option<&Path>, title: &str) -> Result<()> {
+    let static_scene = compose::prepare_static(archive, scene, assets, None)?;
 
     // What is left unsimulated depends on which layer chains compile, which
     // needs the window's GL context — so the report is printed from
@@ -366,6 +367,8 @@ impl App<'_> {
     /// still exporter degrades it.
     fn build_layers(&mut self, gl: &glow::Context) -> Result<Built> {
         let App { archive, static_scene, headers, .. } = self;
+        let assets = static_scene.assets.clone();
+        let assets = assets.as_deref();
         let mut layers = Vec::with_capacity(static_scene.items.len());
         let mut tweak_values = Vec::new();
 
@@ -419,7 +422,7 @@ impl App<'_> {
                 }
                 StaticItem::Particle(system) => {
                     let placement = scaled_placement(&system.place, sim_scale);
-                    let presets = particle::collect_system(archive, &system.preset_path)
+                    let presets = particle::collect_system(archive, assets, &system.preset_path)
                         .with_context(|| format!("loading {}", system.preset_path))?;
                     let image = particle::render_system_from(&presets, &system.preset_path, &placement, 0.0)
                         .with_context(|| format!("simulating {}", system.preset_path))?

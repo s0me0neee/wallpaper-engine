@@ -116,10 +116,16 @@ fn noise_sample(perlin: &Perlin, u: f64, v: f64) -> f64 {
 /// engine-builtin texture) doesn't sink the whole frame: that layer is
 /// composited unprocessed and the reason is recorded as an omission, the same
 /// way the plain composite reports what it left out.
-pub fn render_frame(archive: &mut Archive, scene: &Scene, resolution: Option<Resolution>, time: f64) -> Result<Composite> {
+pub fn render_frame(
+    archive: &mut Archive,
+    scene: &Scene,
+    assets: Option<&std::path::Path>,
+    resolution: Option<Resolution>,
+    time: f64,
+) -> Result<Composite> {
     #[expect(clippy::cast_possible_truncation, reason = "a wallpaper's timestamp is always a few seconds at most")]
     let time = time as f32;
-    let mut layered = compose::prepare(archive, scene, resolution, time)?;
+    let mut layered = compose::prepare(archive, scene, assets, resolution, time)?;
 
     let effected: Vec<usize> = layered
         .layers

@@ -53,6 +53,13 @@ enum Command {
 struct SimulateArgs {
     /// Wallpaper directory, or its project.json. Must be a Scene wallpaper.
     wallpaper: PathBuf,
+
+    /// Resolve stock textures and fonts from a Wallpaper Engine asset tree
+    /// (`<install>/assets`) instead of our stand-ins. Falls back to the
+    /// `WE_ASSETS` environment variable. Read from your own install; nothing
+    /// from it is redistributed.
+    #[arg(long)]
+    we_assets: Option<PathBuf>,
 }
 
 #[derive(Args)]
@@ -98,6 +105,12 @@ struct ExportArgs {
     /// Output size as `WIDTHxHEIGHT`. Defaults to the source resolution.
     #[arg(long)]
     resolution: Option<Resolution>,
+
+    /// Resolve stock textures and fonts from a Wallpaper Engine asset tree
+    /// (`<install>/assets`) instead of our stand-ins. Falls back to the
+    /// `WE_ASSETS` environment variable.
+    #[arg(long)]
+    we_assets: Option<PathBuf>,
 
     /// Output frame rate. Defaults to the source rate.
     #[arg(long)]
@@ -329,6 +342,18 @@ fn unsupported_reason(project: &Project) -> Option<String> {
     }
 }
 
+/// The Wallpaper Engine asset tree to read stock assets from, if any.
+///
+/// The flag wins; `WE_ASSETS` is the fallback so a path that never changes is
+/// set once in the shell rather than retyped per run. A directory that does not
+/// exist is treated as absent rather than as an error, because every lookup
+/// through it already falls back to our own stand-ins.
+fn we_assets(flag: Option<&PathBuf>) -> Option<PathBuf> {
+    flag.cloned()
+        .or_else(|| std::env::var_os("WE_ASSETS").map(PathBuf::from))
+        .filter(|path| path.is_dir())
+}
+
 fn run_info(args: &InfoArgs) -> Result<()> {
     let project = project::load(&args.wallpaper)?;
 
@@ -478,7 +503,8 @@ fn export_scene(project: &Project, options: &Options) -> Result<()> {
     let scene = scene::load(&mut archive)?;
 
     let time = options.frames.first().copied().unwrap_or(0.0);
-    let composite = scene::render::render_frame(&mut archive, &scene, options.resolution, time)?;
+    let composite =
+        scene::render::render_frame(&mut archive, &scene, options.assets.as_deref(), options.resolution, time)?;
 
     let out = options.out_dir.join("still.png");
     if let Some(parent) = out.parent() {
@@ -539,6 +565,7 @@ fn run_export(args: &ExportArgs) -> Result<()> {
         fps: args.fps,
         duration: args.duration,
         audio: args.audio,
+        assets: we_assets(args.we_assets.as_ref()),
     };
 
     match project.kind {
@@ -564,9 +591,13 @@ fn run_simulate(args: &SimulateArgs) -> Result<()> {
     let mut archive = pkg::Archive::open(package)?;
     let scene = scene::load(&mut archive)?;
 
+    let assets = we_assets(args.we_assets.as_ref());
     let title = project::display_name(&project);
     println!("{title}");
-    simulate::run(&mut archive, &scene, title)
+    if let Some(root) = &assets {
+        println!("  stock assets from {}", root.display());
+    }
+    simulate::run(&mut archive, &scene, assets.as_deref(), title)
 }
 
 fn main() -> Result<()> {

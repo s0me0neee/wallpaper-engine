@@ -34,7 +34,7 @@
 //! the driver — so there is no single well-formed parse tree to work from.
 
 use regex::Regex;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::OnceLock;
 
 /// Apply every relaxation, innermost constructs first so that the declaration
@@ -44,6 +44,7 @@ pub fn relax(source: &str) -> String {
     let mut out = array_initializers(source);
     out = bool_in_arithmetic(&out);
     out = float_modulo(&out, &types);
+    out = match_integer_signedness(&out, &types);
     out = promote_scalar_arguments(&out, &types);
     out = truncate_call_arguments(&out, &types);
     out = truncate_mixed_operands(&out, &types);
@@ -121,14 +122,33 @@ fn declared_types(source: &str) -> HashMap<String, Type> {
             .unwrap_or_else(|_| unreachable!("the declaration pattern is a literal"))
     });
 
-    let mut types = HashMap::new();
+    let mut types: HashMap<String, Type> = HashMap::new();
+    let mut ambiguous: HashSet<String> = HashSet::new();
     for capture in pattern.captures_iter(source) {
         let (Some(kind), Some(name)) = (capture.get(1), capture.get(2)) else {
             continue;
         };
         if let Some(ty) = builtin_type(kind.as_str()) {
-            types.insert(name.as_str().to_string(), ty);
+            let name = name.as_str();
+            match types.get(name) {
+                Some(seen) if *seen != ty => {
+                    ambiguous.insert(name.to_string());
+                }
+                _ => {
+                    types.insert(name.to_string(), ty);
+                }
+            }
         }
+    }
+    // A name the source declares at two different types is unresolvable
+    // without scope, so it types nothing and every rewrite depending on it
+    // stays disabled. This is not hypothetical: the shim headers are expanded
+    // into the same text, and `scene_example6`'s `Simple_Audio_Bars` declares
+    // `delta` as a `vec2` where `common_blending`'s `RGBToHSL` declares it as a
+    // `float` — resolving that in the shader's favour rewrote *our own header*
+    // into `delta / vec2(high + low)` and dropped the layer's whole chain.
+    for name in ambiguous {
+        types.remove(&name);
     }
     types.extend(defined_constants(source));
     types
@@ -190,15 +210,19 @@ fn operand_type(text: &str, types: &HashMap<String, Type>) -> Option<Type> {
         && let Some(open) = matching_open(text)
     {
         let name = text[..open].trim();
-        if let Some(ty) = builtin_type(name).or_else(|| builtin_return(name)) {
-            return Some(ty);
+        // An empty callee is a parenthesised group, not a call — leave it to
+        // the group branch below rather than giving up on it here.
+        if !name.is_empty() {
+            if let Some(ty) = builtin_type(name).or_else(|| builtin_return(name)) {
+                return Some(ty);
+            }
+            // Component-wise builtins take the shape of their first argument.
+            if follows_first_argument(name) {
+                let args = split_top_level(&text[open + 1..text.len() - 1], ',');
+                return operand_type(args.first()?.trim(), types);
+            }
+            return None;
         }
-        // Component-wise builtins take the shape of their first argument.
-        if follows_first_argument(name) {
-            let args = split_top_level(&text[open + 1..text.len() - 1], ',');
-            return operand_type(args.first()?.trim(), types);
-        }
-        return None;
     }
 
     // A numeric literal.
@@ -820,33 +844,81 @@ fn truncate_call_arguments(source: &str, types: &HashMap<String, Type>) -> Strin
 // ---------------------------------------------------------------------------
 
 /// `vec4 * vec2` — HLSL truncates the wider operand to the narrower one.
-fn truncate_mixed_operands(source: &str, types: &HashMap<String, Type>) -> String {
+/// Whether the character at `index` is a binary arithmetic operator, as opposed
+/// to a sign, an increment, a compound assignment, a comment delimiter or the
+/// `-` inside a float exponent.
+fn is_binary_operator(source: &str, index: usize) -> bool {
+    if in_comment(source, index) {
+        return false;
+    }
     let bytes = source.as_bytes();
+    let here = bytes[index];
+    if matches!(bytes.get(index + 1), Some(b'=')) || bytes.get(index + 1) == Some(&here) {
+        return false;
+    }
+    if here == b'*' || here == b'/' {
+        return bytes.get(index + 1) != Some(&b'*') && bytes.get(index.wrapping_sub(1)) != Some(&b'/');
+    }
+    if here == b'%' {
+        return true;
+    }
+    let previous = index
+        .checked_sub(1)
+        .map(|at| bytes[at])
+        .map(|c| if c.is_ascii_whitespace() { b' ' } else { c });
+    !matches!(previous, None | Some(b'(' | b',' | b'[' | b'=' | b'+' | b'-' | b'*' | b'/' | b'<' | b'>' | b'?' | b':' | b'&' | b'|' | b'e' | b'E' | b'{' | b';' | b'!'))
+}
+
+/// `barFreq1 + 1` — HLSL promotes freely between `int` and `uint`; GLSL 3.30
+/// says it converts `int` to `uint` implicitly, but Apple's frontend does not,
+/// and rejects the expression outright. `Simple_Audio_Bars` indexes the audio
+/// spectrum through `uint barFreq2 = uint((barFreq1 + 1) % RESOLUTION)`, where
+/// both the `1` and the `RESOLUTION` combo are `int` — one rejected line drops
+/// the whole audio-bars chain.
+fn match_integer_signedness(source: &str, types: &HashMap<String, Type>) -> String {
+    let mut replacements: Vec<(usize, usize, String)> = Vec::new();
+
+    for (index, _) in source.match_indices(['*', '/', '+', '-', '%']) {
+        if !is_binary_operator(source, index) {
+            continue;
+        }
+        let (Some(left), Some(right)) = (operand_start(source, index), operand_end(source, index + 1))
+        else {
+            continue;
+        };
+        let left_text = source[left..index].trim();
+        let right_text = source[index + 1..right].trim();
+        let (Some(lt), Some(rt)) = (operand_type(left_text, types), operand_type(right_text, types))
+        else {
+            continue;
+        };
+        // Only an int/uint pair of the same width: a differing width is
+        // truncation's business, and a float on either side is not this bug.
+        if lt.components != rt.components || {
+            let pair = (lt.kind, rt.kind);
+            pair != (Kind::Int, Kind::Uint) && pair != (Kind::Uint, Kind::Int)
+        } {
+            continue;
+        }
+        let target = Type { kind: Kind::Uint, components: lt.components };
+        let (text, start, end) = if lt.kind == Kind::Int {
+            (left_text, left, left + left_text.len())
+        } else {
+            let offset = source[index + 1..right].len() - source[index + 1..right].trim_start().len();
+            (right_text, index + 1 + offset, index + 1 + offset + right_text.len())
+        };
+        replacements.push((start, end, format!("{}({})", spell(target), text)));
+    }
+
+    splice(source, replacements)
+}
+
+fn truncate_mixed_operands(source: &str, types: &HashMap<String, Type>) -> String {
     let mut replacements: Vec<(usize, usize, String)> = Vec::new();
 
     for (index, _) in source.match_indices(['*', '/', '+', '-']) {
-        if in_comment(source, index) {
+        if !is_binary_operator(source, index) {
             continue;
-        }
-        let here = bytes[index];
-        // Skip compound assignment, `++`/`--`, and comment delimiters.
-        if matches!(bytes.get(index + 1), Some(b'=')) || bytes.get(index + 1) == Some(&here) {
-            continue;
-        }
-        if here == b'*' || here == b'/' {
-            if bytes.get(index + 1) == Some(&b'*') || bytes.get(index.wrapping_sub(1)) == Some(&b'/') {
-                continue;
-            }
-        } else {
-            // A sign, not an operator, when nothing can precede it; and the
-            // `-` of a float exponent is part of the literal.
-            let previous = index
-                .checked_sub(1)
-                .map(|at| bytes[at])
-                .map(|c| if c.is_ascii_whitespace() { b' ' } else { c });
-            if matches!(previous, None | Some(b'(' | b',' | b'[' | b'=' | b'+' | b'-' | b'*' | b'/' | b'<' | b'>' | b'?' | b':' | b'&' | b'|' | b'e' | b'E' | b'{' | b';' | b'!')) {
-                continue;
-            }
         }
         let (Some(left), Some(right)) = (operand_start(source, index), operand_end(source, index + 1))
         else {
@@ -1146,6 +1218,29 @@ mod tests {
         let source = "float frequency; int RESOLUTION;\n\tfloat f = frequency % RESOLUTION;\n";
         let out = relax(source);
         assert!(out.contains("mod(frequency, float(RESOLUTION))"), "got {out}");
+    }
+
+    #[test]
+    fn an_int_meeting_a_uint_becomes_a_uint() {
+        // `Simple_Audio_Bars` writes `uint((barFreq1 + 1) % RESOLUTION)`.
+        let source = "uint barFreq1;\n#define RESOLUTION 32\n\tuint b = (barFreq1 + 1) % RESOLUTION;\n";
+        let out = relax(source);
+        assert!(out.contains("barFreq1 + uint(1)"), "{out}");
+        assert!(out.contains("% uint(RESOLUTION)"), "{out}");
+    }
+
+    #[test]
+    fn a_name_declared_at_two_types_types_nothing() {
+        // The shim headers land in the same text as the shader, so a local
+        // name can genuinely be both. Rewriting either one corrupts the other.
+        let source = "float delta; vec2 delta;\n\tfloat f = delta * 2.0;\n";
+        assert!(relax(source).contains("delta * 2.0"));
+    }
+
+    #[test]
+    fn two_ints_keep_their_signedness() {
+        let source = "int a; int b;\n\tint c = a + b;\n";
+        assert!(relax(source).contains("a + b"));
     }
 
     #[test]

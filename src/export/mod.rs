@@ -67,6 +67,8 @@ pub struct Options {
     /// Keep the audio track. Off by default: wallpaper apps ignore it and it
     /// is usually the bulk of the file size.
     pub audio: bool,
+    /// A Wallpaper Engine asset tree to resolve stock textures and fonts from.
+    pub assets: Option<PathBuf>,
 }
 
 /// True when the output cannot simply reuse the source's encoded frames.

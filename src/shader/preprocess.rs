@@ -237,21 +237,26 @@ fn assemble(body: &str, stage: Stage, combos: &BTreeMap<String, i64>) -> String 
     let mut body = replace_word(body, "attribute", "in");
     body = replace_word(&body, "varying", varying);
 
-    let mut out = String::with_capacity(body.len().saturating_add(512));
-    out.push_str(VERSION);
-    out.push('\n');
+    // The combo defines lead the body rather than the output, because a combo
+    // is often the only thing that types an operand: `Simple_Audio_Bars` writes
+    // `frequency % RESOLUTION`, and with `RESOLUTION` unknown the modulo
+    // relaxation disables itself and the whole audio-bars chain stops compiling.
+    let mut prefix = String::with_capacity(512);
     for (name, value) in combos {
         // Infallible: writing into a String never fails.
-        let _ = writeln!(out, "#define {name} {value}");
+        let _ = writeln!(prefix, "#define {name} {value}");
     }
 
     if stage == Stage::Fragment && body.contains("gl_FragColor") {
-        out.push_str("out vec4 we_FragColor;\n");
+        prefix.push_str("out vec4 we_FragColor;\n");
         body = replace_word(&body, "gl_FragColor", "we_FragColor");
     }
 
+    let mut out = String::with_capacity(body.len().saturating_add(512));
+    out.push_str(VERSION);
+    out.push('\n');
     // Last, so the relaxations see the final spelling of every declaration.
-    out.push_str(&hlsl::relax(&body));
+    out.push_str(&hlsl::relax(&(prefix + &body)));
     out
 }
 
