@@ -10,13 +10,14 @@
 
 use super::model::{
     self, Blend, Material, Model, Object, Orthographic, Scene, Vec3, base_blend, base_texture,
-    is_image, is_particle, is_sound,
+    is_image, is_particle, is_sound, is_text,
 };
-use super::{particle, puppet};
-use crate::{export::Resolution, pkg::Archive, tex};
+use super::{particle, puppet, text};
+use crate::{export::Resolution, pkg::Archive, render::bloom, tex};
 use anyhow::{Context, Result, bail};
 use glam::{Vec2, Vec3 as GVec3};
 use image::{Rgba, RgbaImage, imageops};
+use std::collections::{HashMap, HashSet};
 
 /// A finished still, plus what could not be represented in it.
 pub struct Composite {
@@ -44,6 +45,10 @@ pub struct PreparedLayer<'a> {
     /// Set when a warp was attempted but failed; the layer falls back to its
     /// flat texture and this is surfaced as an omission.
     pub warp_error: Option<String>,
+    /// True for a composition layer, whose `image` is an empty placeholder:
+    /// its real input is whatever the frame already holds under `rect`, which
+    /// only a compositor that keeps the frame on the GPU can supply.
+    pub composition: bool,
 }
 
 /// A scene resolved as far as a plain flatten can take it: the output canvas
@@ -65,6 +70,11 @@ pub struct StaticScene<'a> {
     pub width: u32,
     pub height: u32,
     pub background: Rgba<u8>,
+    /// Scene-wide bloom over the finished frame, when `general.bloom` is on —
+    /// scene state like the background, not a property of any one layer.
+    pub bloom: Option<bloom::Settings>,
+    /// `general.hdr`: render every target in floating point.
+    pub hdr: bool,
     pub items: Vec<StaticItem<'a>>,
     pub omissions: Vec<String>,
 }
@@ -87,6 +97,10 @@ pub struct StaticImage<'a> {
     /// Set when this object *is* a puppet but its mesh failed to load, so it
     /// fell back to the flat texture — surfaced as an omission by `animate`.
     pub warp_error: Option<String>,
+    /// See `PreparedLayer::composition`.
+    pub composition: bool,
+    /// Roll about the layer's own centre, in radians — `Anchor::roll`.
+    pub roll: f32,
 }
 
 /// A puppet-warp layer: the parsed mesh and everything `warp_frame` needs to
@@ -103,6 +117,8 @@ pub struct StaticPuppet<'a> {
     pub rect_left: f32,
     pub rect_top: f32,
     pub blend: Blend,
+    /// Roll about the layer's own centre, in radians — `Anchor::roll`.
+    pub roll: f32,
 }
 
 /// A particle system: its resolved placement and preset path, re-simulated
@@ -112,6 +128,9 @@ pub struct StaticParticle<'a> {
     pub preset_path: String,
     pub place: particle::Placement,
     pub blend: Blend,
+    /// The system's material refracts, so the layer multiplies the frame
+    /// behind it instead of covering it — see `model::base_refracts`.
+    pub refract: bool,
 }
 
 /// The visible rectangle, in scene units.
@@ -247,7 +266,7 @@ fn apply_tint(layer: &mut RgbaImage, color: Vec3, brightness: f32, alpha: f32) {
 }
 
 /// The layer's extent in scene units, from `size` when given.
-fn extent(object: &Object, texture: &RgbaImage) -> (f32, f32) {
+fn extent(object: &Object, anchor: &Anchor, texture: &RgbaImage) -> (f32, f32) {
     // Texture dimensions, nowhere near f32's 2^24 exact-integer range.
     #[expect(clippy::cast_precision_loss, reason = "image dimensions, nowhere near 2^24")]
     let (width, height) = match object.size {
@@ -255,7 +274,249 @@ fn extent(object: &Object, texture: &RgbaImage) -> (f32, f32) {
         // `autosize` models omit the size and take it from the texture.
         _ => (texture.width() as f32, texture.height() as f32),
     };
-    (width * object.scale.x, height * object.scale.y)
+    (width * anchor.scale.x, height * anchor.scale.y)
+}
+
+/// Where an object actually sits, once its parent chain has been applied.
+///
+/// A WE scene is a tree, not a flat list: `origin` and `scale` on a child are
+/// relative to its parent, and the editor leans on that hard — `scene_example6`
+/// parents 31 of its 59 objects, mostly to empty transform nodes that exist
+/// only to move a group. Read absolutely, its `rain.mp3` at (-960, -540) under
+/// a parent at (960, 540) lands a full screen off-canvas instead of at the
+/// scene origin, and its two black `纯色` bars land across the middle of the
+/// picture instead of just outside the frame where the author put them.
+#[derive(Debug, Clone, Copy)]
+pub struct Anchor {
+    pub origin: Vec3,
+    pub scale: Vec3,
+    /// Roll about the view axis, in radians, accumulated down the chain — a
+    /// parent's rotation swings its children too. This is `angles.z`; the other
+    /// two axes tilt a layer out of the plane and are not applied.
+    pub roll: f32,
+}
+
+impl Default for Anchor {
+    fn default() -> Self {
+        Anchor { origin: Vec3::default(), scale: Vec3::splat(1.0), roll: 0.0 }
+    }
+}
+
+/// Resolve every object's parent chain, index-aligned with `scene.objects`.
+///
+/// Indices rather than ids because `id` is `#[serde(default)]` and a scene that
+/// omits it would collide every such object onto id 0.
+fn resolve_anchors(scene: &Scene) -> Vec<Anchor> {
+    let mut index_of: HashMap<i64, usize> = HashMap::with_capacity(scene.objects.len());
+    for (index, object) in scene.objects.iter().enumerate() {
+        index_of.entry(object.id).or_insert(index);
+    }
+
+    let mut anchors = Vec::with_capacity(scene.objects.len());
+    for (index, object) in scene.objects.iter().enumerate() {
+        // Walk to the root, then fold back down. A malformed scene could name
+        // itself an ancestor, so stop the walk at the first repeat.
+        let mut chain = vec![object];
+        let mut seen = HashSet::from([index]);
+        let mut cursor = object.parent;
+        while let Some(parent_index) = cursor.and_then(|id| index_of.get(&id).copied()) {
+            if !seen.insert(parent_index) {
+                break;
+            }
+            let parent = &scene.objects[parent_index];
+            chain.push(parent);
+            cursor = parent.parent;
+        }
+
+        let mut anchor = Anchor::default();
+        for node in chain.iter().rev() {
+            anchor.origin = Vec3 {
+                x: anchor.origin.x + anchor.scale.x * node.origin.x,
+                y: anchor.origin.y + anchor.scale.y * node.origin.y,
+                z: anchor.origin.z + anchor.scale.z * node.origin.z,
+            };
+            anchor.scale = Vec3 {
+                x: anchor.scale.x * node.scale.x,
+                y: anchor.scale.y * node.scale.y,
+                z: anchor.scale.z * node.scale.z,
+            };
+            anchor.roll += node.angles.z;
+        }
+        anchors.push(anchor);
+    }
+    anchors
+}
+
+/// Intersect a placed rectangle with the canvas, as `(left, top, width,
+/// height)`. Both sides are floored at one pixel, so a rectangle entirely off
+/// the canvas degenerates rather than inverting.
+fn clip_to_canvas(left: i64, top: i64, width: u32, height: u32, canvas_w: u32, canvas_h: u32) -> (i64, i64, u32, u32) {
+    let clipped_left = left.max(0);
+    let clipped_top = top.max(0);
+    let right = (left + i64::from(width)).min(i64::from(canvas_w));
+    let bottom = (top + i64::from(height)).min(i64::from(canvas_h));
+    let side = |extent: i64| u32::try_from(extent.max(1)).unwrap_or(u32::MAX);
+    let (clipped_w, clipped_h) = (side(right - clipped_left), side(bottom - clipped_top));
+    (clipped_left, clipped_top, clipped_w, clipped_h)
+}
+
+/// A composition layer, if this object is one.
+///
+/// WE's Composition and Post-Processing layers name a model that ships with the
+/// *program* (`models/util/composelayer.json`, `fullscreenlayer.json`), the
+/// same way `common.h` and `util/white` do, so the read would fail. They carry
+/// no art: their material samples `_rt_FullFrameBuffer` — the frame as
+/// composited so far — cropped to the layer's own rectangle, run through the
+/// layer's effect chain, and drawn back over that rectangle. A post-processing
+/// layer is the same thing at full canvas size.
+///
+/// The image here is a transparent placeholder that only carries the size; the
+/// real input arrives per frame from whatever has the frame on the GPU.
+fn static_composition<'a>(
+    archive: &Archive,
+    canvas: &Canvas,
+    object: &'a Object,
+    anchor: &Anchor,
+) -> Option<StaticImage<'a>> {
+    let path = object.image.as_deref()?;
+    if archive.contains(path) {
+        return None;
+    }
+    let name = path.rsplit('/').next().unwrap_or(path);
+    let fullscreen = match name {
+        "fullscreenlayer.json" => true,
+        "composelayer.json" | "composelayer_depthtest.json" | "projectlayer.json" => false,
+        // Some other model we do not ship and cannot stand in for.
+        _ => return None,
+    };
+
+    #[expect(clippy::cast_precision_loss, reason = "canvas dimensions, nowhere near 2^24")]
+    let full = (canvas.ortho.width as f32, canvas.ortho.height as f32);
+    let (extent_x, extent_y) = match object.size {
+        Some(size) if !fullscreen && size.x > 0.0 && size.y > 0.0 => {
+            (size.x * anchor.scale.x, size.y * anchor.scale.y)
+        }
+        _ => full,
+    };
+    let (origin_x, origin_y) = if fullscreen {
+        (full.0 / 2.0, full.1 / 2.0)
+    } else {
+        (anchor.origin.x, anchor.origin.y)
+    };
+
+    let (rect_left, rect_top) = to_pixels(canvas, origin_x - extent_x / 2.0, origin_y + extent_y / 2.0);
+    let (width, height) = to_pixel_size(extent_x * canvas.scale, extent_y * canvas.scale);
+
+    // Clipped to the canvas: a composition layer can be far larger than the
+    // screen (`scene_example4`'s cloud layer is 3.07x the canvas in Y), and
+    // only the part over the canvas has any frame under it to read. Allocating
+    // the full rectangle would mean a 4k x 6.6k render target per pass.
+    let (left, top, width, height) = clip_to_canvas(
+        round_to_i64(rect_left),
+        round_to_i64(rect_top),
+        width,
+        height,
+        canvas.width,
+        canvas.height,
+    );
+
+    Some(StaticImage {
+        object,
+        image: RgbaImage::new(width, height),
+        left,
+        top,
+        blend: Blend::Over,
+        warp_error: None,
+        composition: true,
+        roll: anchor.roll,
+    })
+}
+
+/// A text layer, rendered to a raster the ordinary image path can carry.
+///
+/// The box is the object's own `size · scale`, and the glyphs are drawn at
+/// `pointsize` scaled the same way — a text layer scales like every other
+/// layer, so its type size has to travel with it.
+fn static_text<'a>(
+    archive: &mut Archive,
+    canvas: &Canvas,
+    object: &'a Object,
+    anchor: &Anchor,
+) -> Result<StaticImage<'a>, String> {
+    let size = object.size.ok_or_else(|| "text layer has no size".to_string())?;
+    let (extent_x, extent_y) = (size.x * anchor.scale.x, size.y * anchor.scale.y);
+    if extent_x <= 0.0 || extent_y <= 0.0 {
+        return Err("text layer has an empty box".into());
+    }
+
+    let (rect_left, rect_top) = to_pixels(
+        canvas,
+        anchor.origin.x - extent_x / 2.0,
+        anchor.origin.y + extent_y / 2.0,
+    );
+    let (width, height) = to_pixel_size(extent_x * canvas.scale, extent_y * canvas.scale);
+    let rendered = text::render(archive, None, object, (width, height))?;
+    Ok(StaticImage {
+        object,
+        image: rendered.image,
+        left: round_to_i64(rect_left),
+        top: round_to_i64(rect_top),
+        blend: Blend::Over,
+        warp_error: None,
+        composition: false,
+        roll: anchor.roll,
+    })
+}
+
+/// A solid-colour layer, if this object is one.
+///
+/// `models/util/solidlayer.json` is another engine-provided model, and the
+/// thinnest one: its material is a single `flat` pass, whose fragment shader is
+/// `gl_FragColor = vec4(g_Color, g_Alpha)` over a translucent-blended
+/// rectangle. So the layer is its own rect filled with the object's tint, and
+/// the ordinary image path — effect chain included — takes it from there.
+/// `scene_example6` uses four: two black bars, and two that are the backdrop an
+/// audio-bars effect draws over.
+fn static_solid<'a>(
+    archive: &Archive,
+    canvas: &Canvas,
+    object: &'a Object,
+    anchor: &Anchor,
+) -> Option<StaticImage<'a>> {
+    let path = object.image.as_deref()?;
+    if archive.contains(path) {
+        return None;
+    }
+    let name = path.rsplit('/').next().unwrap_or(path);
+    if !matches!(name, "solidlayer.json" | "solidlayer_depthtest.json") {
+        return None;
+    }
+
+    let size = object.size?;
+    if size.x <= 0.0 || size.y <= 0.0 {
+        return None;
+    }
+    let (extent_x, extent_y) = (size.x * anchor.scale.x, size.y * anchor.scale.y);
+    let (rect_left, rect_top) = to_pixels(
+        canvas,
+        anchor.origin.x - extent_x / 2.0,
+        anchor.origin.y + extent_y / 2.0,
+    );
+    let (width, height) = to_pixel_size(extent_x * canvas.scale, extent_y * canvas.scale);
+
+    let mut image = RgbaImage::from_pixel(width, height, Rgba([255, 255, 255, 255]));
+    apply_tint(&mut image, object.color, object.brightness, object.alpha);
+
+    Some(StaticImage {
+        object,
+        image,
+        left: round_to_i64(rect_left),
+        top: round_to_i64(rect_top),
+        blend: Blend::Over,
+        warp_error: None,
+        composition: false,
+        roll: anchor.roll,
+    })
 }
 
 /// Note anything about an object that this composite cannot represent.
@@ -274,11 +535,38 @@ fn omissions_for(object: &Object) -> Vec<String> {
         if effects > 0 {
             notes.push(format!("{name}: {effects} effect(s) not applied"));
         }
-        if object.angles != Vec3::default() {
-            notes.push(format!("{name}: rotation not applied"));
+        // Only an out-of-plane tilt is unrepresentable now; `roll` is applied
+        // by the compositor.
+        if object.angles.x != 0.0 || object.angles.y != 0.0 {
+            notes.push(format!("{name}: out-of-plane rotation not applied"));
         }
     }
     notes
+}
+
+/// The scene's bloom settings, when it asks for bloom at all.
+///
+/// An HDR scene tunes the `bloomhdr*` set and leaves the plain pair at their
+/// defaults, so which pair to read follows `hdr` — `scene_example8` writes
+/// 0.12/0.55 for HDR and stock 2.0/0.65 for the other, and reading the wrong
+/// one drives the bloom sixteen times too hard.
+fn scene_bloom(general: &model::General) -> Option<bloom::Settings> {
+    general.bloom.then(|| {
+        let (strength, threshold) = if general.hdr {
+            (general.bloomhdrstrength, general.bloomhdrthreshold)
+        } else {
+            (general.bloomstrength, general.bloomthreshold)
+        };
+        bloom::Settings {
+            strength,
+            threshold,
+            tint: [general.bloomtint.x, general.bloomtint.y, general.bloomtint.z],
+            // The plain path has no spread of its own; WE fixes it at a
+            // quarter-then-eighth pair, which is two levels at full bleed.
+            scatter: if general.hdr { general.bloomhdrscatter } else { 1.0 },
+            iterations: if general.hdr { general.bloomhdriterations } else { 2 },
+        }
+    })
 }
 
 /// The scene's background fill: the clear colour when clearing is on, fully
@@ -338,6 +626,7 @@ fn static_image_or_puppet<'a>(
     archive: &mut Archive,
     canvas: &Canvas,
     object: &'a Object,
+    anchor: &Anchor,
 ) -> Result<Option<StaticItem<'a>>> {
     let Some(LayerTexture { image: texture, puppet: puppet_path, blend }) =
         layer_texture(archive, object)?
@@ -345,13 +634,13 @@ fn static_image_or_puppet<'a>(
         return Ok(None);
     };
 
-    let (extent_x, extent_y) = extent(object, &texture);
+    let (extent_x, extent_y) = extent(object, anchor, &texture);
     // `origin` is the centre of the layer, and the top edge is the one with
     // the larger scene Y.
     let (rect_left, rect_top) = to_pixels(
         canvas,
-        object.origin.x - extent_x / 2.0,
-        object.origin.y + extent_y / 2.0,
+        anchor.origin.x - extent_x / 2.0,
+        anchor.origin.y + extent_y / 2.0,
     );
 
     // A puppet layer replaces the flat scale with a skinned-mesh deformation
@@ -370,6 +659,7 @@ fn static_image_or_puppet<'a>(
                     rect_left,
                     rect_top,
                     blend,
+                    roll: anchor.roll,
                 })));
             }
             Err(error) => warp_error = Some(format!("{error:#}")),
@@ -385,6 +675,8 @@ fn static_image_or_puppet<'a>(
         top: round_to_i64(rect_top),
         blend,
         warp_error,
+        composition: false,
+        roll: anchor.roll,
     })))
 }
 
@@ -464,15 +756,52 @@ pub fn prepare_static<'a>(
 
     let mut items = Vec::new();
     let mut omissions = Vec::new();
+    let anchors = resolve_anchors(scene);
 
-    for object in &scene.objects {
+    for (object, anchor) in scene.objects.iter().zip(&anchors) {
         if !object.visible || is_sound(object) {
             continue;
+        }
+        if is_text(object) {
+            match static_text(archive, &canvas, object, anchor) {
+                Ok(item) => {
+                    omissions.extend(omissions_for(object));
+                    items.push(StaticItem::Image(item));
+                }
+                Err(reason) => {
+                    omissions.push(format!("{}: text layer skipped ({reason})", model::label(object)));
+                }
+            }
+            continue;
+        }
+        if is_image(object) {
+            // A composition layer has no texture to decode: its input is the
+            // frame beneath it, which only the GPU compositors can hand it.
+            if let Some(item) = static_composition(archive, &canvas, object, anchor) {
+                omissions.extend(omissions_for(object));
+                items.push(StaticItem::Image(item));
+                continue;
+            }
+            // A solid-colour layer likewise names a model we do not have, but
+            // its content is fully determined by the object's own tint.
+            if let Some(item) = static_solid(archive, &canvas, object, anchor) {
+                omissions.extend(omissions_for(object));
+                items.push(StaticItem::Image(item));
+                continue;
+            }
+            if !archive.contains(object.image.as_deref().unwrap_or_default()) {
+                omissions.push(format!(
+                    "{}: layer skipped, {} is not in the package",
+                    model::label(object),
+                    object.image.as_deref().unwrap_or_default()
+                ));
+                continue;
+            }
         }
         omissions.extend(omissions_for(object));
 
         if is_particle(object) {
-            match static_particle(archive, &canvas, object) {
+            match static_particle(archive, &canvas, object, anchor) {
                 Ok((item, unsupported)) => {
                     reconcile_particle_note(&mut omissions, object, Ok(&unsupported));
                     items.push(StaticItem::Particle(item));
@@ -485,7 +814,7 @@ pub fn prepare_static<'a>(
         if !is_image(object) {
             continue;
         }
-        if let Some(item) = static_image_or_puppet(archive, &canvas, object)? {
+        if let Some(item) = static_image_or_puppet(archive, &canvas, object, anchor)? {
             items.push(item);
         }
     }
@@ -498,6 +827,8 @@ pub fn prepare_static<'a>(
         width: canvas.width,
         height: canvas.height,
         background: background_pixel(scene),
+        bloom: scene_bloom(&scene.general),
+        hdr: scene.general.hdr,
         items,
         omissions,
     })
@@ -521,6 +852,7 @@ pub fn animate<'a>(archive: &mut Archive, static_scene: &StaticScene<'a>, time: 
                 blend: image.blend,
                 warped: false,
                 warp_error: image.warp_error.clone(),
+                composition: image.composition,
             },
             StaticItem::Puppet(puppet) => {
                 let (image, left, top) = warp_frame(puppet, time);
@@ -532,6 +864,7 @@ pub fn animate<'a>(archive: &mut Archive, static_scene: &StaticScene<'a>, time: 
                     blend: puppet.blend,
                     warped: true,
                     warp_error: None,
+                    composition: false,
                 }
             }
             StaticItem::Particle(particle) => {
@@ -546,6 +879,7 @@ pub fn animate<'a>(archive: &mut Archive, static_scene: &StaticScene<'a>, time: 
                             blend: particle.blend,
                             warped: false,
                             warp_error: None,
+                            composition: false,
                         }
                     }
                     Err(error) => {
@@ -574,6 +908,7 @@ fn static_particle<'a>(
     archive: &mut Archive,
     canvas: &Canvas,
     object: &'a Object,
+    anchor: &Anchor,
 ) -> Result<(StaticParticle<'a>, Vec<String>)> {
     let preset_path = object
         .particle
@@ -581,10 +916,10 @@ fn static_particle<'a>(
         .context("particle object names no preset")?
         .to_string();
 
-    let (origin_x, origin_y) = to_pixels(canvas, object.origin.x, object.origin.y);
+    let (origin_x, origin_y) = to_pixels(canvas, anchor.origin.x, anchor.origin.y);
     let place = particle::Placement {
         origin_px: Vec2::new(origin_x, origin_y),
-        scale: Vec2::new(object.scale.x, object.scale.y),
+        scale: Vec2::new(anchor.scale.x, anchor.scale.y),
         px_per_unit: canvas.scale,
         canvas_px: (canvas.width, canvas.height),
         tint: GVec3::new(
@@ -595,13 +930,15 @@ fn static_particle<'a>(
         alpha: object.alpha,
         overrides: object.instanceoverride.unwrap_or_default(),
         max_sim_steps: particle::EXACT_SIM_STEPS,
+        roll: (anchor.roll.cos(), anchor.roll.sin()),
     };
 
     let blend = particle::layer_blend(archive, &preset_path);
     let rendered = particle::render_system(archive, &preset_path, &place, 0.0)
         .with_context(|| format!("simulating {preset_path}"))?;
 
-    Ok((StaticParticle { object, preset_path, place, blend }, rendered.unsupported))
+    let refract = particle::layer_refracts(archive, &preset_path);
+    Ok((StaticParticle { object, preset_path, place, blend, refract }, rendered.unsupported))
 }
 
 /// `omissions_for` flags every object with animation layers as "keyframe
@@ -654,6 +991,11 @@ fn reconcile_particle_note(
 pub fn flatten(layered: &Layered) -> RgbaImage {
     let mut output = RgbaImage::from_pixel(layered.width, layered.height, layered.background);
     for layer in &layered.layers {
+        // A composition layer's pixels are the frame beneath it, which a flat
+        // overlay has no way to feed back through an effect chain.
+        if layer.composition {
+            continue;
+        }
         blit(&mut output, &layer.image, layer.left, layer.top, layer.blend);
     }
     output
@@ -708,6 +1050,82 @@ mod tests {
         canvas_for(Orthographic { width, height }, resolution).unwrap()
     }
 
+    /// The anchor of a parentless object: its own transform, unmodified.
+    fn own_anchor(object: &Object) -> Anchor {
+        Anchor {
+            origin: object.origin,
+            scale: object.scale,
+            roll: object.angles.z,
+        }
+    }
+
+    fn scene_of(objects: &str) -> Scene {
+        serde_json::from_str(&format!(
+            r#"{{"general":{{"orthogonalprojection":{{"width":1920,"height":1080}}}},"objects":{objects}}}"#
+        ))
+        .unwrap()
+    }
+
+    #[test]
+    fn a_child_origin_is_relative_to_its_parent() {
+        // `scene_example6` parks its sound objects at the scene origin by
+        // hanging a (-960, -540) child off a (960, 540) parent; read
+        // absolutely that lands a full screen off-canvas instead.
+        let scene = scene_of(
+            r#"[{"id":1,"origin":"960.0 540.0 0.0"},
+                {"id":2,"parent":1,"origin":"-960.0 -540.0 0.0"}]"#,
+        );
+        let anchors = resolve_anchors(&scene);
+        assert_eq!(anchors[1].origin, Vec3 { x: 0.0, y: 0.0, z: 0.0 });
+    }
+
+    #[test]
+    fn a_parent_scale_multiplies_both_the_child_offset_and_its_own() {
+        let scene = scene_of(
+            r#"[{"id":1,"origin":"100.0 0.0 0.0","scale":"2.0 2.0 1.0"},
+                {"id":2,"parent":1,"origin":"50.0 0.0 0.0","scale":"3.0 3.0 1.0"}]"#,
+        );
+        let anchors = resolve_anchors(&scene);
+        // 100 + 2 * 50, and the scales compound.
+        assert_eq!(anchors[1].origin.x, 200.0);
+        assert_eq!(anchors[1].scale.x, 6.0);
+    }
+
+    #[test]
+    fn roll_accumulates_down_the_chain() {
+        // A parent's rotation swings its children too, so a child under a
+        // rotated parent rolls by the sum of both.
+        let scene = scene_of(
+            r#"[{"id":1,"angles":"0.0 0.0 0.5"},
+                {"id":2,"parent":1,"name":"child","angles":"0.0 0.0 0.25","image":"models/a.json"}]"#,
+        );
+        let anchors = resolve_anchors(&scene);
+        assert!((anchors[0].roll - 0.5).abs() < 1e-6);
+        assert!((anchors[1].roll - 0.75).abs() < 1e-6, "got {}", anchors[1].roll);
+    }
+
+    #[test]
+    fn only_an_out_of_plane_tilt_is_still_reported() {
+        // Roll is applied by the compositor now; a tilt about x or y is not.
+        let flat: Object =
+            serde_json::from_str(r#"{"name":"a","image":"models/a.json","angles":"0.0 0.0 0.5"}"#).unwrap();
+        assert_eq!(omissions_for(&flat), Vec::<String>::new());
+
+        let tilted: Object =
+            serde_json::from_str(r#"{"name":"b","image":"models/a.json","angles":"0.3 0.0 0.0"}"#).unwrap();
+        assert_eq!(omissions_for(&tilted), vec!["b: out-of-plane rotation not applied"]);
+    }
+
+    #[test]
+    fn an_object_cycle_terminates_rather_than_hanging() {
+        let scene = scene_of(
+            r#"[{"id":1,"parent":2,"origin":"1.0 0.0 0.0"},
+                {"id":2,"parent":1,"origin":"10.0 0.0 0.0"}]"#,
+        );
+        let anchors = resolve_anchors(&scene);
+        assert_eq!(anchors.len(), 2);
+    }
+
     #[test]
     fn scene_y_is_measured_up_from_the_bottom() {
         let canvas = canvas(3840, 2160, None);
@@ -737,7 +1155,7 @@ mod tests {
         )
         .unwrap();
         let texture = RgbaImage::new(4, 4);
-        let (width, height) = extent(&object, &texture);
+        let (width, height) = extent(&object, &own_anchor(&object), &texture);
         assert!((width - 1184.777).abs() < 0.01, "got {width}");
         assert!((height - 786.261).abs() < 0.01, "got {height}");
     }
@@ -746,7 +1164,7 @@ mod tests {
     fn a_sizeless_object_takes_its_extent_from_the_texture() {
         let object: Object = serde_json::from_str(r#"{"image":"models/a.json"}"#).unwrap();
         let texture = RgbaImage::new(512, 256);
-        assert_eq!(extent(&object, &texture), (512.0, 256.0));
+        assert_eq!(extent(&object, &own_anchor(&object), &texture), (512.0, 256.0));
     }
 
     #[test]
@@ -779,7 +1197,10 @@ mod tests {
                            {"file":"f.json","visible":false}]}"#,
         )
         .unwrap();
-        assert_eq!(omissions_for(&effected), vec!["bg: 1 effect(s) not applied"]);
+        assert_eq!(
+            omissions_for(&effected),
+            vec!["bg: 1 effect(s) not applied"]
+        );
     }
 
     #[test]

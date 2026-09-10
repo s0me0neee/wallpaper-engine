@@ -18,7 +18,7 @@
 //! parameter away from the wallpaper's own preset, live.
 
 use crate::pkg::Archive;
-use crate::render::{capture, pass};
+use crate::render::{bloom, capture, pass};
 use crate::scene::compose::{self, StaticItem};
 use crate::scene::model::{self, Blend, Scene};
 use crate::scene::particle;
@@ -37,7 +37,8 @@ use std::ffi::CString;
 use std::num::NonZeroU32;
 use std::ops::Range;
 use std::sync::Arc;
-use std::time::Instant;
+use rayon::prelude::*;
+use std::time::{Duration, Instant};
 use winit::application::ApplicationHandler;
 use winit::event::WindowEvent;
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
@@ -78,6 +79,10 @@ enum LiveKind {
     Image,
     /// A puppet-warp layer: `static_scene.items[usize]` is re-skinned each frame.
     Puppet(usize),
+    /// A composition layer: its input is the frame as composited so far,
+    /// cropped to the layer's own rectangle into `region` each frame, then run
+    /// through the layer's chain and drawn back over the same rectangle.
+    Composition { region: pass::Target },
     /// A particle system, re-simulated each frame into `placement`'s canvas —
     /// which may be a fraction of the real one (soft glows survive a bilinear
     /// upscale, and a full-res tiny-skia raster every frame is what pins a big
@@ -94,19 +99,36 @@ enum LiveKind {
 /// one is large. The soft additive sprites these presets use survive a bilinear
 /// upscale, and the raster + per-frame texture upload both scale with the pixel
 /// count, so a big scene drops to ~0.4 (≈1/6 the pixels).
-fn particle_sim_scale(canvas: (u32, u32)) -> f32 {
-    match canvas.0.max(canvas.1) {
+///
+/// `systems` halves it again past a handful, because every system pays the full
+/// canvas cost — allocate, clear, raster, demultiply, upload — whether it
+/// covers the screen or a corner of it. `scene_example8` has 35 of them over 4K
+/// and spends its entire frame here; the same scene at half scale looks the
+/// same, these being fog and smoke.
+fn particle_sim_scale(canvas: (u32, u32), systems: usize) -> f32 {
+    let base = match canvas.0.max(canvas.1) {
         0..=1999 => 1.0,
         2000..=3199 => 0.5,
         _ => 0.4,
-    }
+    };
+    let crowded = match systems {
+        0..=8 => 1.0,
+        9..=20 => 0.75,
+        _ => 0.6,
+    };
+    base * crowded
 }
 
-/// Per-particle integration steps for the live sim: 6 seconds at 60 Hz. A
-/// particle older than that integrates in a fixed 360 steps with a slightly
-/// coarser `dt` — invisible on these soft drifting sprites, and it stops the
-/// per-frame cost climbing as long-lived fireflies age.
-const LIVE_SIM_STEPS: u32 = 360;
+/// Per-particle integration steps for the live sim.
+///
+/// The simulation is stateless — every frame re-integrates every live particle
+/// from its birth — so this cap is what stops the per-frame cost climbing as
+/// particles age. 90 steps spread over a particle's whole life is a coarse
+/// `dt`, and invisible on the drifting sprites these presets use: fog, smoke
+/// and embers under constant velocity plus gentle turbulence. It is the
+/// difference between `scene_example8` settling at 22 fps and sliding from 14
+/// down to 5 as its 35 systems fill up.
+const LIVE_SIM_STEPS: u32 = 90;
 
 /// `place` rescaled so a `scale`-of-canvas simulation lands in the same spots,
 /// and capped to the live per-particle step budget.
@@ -190,6 +212,28 @@ struct LiveLayer {
     /// Placement on the canvas — `(left, top, width, height)` in pixels,
     /// measured from the top-left. Re-derived each frame for `Puppet`.
     rect: (i32, i32, i32, i32),
+    /// `scene.json`'s `colorBlendMode`, and the scratch target the frame
+    /// beneath this layer is copied into so the compositor can blend against
+    /// it. Both are inert at mode 0, which is every corpus layer but four.
+    blend_mode: i32,
+    backdrop: Option<pass::Target>,
+    /// Roll about the layer's own centre, in radians. Zero for a particle
+    /// layer: its rect is the whole canvas, so rolling the quad would swing
+    /// the entire field about the canvas centre instead of about the emitter —
+    /// that rotation belongs in the placement and is applied there.
+    roll: f32,
+    /// A keyframe track on the layer's alpha, and the static value already
+    /// baked into its pixels — the compositor multiplies by their ratio so a
+    /// fading layer fades. `scene_example8`'s intro watermark is one.
+    alpha_track: Option<model::Track>,
+    alpha_static: f32,
+}
+
+/// The layer's alpha multiplier at `time`, relative to what is baked in.
+fn track_alpha(layer: &LiveLayer, time: f32) -> f32 {
+    let Some(track) = &layer.alpha_track else { return 1.0 };
+    let Some(value) = model::sample_track(track, time) else { return 1.0 };
+    (value / layer.alpha_static.max(1e-3)).clamp(0.0, 1.0)
 }
 
 /// Everything that only exists once the window itself does.
@@ -201,8 +245,12 @@ struct State {
     display_quad: pass::Quad,
     blit: pass::BlitProgram,
     compositor: pass::LayerCompositor,
+    /// Lifts a rectangle back out of `composite`, for composition layers.
+    region_copy: pass::RegionCopy,
     /// Canvas-sized accumulator the layers are stacked into each frame.
     composite: pass::Target,
+    /// Scene-wide bloom over the finished frame, when `general.bloom` is on.
+    bloom: Option<(bloom::Bloom, bloom::Settings)>,
     /// The scene's own pixel dimensions — every layer and the composite match
     /// this, so the window letterboxes to it rather than stretching.
     content_size: (u32, u32),
@@ -215,8 +263,8 @@ struct State {
     /// `(label, min, max)` per tweakable, in `tweak_values` order — fixed, so
     /// it is built once rather than reformatted every frame.
     panel: Vec<(String, f32, f32)>,
-    /// Rolling frame counter for the once-a-second FPS line.
-    frames_since: (Instant, u32),
+    /// Rolling frame counter and per-phase timings for the once-a-second line.
+    frames_since: FrameStats,
 }
 
 /// `(left, top, width, height)` in canvas pixels for an image placed with its
@@ -274,7 +322,11 @@ impl App<'_> {
         let display_quad = pass::build_display_quad(&gl)?;
         let blit = pass::compile_blit_program(&gl)?;
         let compositor = pass::compile_layer_compositor(&gl)?;
-        let composite = pass::Target::new(&gl, width, height).context("allocating the composite target")?;
+        let region_copy = pass::compile_region_copy(&gl)?;
+        let format = target_format(self.static_scene.hdr);
+        let composite = pass::Target::with_format(&gl, width, height, format)
+            .context("allocating the composite target")?;
+        let bloom = compile_bloom(&gl, self.static_scene.bloom, width, height, format)?;
 
         let Built { layers, tweak_values, omissions } = self.build_layers(&gl)?;
         for note in &omissions {
@@ -294,14 +346,16 @@ impl App<'_> {
             display_quad,
             blit,
             compositor,
+            region_copy,
             composite,
+            bloom,
             content_size: (width, height),
             background: normalized_rgba(self.static_scene.background),
             layers,
             egui,
             tweak_values,
             panel,
-            frames_since: (Instant::now(), 0),
+            frames_since: FrameStats::new(),
         })
     }
 
@@ -325,7 +379,8 @@ impl App<'_> {
             .cloned()
             .collect();
 
-        let sim_scale = particle_sim_scale((static_scene.width, static_scene.height));
+        let systems = static_scene.items.iter().filter(|item| matches!(item, StaticItem::Particle(_))).count();
+        let sim_scale = particle_sim_scale((static_scene.width, static_scene.height), systems);
         #[expect(clippy::cast_possible_wrap, reason = "wallpaper canvas dims are nowhere near i32::MAX")]
         let full_rect = (0, 0, static_scene.width as i32, static_scene.height as i32);
 
@@ -339,11 +394,18 @@ impl App<'_> {
                             format!("{}: puppet warp skipped ({error})", model::label(layer.object)),
                         );
                     }
+                    let kind = if layer.composition {
+                        let region = pass::Target::new(gl, layer.image.width(), layer.image.height())
+                            .with_context(|| format!("allocating {}'s region", model::label(layer.object)))?;
+                        LiveKind::Composition { region }
+                    } else {
+                        LiveKind::Image
+                    };
                     (
                         layer.image.clone(),
                         rect_of(layer.left, layer.top, &layer.image),
                         layer.blend,
-                        LiveKind::Image,
+                        kind,
                         layer.object,
                     )
                 }
@@ -371,18 +433,15 @@ impl App<'_> {
                 }
             };
 
-            let effects: Vec<_> = model::visible_effects(object).collect();
-            let chain = if effects.is_empty() {
-                None
-            } else {
-                match render::prepare_effect_chain(gl, archive, &effects, &image, headers) {
-                    Ok(chain) => Some(chain),
-                    Err(error) => {
-                        omissions.push(format!("{}: effect chain skipped ({error:#})", model::label(object)));
-                        None
-                    }
-                }
-            };
+            let chain = compile_chain(
+                gl,
+                archive,
+                headers,
+                object,
+                &image,
+                target_format(static_scene.hdr),
+                &mut omissions,
+            );
 
             let start = tweak_values.len();
             if let Some(chain) = &chain {
@@ -394,6 +453,7 @@ impl App<'_> {
             } else {
                 LayerTextures::ring(gl, &image)?
             };
+            let backdrop = blend_backdrop(gl, object, item, &image)?;
             layers.push(LiveLayer {
                 kind,
                 name: model::label(object),
@@ -402,11 +462,138 @@ impl App<'_> {
                 tweaks: start..tweak_values.len(),
                 textures,
                 rect,
+                blend_mode: layer_blend_mode(object, item),
+                backdrop,
+                roll: item_roll(item),
+                alpha_track: object.alphatrack.clone(),
+                alpha_static: object.alpha,
             });
         }
 
         Ok(Built { layers, tweak_values, omissions })
     }
+}
+
+/// Compile one layer's effect chain, recording whatever it could not build.
+///
+/// A chain that fails to compile is not fatal: the layer still renders, just
+/// unprocessed, and the reason lands in the omissions.
+fn compile_chain(
+    gl: &glow::Context,
+    archive: &mut Archive,
+    headers: &HashMap<String, String>,
+    object: &model::Object,
+    image: &RgbaImage,
+    format: pass::Format,
+    omissions: &mut Vec<String>,
+) -> Option<EffectChain> {
+    let effects: Vec<_> = model::visible_effects(object).collect();
+    if effects.is_empty() {
+        return None;
+    }
+    match render::prepare_effect_chain(gl, archive, &effects, image, headers, format) {
+        Ok(chain) => {
+            let name = model::label(object);
+            omissions.extend(chain.skipped.iter().map(|note| format!("{name}: {note}")));
+            Some(chain)
+        }
+        Err(error) => {
+            omissions.push(format!("{}: effect chain skipped ({error:#})", model::label(object)));
+            None
+        }
+    }
+}
+
+/// Render-target format for this scene: floating point when it says `hdr`.
+fn target_format(hdr: bool) -> pass::Format {
+    if hdr { pass::Format::Hdr } else { pass::Format::Ldr }
+}
+
+/// Compile the scene's bloom post-process, when it asks for one.
+fn compile_bloom(
+    gl: &glow::Context,
+    settings: Option<bloom::Settings>,
+    width: u32,
+    height: u32,
+    format: pass::Format,
+) -> Result<Option<(bloom::Bloom, bloom::Settings)>> {
+    let Some(settings) = settings else { return Ok(None) };
+    let compiled = bloom::compile(gl, width, height, format).context("compiling the scene bloom")?;
+    Ok(Some((compiled, settings)))
+}
+
+/// Draw one finished layer into the composite under its blend mode.
+fn composite_one(state: &State, layer: &LiveLayer, source: glow::Texture, time: f32) {
+    // A blend-mode layer needs the frame beneath it readable, so lift that
+    // rectangle out before overwriting it.
+    if let Some(backdrop) = &layer.backdrop {
+        pass::copy_region(
+            &state.gl,
+            &state.region_copy,
+            backdrop,
+            state.composite.texture,
+            state.content_size,
+            layer.rect,
+        );
+    }
+    pass::composite_layer_blended(
+        &state.gl,
+        &state.compositor,
+        &state.composite,
+        source,
+        layer.rect,
+        layer.additive,
+        layer.blend_mode,
+        layer.backdrop.as_ref().map(|target| target.texture),
+        layer.roll,
+        track_alpha(layer, time),
+    );
+}
+
+/// Roll for the composited quad.
+///
+/// A particle layer gets zero: its rect is the whole canvas, so rolling the
+/// quad would swing the whole field about the canvas centre rather than about
+/// the emitter. That rotation is applied to the placement instead.
+fn item_roll(item: &StaticItem) -> f32 {
+    match item {
+        StaticItem::Image(layer) => layer.roll,
+        StaticItem::Puppet(puppet) => puppet.roll,
+        StaticItem::Particle(_) => 0.0,
+    }
+}
+
+/// How this layer meets the frame beneath it, in `weBlendColor`'s numbering.
+///
+/// Normally the object's own `colorBlendMode`. A refracting particle system
+/// overrides it with multiply: `genericparticle.frag` under `#if REFRACT` ends
+/// with `color.rgb *= <frame>`, and multiplying the layer in — `mix(dst,
+/// dst*src, src.a)` — is that same thing one level up, minus the screen-space
+/// offset the normal map would add. It is what makes `scene_example8`'s wet
+/// snow disappear against a dark sky, as it does in Wallpaper Engine, instead
+/// of covering it in white discs.
+fn layer_blend_mode(object: &model::Object, item: &StaticItem) -> i32 {
+    const MULTIPLY: i32 = 2;
+    match item {
+        StaticItem::Particle(system) if system.refract => MULTIPLY,
+        _ => object.color_blend_mode,
+    }
+}
+
+/// A scratch target for the frame beneath a `colorBlendMode` layer, or `None`
+/// when the layer composites plain alpha-over and needs no backdrop.
+fn blend_backdrop(
+    gl: &glow::Context,
+    object: &model::Object,
+    item: &StaticItem,
+    image: &image::RgbaImage,
+) -> Result<Option<pass::Target>> {
+    if layer_blend_mode(object, item) == 0 {
+        return Ok(None);
+    }
+    let target = pass::Target::new(gl, image.width().max(1), image.height().max(1))
+        .with_context(|| format!("allocating {}'s backdrop", model::label(object)))?;
+    Ok(Some(target))
 }
 
 /// `build_layers`' output: the z-ordered layers, the flattened tweakable
@@ -434,39 +621,70 @@ fn redraw(app: &mut App, time: f32) -> Result<bool> {
 
     // Per-frame CPU work: re-skin puppets, re-simulate particles, then upload
     // each fresh image into the next texture in its ring.
-    for layer in &mut state.layers {
-        let refreshed = match &layer.kind {
-            LiveKind::Image => None,
+    // Each layer's own image is independent of every other layer's, so the two
+    // halves are split: raster across all cores, then upload on this thread,
+    // which is the one that owns the GL context. `scene_example8` has 35
+    // particle systems and spent 230 ms a frame here doing them one at a time.
+    let cpu_start = Instant::now();
+    let refreshed = state
+        .layers
+        .par_iter()
+        .map(|layer| match &layer.kind {
+            // A composition layer's input is produced on the GPU during the
+            // composite pass below, not here.
+            LiveKind::Image | LiveKind::Composition { .. } => Ok(None),
             LiveKind::Puppet(index) => {
                 let StaticItem::Puppet(puppet) = &static_scene.items[*index] else {
                     unreachable!("a Puppet LiveKind always points at a Puppet item")
                 };
                 let (image, left, top) = compose::warp_frame(puppet, time);
                 let rect = rect_of(left, top, &image);
-                Some((image, rect))
+                Ok(Some((image, rect)))
             }
             LiveKind::Particle { placement, preset_path, presets } => {
                 let image = particle::render_system_from(presets, preset_path, placement, time)
                     .with_context(|| format!("simulating {preset_path}"))?
                     .image;
-                Some((image, layer.rect))
+                Ok(Some((image, layer.rect)))
             }
-        };
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    let upload_start = Instant::now();
+    for (layer, refreshed) in state.layers.iter_mut().zip(refreshed) {
         if let Some((image, rect)) = refreshed {
             layer.rect = rect;
             layer.textures.refresh(&state.gl, &image)?;
         }
     }
+    state.frames_since.upload += upload_start.elapsed();
+
+    state.frames_since.cpu += cpu_start.elapsed();
 
     // Stack the layers into the composite target, each under its blend mode.
+    let gpu_start = Instant::now();
     pass::clear_target(&state.gl, &state.composite, state.background);
     for layer in &state.layers {
+        // A composition layer renders the frame beneath it, so lift that
+        // rectangle out of the composite before its chain runs.
+        if let LiveKind::Composition { region } = &layer.kind {
+            pass::copy_region(
+                &state.gl,
+                &state.region_copy,
+                region,
+                state.composite.texture,
+                state.content_size,
+                layer.rect,
+            );
+        }
+
         let source = match &layer.chain {
             Some(chain) => {
                 // A static image's chain keeps its baked-in base; a puppet or
                 // particle layer's image changed this frame, so re-feed it.
-                let base = match layer.kind {
+                let base = match &layer.kind {
                     LiveKind::Image => None,
+                    LiveKind::Composition { region } => Some(region.texture),
                     LiveKind::Puppet(_) | LiveKind::Particle { .. } => Some(layer.textures.current()),
                 };
                 chain
@@ -475,16 +693,24 @@ fn redraw(app: &mut App, time: f32) -> Result<bool> {
             }
             None => layer.textures.current(),
         };
-        pass::composite_layer(&state.gl, &state.compositor, &state.composite, source, layer.rect, layer.additive);
+        composite_one(state, layer, source, time);
     }
+
+    // Scene bloom runs over the finished stack, the way WE post-processes the
+    // whole frame rather than any one layer.
+    if let Some((compiled, settings)) = &state.bloom {
+        bloom::apply(&state.gl, compiled, &state.composite, *settings);
+    }
+
+    state.frames_since.gpu += gpu_start.elapsed();
 
     // Debug hook: `SIMULATE_DUMP=<path>` writes the composited frame (the live
     // pipeline's own output, before the window blit) and exits, so the
     // per-layer chains + GPU compositing can be eyeballed headlessly.
     // Pair with `SIMULATE_TIME=<secs>` to pin `g_Time`.
     if let Ok(path) = std::env::var("SIMULATE_DUMP") {
-        state.frames_since.1 += 1;
-        if state.frames_since.1 >= 2 {
+        state.frames_since.frames += 1;
+        if state.frames_since.frames >= 2 {
             let frame = capture::read_rgba(
                 &state.gl,
                 state.composite.framebuffer,
@@ -508,15 +734,37 @@ fn redraw(app: &mut App, time: f32) -> Result<bool> {
     Ok(false)
 }
 
+/// Frame rate plus where the frame went, split at the one seam that matters:
+/// the CPU half re-skins puppets and re-simulates particles, the GPU half runs
+/// the effect chains and composites. A scene that is slow is almost always slow
+/// in one of the two, and guessing which is what a profiler is for.
+struct FrameStats {
+    since: Instant,
+    frames: u32,
+    cpu: Duration,
+    upload: Duration,
+    gpu: Duration,
+}
+
+impl FrameStats {
+    fn new() -> Self {
+        FrameStats { since: Instant::now(), frames: 0, cpu: Duration::ZERO, upload: Duration::ZERO, gpu: Duration::ZERO }
+    }
+}
+
 /// Print a frame-rate line about once a second so a slow scene is visible
 /// without a profiler.
-fn report_fps(counter: &mut (Instant, u32)) {
-    counter.1 += 1;
-    let elapsed = counter.0.elapsed();
+fn report_fps(stats: &mut FrameStats) {
+    stats.frames += 1;
+    let elapsed = stats.since.elapsed();
     if elapsed.as_secs() >= 1 {
-        let fps = f64::from(counter.1) / elapsed.as_secs_f64();
-        println!("  {fps:.0} fps");
-        *counter = (Instant::now(), 0);
+        let frames = f64::from(stats.frames);
+        let fps = frames / elapsed.as_secs_f64();
+        let cpu = stats.cpu.as_secs_f64() * 1000.0 / frames;
+        let gpu = stats.gpu.as_secs_f64() * 1000.0 / frames;
+        let upload = stats.upload.as_secs_f64() * 1000.0 / frames;
+        println!("  {fps:.0} fps  (cpu {cpu:.0} ms, upload {upload:.0} ms, gpu {gpu:.0} ms)");
+        *stats = FrameStats::new();
     }
 }
 

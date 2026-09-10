@@ -10,6 +10,7 @@
 
 use anyhow::{Result, bail};
 use glow::HasContext;
+use std::collections::HashMap;
 
 /// GL enum constants are `u32`, but the API's own setter parameters are `i32`
 /// — a mismatch from the spec's `GLenum`/`GLint` split, not a real risk: every
@@ -21,6 +22,15 @@ fn gl_enum(value: u32) -> i32 {
 /// A compiled vertex+fragment program.
 pub struct Program {
     pub handle: glow::Program,
+    /// How many floats each active float/vector uniform actually takes, read
+    /// back from the linked program.
+    ///
+    /// The two stages do not always agree on a uniform's type — WE's own
+    /// `clouds` declares `g_CloudSpeeds` as `vec2` in the vertex shader and
+    /// `vec4` in the fragment — and only one of the two survives linking.
+    /// Uploading the other one's width is an `INVALID_OPERATION` that kills the
+    /// draw, so the link is the authority on what to send.
+    float_widths: HashMap<String, usize>,
 }
 
 pub fn compile_program(gl: &glow::Context, vertex_src: &str, fragment_src: &str) -> Result<Program> {
@@ -47,7 +57,25 @@ pub fn compile_program(gl: &glow::Context, vertex_src: &str, fragment_src: &str)
         bail!("linking the shader program: {log}");
     }
 
-    Ok(Program { handle: program })
+    Ok(Program { handle: program, float_widths: float_widths(gl, program) })
+}
+
+/// Component count per active float-typed uniform, by name.
+fn float_widths(gl: &glow::Context, program: glow::Program) -> HashMap<String, usize> {
+    let count = unsafe { gl.get_active_uniforms(program) };
+    (0..count)
+        .filter_map(|index| {
+            let uniform = unsafe { gl.get_active_uniform(program, index) }?;
+            let width = match uniform.utype {
+                glow::FLOAT => 1,
+                glow::FLOAT_VEC2 => 2,
+                glow::FLOAT_VEC3 => 3,
+                glow::FLOAT_VEC4 => 4,
+                _ => return None,
+            };
+            Some((uniform.name, width))
+        })
+        .collect()
 }
 
 fn compile_stage(gl: &glow::Context, kind: u32, source: &str, label: &str) -> Result<glow::Shader> {
@@ -72,8 +100,42 @@ pub struct Target {
     pub height: u32,
 }
 
+/// Colour format for a render target.
+///
+/// `Hdr` is what `general.hdr` means: values above 1.0 survive instead of
+/// clamping at the end of every pass. It matters most for bloom, whose
+/// threshold is only meaningful if something can exceed it — `scene_example8`'s
+/// sun is a shader result well past 1.0, and in an 8-bit target it lands at
+/// exactly 1.0 with the rest of the sky, so a 0.65 threshold extracts almost
+/// nothing and the sunset loses its glow.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Format {
+    Ldr,
+    Hdr,
+}
+
+impl Format {
+    fn internal(self) -> u32 {
+        match self {
+            Format::Ldr => glow::RGBA8,
+            Format::Hdr => glow::RGBA16F,
+        }
+    }
+
+    fn component(self) -> u32 {
+        match self {
+            Format::Ldr => glow::UNSIGNED_BYTE,
+            Format::Hdr => glow::HALF_FLOAT,
+        }
+    }
+}
+
 impl Target {
     pub fn new(gl: &glow::Context, width: u32, height: u32) -> Result<Target> {
+        Target::with_format(gl, width, height, Format::Ldr)
+    }
+
+    pub fn with_format(gl: &glow::Context, width: u32, height: u32, format: Format) -> Result<Target> {
         // Wallpaper-sized canvases stay far under i32::MAX; the driver takes
         // signed dimensions because it also accepts negative border sizes we
         // never use.
@@ -86,12 +148,12 @@ impl Target {
             gl.tex_image_2d(
                 glow::TEXTURE_2D,
                 0,
-                gl_enum(glow::RGBA8),
+                gl_enum(format.internal()),
                 signed_width,
                 signed_height,
                 0,
                 glow::RGBA,
-                glow::UNSIGNED_BYTE,
+                format.component(),
                 glow::PixelUnpackData::Slice(None),
             );
             gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MIN_FILTER, gl_enum(glow::LINEAR));
@@ -318,6 +380,11 @@ pub fn draw(gl: &glow::Context, call: &DrawCall) -> Result<()> {
 
     set_uniform_matrix4(gl, call.program.handle, "g_ModelViewProjectionMatrix", call.mvp);
     for (name, values) in call.floats {
+        // Both stages' declarations reach here, and where they disagree only
+        // the linked width can be uploaded.
+        if call.program.float_widths.get(*name).is_some_and(|width| *width != values.len()) {
+            continue;
+        }
         set_uniform_floats(gl, call.program.handle, name, values);
     }
     for (name, value) in call.ints {
@@ -415,6 +482,84 @@ pub fn blit_to_screen(
     }
 }
 
+/// Copies a rectangle out of the composited frame into a target of that size —
+/// how a composition layer gets its input, since what it renders is whatever
+/// the frame already holds underneath it.
+pub struct RegionCopy {
+    program: Program,
+    quad: Quad,
+}
+
+const REGION_VERTEX: &str = "#version 330 core\n\
+    layout(location = 0) in vec3 a_Position;\n\
+    layout(location = 1) in vec2 a_TexCoord;\n\
+    uniform vec2 u_UvOffset;\n\
+    uniform vec2 u_UvScale;\n\
+    out vec2 v_TexCoord;\n\
+    void main() {\n\
+        v_TexCoord = u_UvOffset + a_TexCoord * u_UvScale;\n\
+        gl_Position = vec4(a_Position, 1.0);\n\
+    }\n";
+const REGION_FRAGMENT: &str = "#version 330 core\n\
+    in vec2 v_TexCoord;\n\
+    out vec4 o_Color;\n\
+    uniform sampler2D u_Texture;\n\
+    void main() {\n\
+        o_Color = texture(u_Texture, v_TexCoord);\n\
+    }\n";
+
+pub fn compile_region_copy(gl: &glow::Context) -> Result<RegionCopy> {
+    Ok(RegionCopy { program: compile_program(gl, REGION_VERTEX, REGION_FRAGMENT)?, quad: build_quad(gl)? })
+}
+
+/// Fill `region` with the `(left, top, width, height)` rectangle of `source`,
+/// a `source_size` texture in the same row-preserving orientation as the
+/// composite target. Sampling is clamped at the edges, so a rectangle that
+/// hangs off the canvas smears its border rather than wrapping.
+pub fn copy_region(
+    gl: &glow::Context,
+    copier: &RegionCopy,
+    region: &Target,
+    source: glow::Texture,
+    source_size: (u32, u32),
+    (left, top, width, height): (i32, i32, i32, i32),
+) {
+    #[expect(clippy::cast_precision_loss, reason = "canvas dimensions, nowhere near f32's 2^24 exact range")]
+    let (source_w, source_h) = (source_size.0 as f32, source_size.1 as f32);
+    #[expect(clippy::cast_precision_loss, reason = "canvas coordinates, nowhere near f32's 2^24 exact range")]
+    let (offset, scale) = (
+        [left as f32 / source_w, top as f32 / source_h],
+        [width as f32 / source_w, height as f32 / source_h],
+    );
+
+    #[expect(clippy::cast_possible_wrap, reason = "wallpaper canvases are nowhere near i32::MAX")]
+    let (target_w, target_h) = (region.width as i32, region.height as i32);
+    unsafe {
+        gl.bind_framebuffer(glow::FRAMEBUFFER, Some(region.framebuffer));
+        gl.viewport(0, 0, target_w, target_h);
+        gl.disable(glow::BLEND);
+        gl.use_program(Some(copier.program.handle));
+        gl.bind_vertex_array(Some(copier.quad.vertex_array));
+        gl.active_texture(glow::TEXTURE0);
+        gl.bind_texture(glow::TEXTURE_2D, Some(source));
+        gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_WRAP_S, gl_enum(glow::CLAMP_TO_EDGE));
+        gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_WRAP_T, gl_enum(glow::CLAMP_TO_EDGE));
+        if let Some(location) = gl.get_uniform_location(copier.program.handle, "u_Texture") {
+            gl.uniform_1_i32(Some(&location), 0);
+        }
+        if let Some(location) = gl.get_uniform_location(copier.program.handle, "u_UvOffset") {
+            gl.uniform_2_f32_slice(Some(&location), &offset);
+        }
+        if let Some(location) = gl.get_uniform_location(copier.program.handle, "u_UvScale") {
+            gl.uniform_2_f32_slice(Some(&location), &scale);
+        }
+        gl.draw_arrays(glow::TRIANGLE_STRIP, 0, 4);
+        gl.bind_vertex_array(None);
+        gl.use_program(None);
+        gl.bind_framebuffer(glow::FRAMEBUFFER, None);
+    }
+}
+
 /// Draws one placed layer texture into a canvas-sized target, under a blend
 /// mode. The live simulator runs each layer's effect chain separately and then
 /// stacks the results here, the GPU equivalent of `compose::flatten`.
@@ -423,25 +568,87 @@ pub struct LayerCompositor {
     quad: Quad,
 }
 
+/// Places the layer's quad itself rather than leaning on the viewport, so it
+/// can be rolled about its own centre.
+///
+/// `u_Rect` is the same `(left, top, width, height)` the viewport took before,
+/// and at zero roll this reproduces it exactly: the corner at texcoord (s, t)
+/// lands at `(left + s·w, top + t·h)`, which is what `glViewport` did.
+/// `v_Backdrop` stays in the *unrotated* rect so the copied backdrop still
+/// lines up; a rolled corner reaching outside it clamps, which is a pixel or
+/// two at the angles the corpus uses.
 const COMPOSITE_VERTEX: &str = "#version 330 core\n\
     layout(location = 0) in vec3 a_Position;\n\
     layout(location = 1) in vec2 a_TexCoord;\n\
+    uniform vec4 u_Rect;\n\
+    uniform vec2 u_Target;\n\
+    uniform vec2 u_Roll;\n\
     out vec2 v_TexCoord;\n\
+    out vec2 v_Backdrop;\n\
     void main() {\n\
+        vec2 local = (a_TexCoord - 0.5) * u_Rect.zw;\n\
+        vec2 rolled = vec2(local.x * u_Roll.x - local.y * u_Roll.y,\n\
+                           local.x * u_Roll.y + local.y * u_Roll.x);\n\
+        vec2 pixel = u_Rect.xy + u_Rect.zw * 0.5 + rolled;\n\
         v_TexCoord = a_TexCoord;\n\
-        gl_Position = vec4(a_Position, 1.0);\n\
+        v_Backdrop = (pixel - u_Rect.xy) / u_Rect.zw;\n\
+        gl_Position = vec4(pixel / u_Target * 2.0 - 1.0, 0.0, 1.0);\n\
     }\n";
-const COMPOSITE_FRAGMENT: &str = "#version 330 core\n\
+/// The shim's blend-mode dispatch, reused verbatim.
+///
+/// It is self-contained GLSL — no includes, no HLSL intrinsics — so it drops
+/// straight into the compositor, and reusing it means the layer blend and the
+/// in-shader `ApplyBlending` an effect pass calls can never disagree. The
+/// numbering was checked against Wallpaper Engine's own `common_blending.h`
+/// and matches arm for arm.
+const BLENDING: &str = include_str!("../shader/glsl/common_blending.glsl");
+
+/// The blend-mode compositor's `main`.
+///
+/// `scene.json`'s `colorBlendMode` picks a Photoshop-style blend of the layer
+/// against the frame beneath it. Unlike `translucent`/`additive` — which are GL
+/// blend state — this needs the destination readable, so the backdrop is copied
+/// in as a texture and the blend runs here.
+///
+/// The wiring is `genericimage2.frag`'s, which is where Wallpaper Engine does
+/// this: it binds `_rt_FullFrameBuffer` under `#if BLENDMODE` and finishes with
+///
+/// ```glsl
+/// gl_FragColor.rgb = ApplyBlending(BLENDMODE, screen.rgb, gl_FragColor.rgb, gl_FragColor.a);
+/// gl_FragColor.a = screen.a;
+/// ```
+///
+/// so the *frame* is the base, the layer is the blend, the layer's own alpha is
+/// the opacity, and the result carries the frame's alpha — not the layer's. That
+/// output then meets the frame again through the material's ordinary translucent
+/// blend, which the `mix` by `dst.a` below folds in; with an opaque frame it is
+/// the identity, and `scene_example8` clears to opaque.
+///
+/// `scene_example8` is the only corpus scene that uses this at all: four
+/// objects, at modes 1 (darken), 4 (linear burn), 11 (overlay) and 12 (soft
+/// light). All four darken, which is why compositing them plain-over pasted its
+/// clouds onto the sky as bright slabs.
+const COMPOSITE_MAIN: &str = "\n\
     in vec2 v_TexCoord;\n\
+    in vec2 v_Backdrop;\n\
     out vec4 o_Color;\n\
     uniform sampler2D u_Texture;\n\
+    uniform sampler2D u_Backdrop;\n\
+    uniform int u_Mode;\n\
+    uniform float u_Alpha;\n\
     void main() {\n\
-        o_Color = texture(u_Texture, v_TexCoord);\n\
+        vec4 src = texture(u_Texture, v_TexCoord);\n\
+        src *= u_Alpha;\n\
+        if (u_Mode == 0) { o_Color = src; return; }\n\
+        vec4 dst = texture(u_Backdrop, clamp(v_Backdrop, 0.0, 1.0));\n\
+        vec3 blended = ApplyBlending(u_Mode, dst.rgb, src.rgb, src.a);\n\
+        o_Color = vec4(mix(dst.rgb, blended, dst.a), dst.a);\n\
     }\n";
 
 pub fn compile_layer_compositor(gl: &glow::Context) -> Result<LayerCompositor> {
+    let fragment = format!("#version 330 core\n{BLENDING}\n{COMPOSITE_MAIN}");
     Ok(LayerCompositor {
-        program: compile_program(gl, COMPOSITE_VERTEX, COMPOSITE_FRAGMENT)?,
+        program: compile_program(gl, COMPOSITE_VERTEX, &fragment)?,
         // Row-preserving, same as an effect pass: the target ends up with
         // texel row 0 == the canvas's visual top, which `blit_to_screen` then
         // flips once for the window.
@@ -469,24 +676,41 @@ pub fn clear_target(gl: &glow::Context, target: &Target, color: [f32; 4]) {
 /// `dst·(1-srcA) + src·srcA` (normal) and `dst + src·srcA` with the alpha
 /// lifted to the brighter of the two (additive) — the same two rules
 /// `compose::blit` uses on the CPU.
-pub fn composite_layer(
+/// Composite a layer with `scene.json`'s `colorBlendMode` applied
+/// against `backdrop` — the frame beneath this layer, already copied out of
+/// `target` at the same rectangle. Mode 0 ignores the backdrop entirely and
+/// takes the fixed-function path, which is every layer in the corpus but four.
+#[expect(clippy::too_many_arguments, reason = "one layer's full composite state")]
+pub fn composite_layer_blended(
     gl: &glow::Context,
     compositor: &LayerCompositor,
     target: &Target,
     texture: glow::Texture,
     (left, top, width, height): (i32, i32, i32, i32),
     additive: bool,
+    mode: i32,
+    backdrop: Option<glow::Texture>,
+    roll: f32,
+    alpha: f32,
 ) {
+    let blended = mode != 0 && backdrop.is_some();
+    #[expect(clippy::cast_possible_wrap, reason = "wallpaper canvases are nowhere near i32::MAX")]
+    let (target_width, target_height) = (target.width as i32, target.height as i32);
     unsafe {
         gl.bind_framebuffer(glow::FRAMEBUFFER, Some(target.framebuffer));
-        // The target is row-preserving (texel row 0 == visual top), so viewport
-        // y measures straight down from the top — no flip.
-        gl.viewport(left, top, width, height);
-        gl.enable(glow::BLEND);
-        if additive {
+        // The quad places itself now (see `COMPOSITE_VERTEX`), so the viewport
+        // is the whole target — a rolled layer reaches outside its own rect.
+        gl.viewport(0, 0, target_width, target_height);
+        if blended {
+            // The shader has already folded the backdrop in, so writing must
+            // replace rather than blend a second time.
+            gl.disable(glow::BLEND);
+        } else if additive {
+            gl.enable(glow::BLEND);
             gl.blend_equation_separate(glow::FUNC_ADD, glow::MAX);
             gl.blend_func_separate(glow::SRC_ALPHA, glow::ONE, glow::ONE, glow::ONE);
         } else {
+            gl.enable(glow::BLEND);
             gl.blend_equation_separate(glow::FUNC_ADD, glow::FUNC_ADD);
             gl.blend_func_separate(
                 glow::SRC_ALPHA,
@@ -503,6 +727,34 @@ pub fn composite_layer(
         if let Some(location) = gl.get_uniform_location(compositor.program.handle, "u_Texture") {
             gl.uniform_1_i32(Some(&location), 0);
         }
+        if let Some(location) = gl.get_uniform_location(compositor.program.handle, "u_Mode") {
+            gl.uniform_1_i32(Some(&location), if blended { mode } else { 0 });
+        }
+        #[expect(clippy::cast_precision_loss, reason = "canvas coordinates, nowhere near 2^24")]
+        let rect = [left as f32, top as f32, width as f32, height as f32];
+        #[expect(clippy::cast_precision_loss, reason = "canvas dimensions, nowhere near 2^24")]
+        let size = [target.width as f32, target.height as f32];
+        if let Some(location) = gl.get_uniform_location(compositor.program.handle, "u_Rect") {
+            gl.uniform_4_f32_slice(Some(&location), &rect);
+        }
+        if let Some(location) = gl.get_uniform_location(compositor.program.handle, "u_Target") {
+            gl.uniform_2_f32_slice(Some(&location), &size);
+        }
+        if let Some(location) = gl.get_uniform_location(compositor.program.handle, "u_Roll") {
+            gl.uniform_2_f32_slice(Some(&location), &[roll.cos(), roll.sin()]);
+        }
+        if let Some(location) = gl.get_uniform_location(compositor.program.handle, "u_Alpha") {
+            gl.uniform_1_f32(Some(&location), alpha.clamp(0.0, 1.0));
+        }
+        gl.active_texture(glow::TEXTURE1);
+        // Bind *something* even when there is no backdrop: the sampler is
+        // declared either way, and an incomplete texture unit makes the whole
+        // draw undefined on a strict driver (macOS logs it outright).
+        gl.bind_texture(glow::TEXTURE_2D, Some(backdrop.unwrap_or(texture)));
+        if let Some(location) = gl.get_uniform_location(compositor.program.handle, "u_Backdrop") {
+            gl.uniform_1_i32(Some(&location), 1);
+        }
+        gl.active_texture(glow::TEXTURE0);
         gl.draw_arrays(glow::TRIANGLE_STRIP, 0, 4);
 
         gl.bind_vertex_array(None);

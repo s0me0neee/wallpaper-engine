@@ -5,8 +5,9 @@
 //! a list of operators that evolve it, a renderer, and optional child systems.
 //! This module parses that, simulates it as a pure function of `time`, and
 //! rasterizes the result into one RGBA layer the scene compositor drops in at
-//! the object's z-order. Every preset in the wild uses an additive
-//! `genericparticle` material, so the layer is always composited additively.
+//! the object's z-order. Presets use a `genericparticle` material, but not all
+//! of them additively — twenty of the corpus's fifty-one are `translucent`, and
+//! each preset draws its own particles with its own blend.
 //!
 //! Determinism without frame-to-frame state: each particle's whole trajectory
 //! is re-integrated from its birth on every call, and its random rolls come
@@ -38,10 +39,31 @@ use rand_pcg::Pcg64Mcg;
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::f32::consts::TAU;
+use super::sprite;
 use tiny_skia::{
-    BlendMode, Color, FillRule, GradientStop, LineCap, Paint, PathBuilder, Pixmap, Point,
-    RadialGradient, SpreadMode, Stroke, Transform,
+    BlendMode, FilterQuality, LineCap, Paint, PathBuilder, Pattern, Pixmap, Point,
+    PremultipliedColorU8, Rect, SpreadMode, Stroke, Transform,
 };
+
+/// Resolve an initializer's optional bounds: an absent `max` is fixed at `min`,
+/// and an absent `min` is the initializer's own neutral value.
+/// Alpha's bounds, which unlike a size or a lifetime have a natural range.
+///
+/// An absent `min` is 0 and an absent `max` is 1 — the whole range — because
+/// the corpus only makes sense read that way. Three presets write `{"max": 1}`
+/// and one writes `{"max": 0.3}`; treating the absent `min` as 1.0 would make
+/// the first a no-op and the second an inverted range, and `alpharandom` is
+/// not something a scene serializes to do nothing. `{"min": 0.8}` still pins
+/// both ends, which is the same "absent max is fixed at min" rule as
+/// everywhere else.
+fn alpha_bounds(min: Option<f32>, max: Option<f32>) -> (f32, f32) {
+    (min.unwrap_or(0.0), max.or(min).unwrap_or(1.0))
+}
+
+fn bounds<T: Copy>(min: Option<T>, max: Option<T>, neutral: T) -> (T, T) {
+    let low = min.unwrap_or(neutral);
+    (low, max.or(min).unwrap_or(neutral))
+}
 
 /// Simulation step rate for trajectory integration.
 const SIM_HZ: f32 = 60.0;
@@ -79,6 +101,23 @@ pub struct Preset {
     maxcount: f32,
     #[serde(default)]
     starttime: f32,
+    /// Blend the preset's own material asks for, resolved at collect time.
+    ///
+    /// Not every system is additive, and drawing a `translucent` one as if it
+    /// were is what turns `scene_example6`'s rain into saturated white blobs:
+    /// summing overlapping drops clips to white instead of letting the nearest
+    /// one cover the rest. Twenty of the corpus's fifty-one particle materials
+    /// are `translucent`.
+    #[serde(skip, default = "additive")]
+    blend: model::Blend,
+    /// The sprite each of this preset's particles is drawn with, resolved at
+    /// collect time from the material's first texture slot.
+    #[serde(skip)]
+    sprite: Option<Pixmap>,
+}
+
+fn additive() -> model::Blend {
+    model::Blend::Add
 }
 
 #[derive(Debug, Deserialize)]
@@ -115,12 +154,52 @@ enum Emitter {
 
 #[derive(Debug, Deserialize)]
 #[serde(tag = "name", rename_all = "lowercase")]
+/// Every `*random` initializer's bounds are optional, because Wallpaper Engine
+/// omits a field that still holds its default. Eight presets across
+/// `scene_example3` and `scene_example4` write `colorrandom` as bare
+/// `min: "255 255 255"` (`shootingstarglow` writes both halves of that same
+/// white), and `scene_example8`'s `wet_snow1` writes `alpharandom` with neither
+/// bound at all. An absent `max` means "fixed at `min`"; an absent `min` means
+/// the neutral value for what it initialises — 1.0 for a lifetime, size or
+/// alpha, white for a colour, still for a velocity. Reading either as zero
+/// turns the particles black, or invisible, or dead on arrival.
 enum Initializer {
-    LifeTimeRandom { min: f32, max: f32, #[serde(default = "one")] exponent: f32 },
-    SizeRandom { min: f32, max: f32, #[serde(default = "one")] exponent: f32 },
-    AlphaRandom { min: f32, max: f32, #[serde(default = "one")] exponent: f32 },
-    ColorRandom { min: model::Vec3, max: model::Vec3 },
-    VelocityRandom { min: model::Vec3, max: model::Vec3 },
+    LifeTimeRandom {
+        #[serde(default)]
+        min: Option<f32>,
+        #[serde(default)]
+        max: Option<f32>,
+        #[serde(default = "one")]
+        exponent: f32,
+    },
+    SizeRandom {
+        #[serde(default)]
+        min: Option<f32>,
+        #[serde(default)]
+        max: Option<f32>,
+        #[serde(default = "one")]
+        exponent: f32,
+    },
+    AlphaRandom {
+        #[serde(default)]
+        min: Option<f32>,
+        #[serde(default)]
+        max: Option<f32>,
+        #[serde(default = "one")]
+        exponent: f32,
+    },
+    ColorRandom {
+        #[serde(default)]
+        min: Option<model::Vec3>,
+        #[serde(default)]
+        max: Option<model::Vec3>,
+    },
+    VelocityRandom {
+        #[serde(default)]
+        min: Option<model::Vec3>,
+        #[serde(default)]
+        max: Option<model::Vec3>,
+    },
     TurbulentVelocityRandom {
         #[serde(default = "one")]
         scale: f32,
@@ -140,10 +219,19 @@ enum Operator {
         #[serde(default)]
         drag: f32,
     },
+    /// An omitted fade time is one second, not zero.
+    ///
+    /// Wallpaper Engine leaves out any field still holding its default, the
+    /// same convention the initializers follow. Of the corpus's forty-four
+    /// `alphafade` operators, twenty-eight name no `fadeouttime` and fourteen
+    /// name neither field — reading those as zero makes the operator a no-op,
+    /// and a no-op is not something a scene serializes fourteen times. An
+    /// *explicit* zero still means no fade, which is the distinction serde's
+    /// `default` draws for free.
     AlphaFade {
-        #[serde(default)]
+        #[serde(default = "one")]
         fadeintime: f32,
-        #[serde(default)]
+        #[serde(default = "one")]
         fadeouttime: f32,
     },
     OscillateAlpha {
@@ -252,6 +340,15 @@ pub struct Placement {
     /// Per-particle integration-step ceiling. `MAX_STEPS` for an exact still;
     /// the live simulator sets it lower to bound the per-frame cost.
     pub max_sim_steps: u32,
+    /// The object's roll, in radians, applied to the system's local space —
+    /// so the emitter box turns and gravity leans with it.
+    ///
+    /// A particle layer rasterizes to the whole canvas, so rolling its quad in
+    /// the compositor would swing the entire field about the canvas centre
+    /// instead of about the emitter. It has to happen here. Thirty-one of
+    /// `scene_example8`'s systems carry one, including two smoke banks at
+    /// roughly ±90 degrees.
+    pub roll: (f32, f32),
 }
 
 /// The exact-integration step ceiling (`MAX_STEPS`), for the still exporter.
@@ -259,7 +356,10 @@ pub const EXACT_SIM_STEPS: u32 = MAX_STEPS;
 
 /// A live particle's local position (sim units) to an output-pixel point.
 fn to_screen(place: &Placement, local: Vec2) -> Point {
-    let scaled = Vec2::new(local.x * place.scale.x, -local.y * place.scale.y) * place.px_per_unit;
+    // Roll in the system's own (Y-up) space, before the flip to image rows.
+    let (cos, sin) = place.roll;
+    let rolled = Vec2::new(local.x * cos - local.y * sin, local.x * sin + local.y * cos);
+    let scaled = Vec2::new(rolled.x * place.scale.x, -rolled.y * place.scale.y) * place.px_per_unit;
     let p = place.origin_px + scaled;
     Point::from_xy(p.x, p.y)
 }
@@ -349,15 +449,19 @@ fn roll(preset: &Preset, emitter: &Emitter, flow: &Perlin, mut rng: Pcg64Mcg) ->
     for init in &preset.initializer {
         match init {
             Initializer::LifeTimeRandom { min, max, exponent } => {
-                r.lifetime = rpow(&mut rng, *min, *max, *exponent).max(0.01);
+                let (low, high) = bounds(*min, *max, 1.0);
+                r.lifetime = rpow(&mut rng, low, high, *exponent).max(0.01);
             }
             Initializer::SizeRandom { min, max, exponent } => {
-                r.size = rpow(&mut rng, *min, *max, *exponent).max(0.0);
+                let (low, high) = bounds(*min, *max, 1.0);
+                r.size = rpow(&mut rng, low, high, *exponent).max(0.0);
             }
             Initializer::AlphaRandom { min, max, exponent } => {
-                r.alpha = rpow(&mut rng, *min, *max, *exponent).clamp(0.0, 1.0);
+                let (low, high) = alpha_bounds(*min, *max);
+                r.alpha = rpow(&mut rng, low, high, *exponent).clamp(0.0, 1.0);
             }
             Initializer::ColorRandom { min, max } => {
+                let (min, max) = bounds(*min, *max, model::Vec3::splat(255.0));
                 r.color = Vec3::new(
                     rrange(&mut rng, min.x, max.x),
                     rrange(&mut rng, min.y, max.y),
@@ -365,6 +469,7 @@ fn roll(preset: &Preset, emitter: &Emitter, flow: &Perlin, mut rng: Pcg64Mcg) ->
                 ) / 255.0;
             }
             Initializer::VelocityRandom { min, max } => {
+                let (min, max) = bounds(*min, *max, model::Vec3::default());
                 r.velocity += Vec2::new(
                     rrange(&mut rng, min.x, max.x),
                     rrange(&mut rng, min.y, max.y),
@@ -552,24 +657,59 @@ fn seed(salt: u64, n: u64) -> Pcg64Mcg {
 
 /// A soft round sprite: a radial gradient from the particle colour at full
 /// weight to fully transparent at the rim.
-fn halo_paint(color: Vec3, weight: f32, center: Point, radius: f32) -> Option<Paint<'static>> {
+/// Draw the sprite for one particle, tinted and scaled to its rect.
+///
+/// The sprite is a `Pattern` rather than a `draw_pixmap` blit because the
+/// pattern shader carries the blend mode and the scale transform together, and
+/// because tinting has to happen anyway: tiny-skia has no colour filter, so a
+/// tinted copy is built once per (sprite, quantised colour) and reused. Most
+/// systems fix their colour, so the cache almost always holds one entry.
+fn tinted_sprite<'a>(
+    cache: &'a mut HashMap<(u64, u32), Pixmap>,
+    key: u64,
+    base: &Pixmap,
+    color: Vec3,
+) -> &'a Pixmap {
     let rgb = color.clamp(Vec3::ZERO, Vec3::ONE);
-    let stop = |offset: f32, a: f32| {
-        GradientStop::new(offset, Color::from_rgba(rgb.x, rgb.y, rgb.z, (weight * a).clamp(0.0, 1.0)).unwrap_or(Color::BLACK))
-    };
-    let shader = RadialGradient::new(
-        center,
-        0.0,
-        center,
-        radius.max(0.5),
-        vec![stop(0.0, 1.0), stop(0.35, 0.5), stop(1.0, 0.0)],
-        SpreadMode::Pad,
-        Transform::identity(),
-    )?;
-    Some(Paint { shader, blend_mode: BlendMode::Plus, anti_alias: true, ..Paint::default() })
+    let quantized = (quantize(rgb.x) << 16) | (quantize(rgb.y) << 8) | quantize(rgb.z);
+    cache.entry((key, quantized)).or_insert_with(|| {
+        let mut tinted = base.clone();
+        for pixel in tinted.pixels_mut() {
+            // Premultiplied throughout, so scaling RGB alone keeps it valid.
+            let (r, g, b, a) = (pixel.red(), pixel.green(), pixel.blue(), pixel.alpha());
+            *pixel = PremultipliedColorU8::from_rgba(
+                channel(r, rgb.x),
+                channel(g, rgb.y),
+                channel(b, rgb.z),
+                a,
+            )
+            .unwrap_or(*pixel);
+        }
+        tinted
+    })
 }
 
-fn draw_particle(pixmap: &mut Pixmap, place: &Placement, renderer: &Renderer, live: &Live) {
+#[expect(clippy::cast_sign_loss, reason = "clamped to 0.0..=1.0 before the cast")]
+fn quantize(value: f32) -> u32 {
+    (value.clamp(0.0, 1.0) * 31.0).round() as u32
+}
+
+#[expect(clippy::cast_sign_loss, reason = "a product of clamped 0..=1 factors")]
+fn channel(value: u8, factor: f32) -> u8 {
+    (f32::from(value) * factor.clamp(0.0, 1.0)).round() as u8
+}
+
+#[expect(clippy::too_many_arguments, reason = "one particle's full draw state")]
+fn draw_particle(
+    pixmap: &mut Pixmap,
+    place: &Placement,
+    renderer: &Renderer,
+    live: &Live,
+    blend: model::Blend,
+    base: &Pixmap,
+    cache: &mut HashMap<(u64, u32), Pixmap>,
+    cache_key: u64,
+) {
     let over = &place.overrides;
     let center = to_screen(place, live.pos);
     let radius = 0.5 * live.size * place.scale.x.abs() * over.size.max(0.0) * place.px_per_unit;
@@ -577,8 +717,11 @@ fn draw_particle(pixmap: &mut Pixmap, place: &Placement, renderer: &Renderer, li
         return;
     }
 
-    let color = over.colorn.map_or(live.color, |c| Vec3::new(c.x, c.y, c.z)) * place.tint;
+    let color = over.colorn.map_or(live.color, |c| Vec3::new(c.x, c.y, c.z))
+        * place.tint
+        * over.brightness.max(0.0);
     let weight = live.alpha * place.alpha * over.alpha.max(0.0);
+    let sprite = tinted_sprite(cache, cache_key, base, color);
 
     if let Renderer::SpriteTrail { length } = renderer
         && *length > 0.0
@@ -588,7 +731,9 @@ fn draw_particle(pixmap: &mut Pixmap, place: &Placement, renderer: &Renderer, li
         if back > 1.0 {
             let dir = vel_px.normalize_or_zero();
             let tail = Point::from_xy(center.x - dir.x * back, center.y - dir.y * back);
-            if let Some(paint) = halo_paint(color, weight * 0.6, center, radius.max(1.0)) {
+            if let Some(paint) = sprite_rect(sprite, center, radius.max(1.0))
+                .and_then(|rect| sprite_paint(sprite, weight * 0.6, rect, blend))
+            {
                 let mut pb = PathBuilder::new();
                 pb.move_to(center.x, center.y);
                 pb.line_to(tail.x, tail.y);
@@ -600,11 +745,69 @@ fn draw_particle(pixmap: &mut Pixmap, place: &Placement, renderer: &Renderer, li
         }
     }
 
-    let Some(paint) = halo_paint(color, weight, center, radius) else {
+    let Some(rect) = sprite_rect(sprite, center, radius) else {
         return;
     };
-    if let Some(path) = PathBuilder::from_circle(center.x, center.y, radius) {
-        pixmap.fill_path(&path, &paint, FillRule::Winding, Transform::identity(), None);
+    let Some(paint) = sprite_paint(sprite, weight, rect, blend) else {
+        return;
+    };
+    pixmap.fill_rect(rect, &paint, Transform::identity(), None);
+}
+
+/// The particle's on-screen rectangle: `radius` sets the longer side, and the
+/// sprite's own aspect sets the other.
+///
+/// Squashing every sprite into a square turns a streak into a blob.
+/// `scene_example8`'s rain uses a 256x1280 sheet — five times taller than it is
+/// wide — and Wallpaper Engine draws it as the thin falling line it is.
+fn sprite_rect(sprite: &Pixmap, center: Point, radius: f32) -> Option<Rect> {
+    #[expect(clippy::cast_precision_loss, reason = "sprite sides are at most 1024")]
+    let (sw, sh) = (sprite.width() as f32, sprite.height() as f32);
+    if sw <= 0.0 || sh <= 0.0 {
+        return None;
+    }
+    let longest = sw.max(sh);
+    let (half_w, half_h) = (radius * sw / longest, radius * sh / longest);
+    Rect::from_xywh(center.x - half_w, center.y - half_h, half_w * 2.0, half_h * 2.0)
+}
+
+/// Paint that maps `sprite` onto `rect`, at `weight` opacity.
+fn sprite_paint(
+    sprite: &Pixmap,
+    weight: f32,
+    rect: Rect,
+    blend: model::Blend,
+) -> Option<Paint<'_>> {
+    #[expect(clippy::cast_precision_loss, reason = "sprite sides are at most 1024")]
+    let (sw, sh) = (sprite.width() as f32, sprite.height() as f32);
+    if sw <= 0.0 || sh <= 0.0 {
+        return None;
+    }
+    let transform = Transform::from_row(
+        rect.width() / sw,
+        0.0,
+        0.0,
+        rect.height() / sh,
+        rect.x(),
+        rect.y(),
+    );
+    let shader = Pattern::new(
+        sprite.as_ref(),
+        SpreadMode::Pad,
+        FilterQuality::Bilinear,
+        weight.clamp(0.0, 1.0),
+        transform,
+    );
+    Some(Paint { shader, blend_mode: blend_mode(blend), anti_alias: true, ..Paint::default() })
+}
+
+/// `Plus` sums overlapping particles, which is what an additive material does;
+/// a translucent one must let the nearest particle cover the rest, or a dense
+/// system clips to white.
+fn blend_mode(blend: model::Blend) -> BlendMode {
+    match blend {
+        model::Blend::Add => BlendMode::Plus,
+        model::Blend::Over => BlendMode::SourceOver,
     }
 }
 
@@ -624,6 +827,7 @@ fn render_preset(
     salt: u64,
     depth: u32,
     unsupported: &mut Vec<String>,
+    cache: &mut HashMap<(u64, u32), Pixmap>,
 ) {
     let Some(preset) = presets.get(key) else {
         return;
@@ -644,7 +848,7 @@ fn render_preset(
         for child in children.clone().filter(|child| child.r#type != "eventfollow") {
             render_preset(
                 presets, &child.name, pixmap, place, time, starttime,
-                salt ^ fnv1a(&child.name), depth + 1, unsupported,
+                salt ^ fnv1a(&child.name), depth + 1, unsupported, cache,
             );
         }
     }
@@ -664,15 +868,17 @@ fn render_preset(
         })
         .collect();
 
+    let base = preset.sprite.clone().unwrap_or_else(|| sprite::stand_in("particle/halo"));
+    let cache_key = fnv1a(key);
     for (n, birth, live) in &alive {
-        draw_particle(pixmap, place, renderer, live);
+        draw_particle(pixmap, place, renderer, live, preset.blend, &base, cache, cache_key);
         if depth + 1 < MAX_DEPTH {
             for child in children.clone().filter(|child| child.r#type == "eventfollow") {
                 let at = to_screen(place, live.pos);
                 let child_place = Placement { origin_px: Vec2::new(at.x, at.y), ..place.clone() };
                 render_preset(
                     presets, &child.name, pixmap, &child_place, time, *birth,
-                    salt ^ n.wrapping_mul(0x9E37_79B9), depth + 1, unsupported,
+                    salt ^ n.wrapping_mul(0x9E37_79B9), depth + 1, unsupported, cache,
                 );
             }
         }
@@ -750,7 +956,10 @@ pub fn render_system_from(
     let mut unsupported = Vec::new();
 
     let salt = 0x5EED_u64.wrapping_add(fnv1a(preset_path));
-    render_preset(presets, preset_path, &mut pixmap, place, time, start, salt, 0, &mut unsupported);
+    let mut tints = HashMap::new();
+    render_preset(
+        presets, preset_path, &mut pixmap, place, time, start, salt, 0, &mut unsupported, &mut tints,
+    );
 
     Ok(ParticleLayer { image: pixmap_to_rgba(&pixmap), unsupported })
 }
@@ -765,7 +974,14 @@ fn collect_presets(
         return Ok(());
     }
     let bytes = archive.read(key).with_context(|| format!("reading {key}"))?;
-    let preset: Preset = serde_json::from_slice(&bytes).with_context(|| format!("parsing {key}"))?;
+    let mut preset: Preset = serde_json::from_slice(&bytes).with_context(|| format!("parsing {key}"))?;
+    let material = read_material(archive, &preset.material);
+    preset.blend = material.as_ref().map_or(model::Blend::Add, model::base_blend);
+    preset.sprite = Some(sprite::resolve(
+        archive,
+        None,
+        material.as_ref().and_then(model::base_texture).unwrap_or("particle/halo"),
+    ));
     let child_names: Vec<String> =
         preset.children.iter().flatten().map(|c| c.name.clone()).collect();
     out.insert(key.to_string(), preset);
@@ -775,19 +991,35 @@ fn collect_presets(
     Ok(())
 }
 
-/// The blend the preset's material asks for. Every preset in the wild is
-/// `additive`, which is also the fallback if anything about the lookup fails.
+/// The blend the root preset's material asks for — how the whole rasterized
+/// layer meets the scene. `additive` is the fallback if the lookup fails.
 pub fn layer_blend(archive: &mut Archive, preset_path: &str) -> model::Blend {
     read_blend(archive, preset_path).unwrap_or(model::Blend::Add)
 }
 
 fn read_blend(archive: &mut Archive, preset_path: &str) -> Option<model::Blend> {
     let preset: Preset = serde_json::from_slice(&archive.read(preset_path).ok()?).ok()?;
-    if preset.material.is_empty() {
+    material_blend(archive, &preset.material)
+}
+
+/// Whether the root preset's material refracts the frame behind it, which the
+/// compositor reproduces by multiplying the layer into the frame.
+pub fn layer_refracts(archive: &mut Archive, preset_path: &str) -> bool {
+    let Ok(bytes) = archive.read(preset_path) else { return false };
+    let Ok(preset) = serde_json::from_slice::<Preset>(&bytes) else { return false };
+    read_material(archive, &preset.material).is_some_and(|material| model::base_refracts(&material))
+}
+
+/// The blend one material file asks for.
+fn material_blend(archive: &mut Archive, material_path: &str) -> Option<model::Blend> {
+    Some(model::base_blend(&read_material(archive, material_path)?))
+}
+
+fn read_material(archive: &mut Archive, material_path: &str) -> Option<Material> {
+    if material_path.is_empty() {
         return None;
     }
-    let material: Material = serde_json::from_slice(&archive.read(&preset.material).ok()?).ok()?;
-    Some(model::base_blend(&material))
+    serde_json::from_slice(&archive.read(material_path).ok()?).ok()
 }
 
 fn fnv1a(text: &str) -> u64 {
@@ -799,11 +1031,22 @@ fn fnv1a(text: &str) -> u64 {
     hash
 }
 
+/// Undo tiny-skia's premultiplication into a plain RGBA image.
+///
+/// `demultiply` costs a division per channel, and a particle canvas is mostly
+/// empty — the two saturated cases need no division at all, and skipping them
+/// is most of this function's cost on a scene with dozens of systems.
 fn pixmap_to_rgba(pixmap: &Pixmap) -> RgbaImage {
     let mut out = RgbaImage::new(pixmap.width(), pixmap.height());
     for (dst, src) in out.pixels_mut().zip(pixmap.pixels()) {
-        let c = src.demultiply();
-        dst.0 = [c.red(), c.green(), c.blue(), c.alpha()];
+        dst.0 = match src.alpha() {
+            0 => [0, 0, 0, 0],
+            255 => [src.red(), src.green(), src.blue(), 255],
+            _ => {
+                let c = src.demultiply();
+                [c.red(), c.green(), c.blue(), c.alpha()]
+            }
+        };
     }
     out
 }
@@ -834,6 +1077,38 @@ mod tests {
         assert!(matches!(p.emitter[0], Emitter::BoxRandom { .. }));
         assert!(matches!(p.renderer[0], Renderer::SpriteTrail { .. }));
         assert_eq!(p.initializer.len(), 2);
+    }
+
+    #[test]
+    fn a_colorrandom_without_a_max_is_a_fixed_colour() {
+        // Half the corpus's colorrandom entries write only `min`; reading the
+        // absent `max` as zero would turn every such particle black.
+        let p = preset(r#"{"initializer":[{"name":"colorrandom","min":"255 255 255"}]}"#);
+        let Initializer::ColorRandom { min, max } = &p.initializer[0] else {
+            panic!("expected a colorrandom initializer");
+        };
+        assert_eq!(bounds(*min, *max, model::Vec3::splat(255.0)).1, model::Vec3::splat(255.0));
+    }
+
+    #[test]
+    fn an_initializer_with_no_bounds_at_all_is_neutral() {
+        // `scene_example8`'s wet_snow1 writes a bare `{"name":"alpharandom"}`,
+        // which means the whole range: reading it as a fixed 1.0 makes the
+        // initializer a no-op and every snowflake a solid white disc.
+        let p = preset(r#"{"initializer":[{"name":"alpharandom"}]}"#);
+        let Initializer::AlphaRandom { min, max, .. } = &p.initializer[0] else {
+            panic!("expected an alpharandom initializer");
+        };
+        assert_eq!(alpha_bounds(*min, *max), (0.0, 1.0));
+    }
+
+    #[test]
+    fn an_alpha_bound_given_only_as_a_maximum_starts_at_zero() {
+        // `rainperspective` writes `{"max": 0.3}`. Defaulting the absent `min`
+        // to 1.0 would invert the range outright.
+        assert_eq!(alpha_bounds(None, Some(0.3)), (0.0, 0.3));
+        // `wind-blur` writes `{"min": 0.8}`, which still pins both ends.
+        assert_eq!(alpha_bounds(Some(0.8), None), (0.8, 0.8));
     }
 
     #[test]

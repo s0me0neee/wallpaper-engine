@@ -8,6 +8,8 @@ pub mod model;
 pub mod particle;
 pub mod puppet;
 pub mod render;
+pub mod sprite;
+pub mod text;
 
 use anyhow::{Context, Result};
 use model::Scene;
@@ -17,5 +19,5 @@ pub fn load(archive: &mut crate::pkg::Archive) -> Result<Scene> {
     let bytes = archive
         .read("scene.json")
         .context("the package has no scene.json")?;
-    serde_json::from_slice(&bytes).context("parsing scene.json")
+    model::parse_scene(&bytes).context("parsing scene.json")
 }

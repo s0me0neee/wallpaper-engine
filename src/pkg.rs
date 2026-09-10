@@ -126,6 +126,11 @@ impl Archive {
         self.index.values().map(|entry| entry.path.as_str())
     }
 
+    /// Whether the archive holds an entry, without reading it.
+    pub fn contains(&self, path: &str) -> bool {
+        self.index.contains_key(&normalize(path))
+    }
+
     /// Read one entry into memory.
     pub fn read(&mut self, path: &str) -> Result<Vec<u8>> {
         let entry = self

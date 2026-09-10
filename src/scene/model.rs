@@ -84,6 +84,105 @@ fn r#true() -> bool {
     true
 }
 
+/// Parse `scene.json`, reducing driven values to their static defaults first.
+pub fn parse_scene(bytes: &[u8]) -> Result<Scene, serde_json::Error> {
+    let mut document: Value = serde_json::from_slice(bytes)?;
+    hoist_alpha_tracks(&mut document);
+    strip_driven_values(&mut document);
+    Scene::deserialize(document)
+}
+
+/// What can sit beside `value` and turn a plain number into a driven one.
+///
+/// - `user` — bound to one of the wallpaper's own settings
+///   (`project.json`'s `general.properties`), written as
+///   `{"user": "moon", "value": true}`, or as
+///   `{"user": {"name": "clock", "condition": "1"}, "value": false}` when a
+///   layer belongs to one setting of a combo.
+/// - `script` / `scriptproperties` — driven by the wallpaper's own JavaScript.
+///   `scene_example6` positions a layer with a script that multiplies a slider
+///   by the canvas size, and writes the JS source inline.
+/// - `animation` — driven by a keyframe track.
+/// - `frame` — a keyframe control point (`c0`/`c1`/`c2`, each with `back`,
+///   `front`, `lockangle` and `locklength` beside it).
+const DRIVER_KEYS: [&str; 5] = ["user", "script", "scriptproperties", "animation", "frame"];
+
+/// Replace every driven value in the document with the static value under it.
+///
+/// Any value in `scene.json` can be driven rather than fixed, and is then
+/// written as an object carrying the driver plus a `value` — the one the
+/// wallpaper was published with, and the one we take. It reaches keys no struct
+/// here names (`pointsize`, `text.scriptproperties.use24hFormat`, individual
+/// `constantshadervalues` entries), which is why this runs over the whole
+/// document rather than field by field.
+///
+/// A driver key has to be present: `constantshadervalues` is a free-form map of
+/// material keys, so an object that merely *has* a `value` key may well be a
+/// pass's uniform table with a uniform called "value" in it.
+///
+/// Honouring a *changed* user setting would mean reading `project.json`, which
+/// the scene loader deliberately never opens; across the corpus the two agree
+/// except for `scene_example4`'s cloud opacity (0.3 here, 0.2 there). Script-
+/// and animation-driven values are simply frozen at their published value.
+/// Copy each object's `alpha` keyframe track somewhere `strip_driven_values`
+/// will not eat it.
+///
+/// The strip below replaces every driven value with the static one under it,
+/// which is right for a user setting or a script but throws away a track that
+/// genuinely varies. Alpha is the one that changes what is on screen rather
+/// than how it looks: `scene_example8`'s intro watermark fades 1 → 0 over its
+/// first seven seconds, and frozen at its published 1.0 it would sit on the
+/// wallpaper forever.
+/// Where `hoist_alpha_tracks` parks the track, and the key `strip_driven_values`
+/// leaves alone.
+const HOISTED_TRACK: &str = "alphatrack";
+
+fn hoist_alpha_tracks(node: &mut Value) {
+    let Some(objects) = node.get_mut("objects").and_then(Value::as_array_mut) else {
+        return;
+    };
+    for object in objects {
+        let Some(map) = object.as_object_mut() else { continue };
+        let track = map
+            .get("alpha")
+            .and_then(|alpha| alpha.get("animation"))
+            .cloned();
+        if let Some(track) = track {
+            map.insert(HOISTED_TRACK.to_string(), track);
+        }
+    }
+}
+
+fn strip_driven_values(node: &mut Value) {
+    match node {
+        Value::Object(map) => {
+            if DRIVER_KEYS.iter().any(|key| map.contains_key(*key))
+                && let Some(mut value) = map.remove("value")
+            {
+                strip_driven_values(&mut value);
+                *node = value;
+                return;
+            }
+            for (key, value) in map.iter_mut() {
+                // `hoist_alpha_tracks` put a keyframe track here precisely so
+                // it would survive; every control point in it carries `frame`,
+                // which is itself a driver key, so stripping would collapse the
+                // whole track to a list of bare numbers.
+                if key == HOISTED_TRACK {
+                    continue;
+                }
+                strip_driven_values(value);
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                strip_driven_values(item);
+            }
+        }
+        _ => {}
+    }
+}
+
 /// The root of `scene.json`.
 #[derive(Debug, Deserialize)]
 pub struct Scene {
@@ -119,6 +218,60 @@ pub struct General {
     pub clearenabled: bool,
     #[serde(default = "one")]
     pub zoom: f32,
+    /// Scene-wide bloom over the finished frame. On for `scene_example4` and
+    /// `scene_example8`, and on the latter it is the whole sunset: without it
+    /// the sun is a few lit cloud edges rather than a glow.
+    #[serde(default)]
+    pub bloom: bool,
+    /// Render the frame in floating point. Without it a shader result above 1.0
+    /// clamps at the end of every pass, and a bloom threshold has nothing left
+    /// to extract — see `pass::Format`.
+    #[serde(default)]
+    pub hdr: bool,
+    #[serde(default = "bloom_strength")]
+    pub bloomstrength: f32,
+    #[serde(default = "bloom_threshold")]
+    pub bloomthreshold: f32,
+    #[serde(default = "vec3_one")]
+    pub bloomtint: Vec3,
+    /// The HDR bloom's own strength/threshold, plus how far it spreads. A scene
+    /// with `hdr` set tunes these and leaves the pair above at their defaults —
+    /// `scene_example8` writes 0.12/0.55/0.67 here and stock 2.0/0.65 there —
+    /// so reading the wrong pair drives the bloom at sixteen times its
+    /// intended strength.
+    #[serde(default = "bloom_hdr_strength")]
+    pub bloomhdrstrength: f32,
+    #[serde(default = "bloom_hdr_threshold")]
+    pub bloomhdrthreshold: f32,
+    #[serde(default = "bloom_hdr_scatter")]
+    pub bloomhdrscatter: f32,
+    #[serde(default = "bloom_hdr_iterations")]
+    pub bloomhdriterations: u32,
+}
+
+/// `downsample_quarter_bloom.frag`'s own annotation defaults.
+fn bloom_strength() -> f32 {
+    2.0
+}
+
+fn bloom_threshold() -> f32 {
+    0.65
+}
+
+fn bloom_hdr_strength() -> f32 {
+    2.0
+}
+
+fn bloom_hdr_threshold() -> f32 {
+    1.0
+}
+
+fn bloom_hdr_scatter() -> f32 {
+    1.619
+}
+
+fn bloom_hdr_iterations() -> u32 {
+    8
 }
 
 #[derive(Debug, Clone, Copy, Deserialize)]
@@ -139,6 +292,11 @@ pub struct Object {
     #[serde(default)]
     pub id: i64,
 
+    /// Id of the object this one is parented to. A scene is a tree, and
+    /// `origin`/`scale`/`angles` below are relative to this parent.
+    #[serde(default)]
+    pub parent: Option<i64>,
+
     /// Path to a model JSON, for image layers.
     #[serde(default)]
     pub image: Option<String>,
@@ -154,6 +312,19 @@ pub struct Object {
     #[serde(default)]
     pub sound: Option<Vec<String>>,
 
+    /// A text layer's string. Usually the design-time preview of a script — see
+    /// `scene::text`.
+    #[serde(default)]
+    pub text: Option<String>,
+    /// The font: a path inside the package or the engine's assets, or
+    /// `systemfont_<family>`.
+    #[serde(default)]
+    pub font: Option<String>,
+    #[serde(default = "text_point_size")]
+    pub pointsize: f32,
+    #[serde(default)]
+    pub horizontalalign: Option<String>,
+
     /// Centre of the object in scene units.
     #[serde(default)]
     pub origin: Vec3,
@@ -167,12 +338,23 @@ pub struct Object {
 
     #[serde(default = "one")]
     pub alpha: f32,
+    /// The `alpha` keyframe track, preserved by `hoist_alpha_tracks` from the
+    /// driver object `strip_driven_values` would otherwise flatten.
+    #[serde(default)]
+    pub alphatrack: Option<Track>,
     #[serde(default = "vec3_one")]
     pub color: Vec3,
     #[serde(default = "one")]
     pub brightness: f32,
     #[serde(default = "r#true")]
     pub visible: bool,
+    /// Photoshop-style blend of this layer against the frame beneath it, in
+    /// `weBlendColor`'s numbering. Distinct from the material's
+    /// `translucent`/`additive`, which is GL blend state; this one needs the
+    /// destination in the shader. Zero — plain alpha-over — on every corpus
+    /// object but four, all in `scene_example8`.
+    #[serde(default, rename = "colorBlendMode")]
+    pub color_blend_mode: i32,
 
     /// Post-process effects. Not applied yet; their presence is what tells the
     /// user the still is missing something.
@@ -212,6 +394,11 @@ pub struct InstanceOverride {
     pub speed: f32,
     #[serde(default = "one")]
     pub alpha: f32,
+    /// Multiplies the particle's colour, and goes well past 1: `scene_example8`
+    /// drives its orange snow at 10, which is what turns a dim sprite into an
+    /// ember. Applied after `colorn`, so it scales the override too.
+    #[serde(default = "one")]
+    pub brightness: f32,
     /// A normalised RGB that replaces whatever colour the preset would pick.
     #[serde(default)]
     pub colorn: Option<Vec3>,
@@ -219,7 +406,15 @@ pub struct InstanceOverride {
 
 impl Default for InstanceOverride {
     fn default() -> Self {
-        InstanceOverride { count: 1.0, rate: 1.0, size: 1.0, speed: 1.0, alpha: 1.0, colorn: None }
+        InstanceOverride {
+            count: 1.0,
+            rate: 1.0,
+            size: 1.0,
+            speed: 1.0,
+            alpha: 1.0,
+            brightness: 1.0,
+            colorn: None,
+        }
     }
 }
 
@@ -234,6 +429,87 @@ pub fn is_particle(object: &Object) -> bool {
 
 pub fn is_sound(object: &Object) -> bool {
     object.sound.is_some()
+}
+
+pub fn is_text(object: &Object) -> bool {
+    object.text.is_some()
+}
+
+/// A keyframe track on one scalar property.
+///
+/// Only channel `c0` is read: the tracks that matter here drive a single
+/// number. The control points carry bezier tangents (`back`/`front`) which are
+/// ignored — the segments in the corpus are straight ramps, and a linear read
+/// of a straight ramp is exact.
+#[derive(Debug, Clone, Deserialize)]
+pub struct Track {
+    #[serde(default)]
+    pub c0: Vec<Keyframe>,
+    #[serde(default)]
+    pub options: TrackOptions,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize)]
+pub struct Keyframe {
+    #[serde(default)]
+    pub frame: f32,
+    #[serde(default)]
+    pub value: f32,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct TrackOptions {
+    #[serde(default = "track_fps")]
+    pub fps: f32,
+    #[serde(default)]
+    pub length: f32,
+    /// `"single"` plays once and holds; anything else repeats.
+    #[serde(default)]
+    pub mode: String,
+}
+
+impl Default for TrackOptions {
+    fn default() -> Self {
+        TrackOptions { fps: track_fps(), length: 0.0, mode: String::new() }
+    }
+}
+
+fn track_fps() -> f32 {
+    60.0
+}
+
+/// Sample `track` at `seconds`, or `None` when it has no keyframes.
+pub fn sample_track(track: &Track, seconds: f32) -> Option<f32> {
+    let first = track.c0.first()?;
+    let last = track.c0.last()?;
+    let mut frame = seconds * track.options.fps.max(1e-3);
+    if track.options.mode != "single" && track.options.length > 0.0 {
+        frame = frame.rem_euclid(track.options.length);
+    }
+
+    if frame <= first.frame {
+        return Some(first.value);
+    }
+    if frame >= last.frame {
+        return Some(last.value);
+    }
+    for pair in track.c0.windows(2) {
+        let [a, b] = pair else { continue };
+        if frame >= a.frame && frame <= b.frame {
+            let span = b.frame - a.frame;
+            if span <= 0.0 {
+                return Some(b.value);
+            }
+            let t = (frame - a.frame) / span;
+            return Some(a.value + (b.value - a.value) * t);
+        }
+    }
+    Some(last.value)
+}
+
+/// Wallpaper Engine's own default point size for a text layer.
+fn text_point_size() -> f32 {
+    32.0
 }
 
 /// A human name for an object: its `name` when it has one, else `object <id>`.
@@ -268,6 +544,13 @@ pub struct EffectPass {
     /// Material keys bound to shader uniforms for this pass.
     #[serde(default)]
     pub constantshadervalues: Map<String, Value>,
+    /// Combo values the wallpaper picked for this pass, overriding the
+    /// shader's own `[COMBO]` defaults. This is how a separable blur's second
+    /// pass is told to run vertically: `godrays`, `shine` and `blurprecise`
+    /// all write `{"VERTICAL": 1}` here, and without it both halves of the
+    /// gaussian blur the same axis.
+    #[serde(default)]
+    pub combos: Map<String, Value>,
     /// Texture slots, indexed by slot number: `textures[1]` is `g_Texture1`.
     /// Entry 0 stands for `g_Texture0`, which is always the previous pass, and
     /// is written as `null`. `null` elsewhere means "use the shader's own
@@ -286,12 +569,53 @@ pub struct EffectPass {
 pub struct EffectDefinition {
     #[serde(default)]
     pub passes: Vec<EffectDefinitionPass>,
+    /// Intermediate render targets the passes write to and read back.
+    #[serde(default)]
+    pub fbos: Vec<EffectFbo>,
+}
+
+/// One intermediate render target. `scale` is a divisor on the layer's size,
+/// not a multiplier: `blur` does its gaussian at 4 (quarter resolution) and
+/// `godrays`/`shine` at 2. Ignoring it does not merely cost sharpness — the
+/// blur offsets are in texels of *this* target, so running the same pass at
+/// full size blurs by a quarter as much.
+#[derive(Debug, Deserialize)]
+pub struct EffectFbo {
+    pub name: String,
+    #[serde(default = "one")]
+    pub scale: f32,
 }
 
 #[derive(Debug, Deserialize)]
 pub struct EffectDefinitionPass {
-    /// Path to the `materials/*.json` this pass renders with.
-    pub material: String,
+    /// Path to the `materials/*.json` this pass renders with. Absent on a pass
+    /// that is a render-target command instead of a draw: `motionblur` writes
+    /// `{"command":"copy","target":"_rt_FullCompoBuffer1", ...}` to carry its
+    /// accumulation buffer over to the next frame. Such a pass has no entry in
+    /// the scene's own `passes` list either — `scene_example3` gives motionblur
+    /// two, for the three here.
+    #[serde(default)]
+    pub material: Option<String>,
+    /// The `fbos` entry this pass renders into. Absent means the chain's own
+    /// output, which is what the last pass of an effect writes.
+    #[serde(default)]
+    pub target: Option<String>,
+    /// Where this pass's sampler slots come from. This — not the scene's
+    /// `textures[]` — is what decides a pass's inputs: `godrays`'s combine
+    /// pass binds its half-res rays at slot 0 and `previous` at slot 1, and
+    /// `blur`'s binds `previous` at slot 2.
+    #[serde(default)]
+    pub bind: Vec<EffectBind>,
+}
+
+/// One entry of a pass's `bind` list. `name` is either `"previous"` — the
+/// image the *effect* was handed, not the previous pass's output — or one of
+/// the effect's own `fbos`.
+#[derive(Debug, Deserialize)]
+pub struct EffectBind {
+    pub name: String,
+    #[serde(default)]
+    pub index: usize,
 }
 
 /// `models/*.json` — the indirection between an object and its material.
@@ -323,6 +647,9 @@ pub struct MaterialPass {
     /// extension. A slot may be null when the shader supplies it another way.
     #[serde(default)]
     pub textures: Vec<Option<String>>,
+    /// Combo values the material pins on its shader.
+    #[serde(default)]
+    pub combos: Map<String, Value>,
 }
 
 /// The texture the layer is actually made of: slot 0 of the first pass.
@@ -359,6 +686,20 @@ pub fn parse_blend(name: &str) -> Blend {
 /// The blend mode of the layer's base pass (slot 0 of the first pass).
 pub fn base_blend(material: &Material) -> Blend {
     material.passes.first().map_or(Blend::Over, |pass| parse_blend(&pass.blending))
+}
+
+/// Whether the material's base pass refracts the frame behind it.
+///
+/// `genericparticle.frag` under `#if REFRACT` binds `_rt_FullFrameBuffer` and
+/// finishes with `color.rgb *= texSample2D(g_Texture3, refractTexCoord).rgb` —
+/// the particle *multiplies* what is behind it rather than covering it. A white
+/// sprite over a dark sky therefore disappears, which is why `scene_example8`'s
+/// wet snow is invisible in Wallpaper Engine and was a field of white discs
+/// here. Nine of `scene_example6`'s particle materials declare it too.
+pub fn base_refracts(material: &Material) -> bool {
+    material.passes.first().is_some_and(|pass| {
+        pass.combos.get("REFRACT").and_then(Value::as_i64).unwrap_or(0) != 0
+    })
 }
 
 #[cfg(test)]
@@ -408,6 +749,122 @@ mod tests {
     }
 
     #[test]
+    fn a_user_bound_value_parses_as_the_value_it_wraps() {
+        // scene_example3 hides its girl layer behind a "girl" checkbox, and
+        // scene_example4 binds a cloud's opacity to a slider.
+        let scene = parse_scene(
+            br#"{"objects":[
+                {"image":"models/a.json","visible":{"user":"girl","value":false}},
+                {"image":"models/b.json","alpha":{"user":"opacity","value":0.25},
+                 "color":{"user":"color","value":"0.5 0.25 1.0"}}
+            ]}"#,
+        )
+        .unwrap();
+
+        assert!(!scene.objects[0].visible);
+        assert_eq!(scene.objects[1].alpha, 0.25);
+        assert_eq!(scene.objects[1].color, Vec3 { x: 0.5, y: 0.25, z: 1.0 });
+    }
+
+    #[test]
+    fn a_scripted_or_animated_value_falls_back_to_its_static_default() {
+        // `scene_example6` drives a layer's origin from inline JavaScript and
+        // `scene_example8` drives a strength from a keyframe track; both write
+        // the published value beside the driver.
+        let scene = parse_scene(
+            br#"{"objects":[
+                {"image":"models/a.json","origin":{"script":"export function update(v){return v}",
+                 "scriptproperties":{"x":0.5},"value":"1362.5 736.7 0.0"},
+                 "alpha":{"animation":{"c0":[{"frame":0,"value":1}],
+                                       "options":{"fps":60,"length":420,"mode":"single"}},"value":0.25}}
+            ]}"#,
+        )
+        .unwrap();
+
+        assert_eq!(scene.objects[0].origin, Vec3 { x: 1362.5, y: 736.7, z: 0.0 });
+        assert_eq!(scene.objects[0].alpha, 0.25);
+    }
+
+    #[test]
+    fn an_alpha_track_survives_the_strip_that_flattens_everything_else() {
+        // The strip collapses driven values to their published one, which is
+        // right for a slider and wrong for a fade: every control point carries
+        // `frame`, itself a driver key, so an unprotected track would come back
+        // as a list of bare numbers.
+        let scene = parse_scene(
+            br#"{"objects":[
+                {"image":"models/a.json",
+                 "alpha":{"animation":{"c0":[{"frame":0,"value":1},{"frame":420,"value":0}],
+                                       "options":{"fps":60,"length":420,"mode":"single"}},"value":1.0}}
+            ]}"#,
+        )
+        .unwrap();
+
+        let track = scene.objects[0].alphatrack.as_ref().expect("the track must survive");
+        assert_eq!(track.c0.len(), 2);
+        // `scene_example8`'s intro watermark fades over seven seconds; halfway
+        // in it is half gone, and past the end it stays gone.
+        assert!((sample_track(track, 0.0).unwrap() - 1.0).abs() < 1e-6);
+        assert!((sample_track(track, 3.5).unwrap() - 0.5).abs() < 1e-3);
+        assert!((sample_track(track, 30.0).unwrap() - 0.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn a_looping_track_wraps_instead_of_holding() {
+        let scene = parse_scene(
+            br#"{"objects":[
+                {"image":"models/a.json",
+                 "alpha":{"animation":{"c0":[{"frame":0,"value":0},{"frame":60,"value":1}],
+                                       "options":{"fps":60,"length":60,"mode":"loop"}},"value":1.0}}
+            ]}"#,
+        )
+        .unwrap();
+
+        let track = scene.objects[0].alphatrack.as_ref().expect("the track must survive");
+        // At 2.5s a one-second loop is halfway through its second repeat.
+        assert!((sample_track(track, 2.5).unwrap() - 0.5).abs() < 1e-3);
+    }
+
+    #[test]
+    fn a_uniform_table_is_not_mistaken_for_a_driven_value() {
+        // `constantshadervalues` is a free-form map, so a shader uniform may
+        // simply be called "value"; without a driver key beside it there is
+        // nothing to unwrap.
+        let scene = parse_scene(
+            br#"{"objects":[{"image":"models/a.json","effects":[{"file":"e.json",
+                "passes":[{"constantshadervalues":{"value":0.75}}]}]}]}"#,
+        )
+        .unwrap();
+
+        let pass = &scene.objects[0].effects[0].passes[0];
+        assert_eq!(pass.constantshadervalues["value"], Value::from(0.75));
+    }
+
+    #[test]
+    fn user_bindings_are_stripped_wherever_they_appear() {
+        // The wrapper reaches keys no struct here names, and `user` is itself a
+        // map when a layer is tied to one setting of a combo.
+        let scene = parse_scene(
+            br#"{"objects":[{
+                "image":"models/a.json",
+                "visible":{"user":{"name":"clock","condition":"1"},"value":true},
+                "pointsize":{"user":"size","value":30.0},
+                "effects":[{"file":"effects/blur/effect.json","passes":[
+                    {"constantshadervalues":{"scale":{"user":"blur","value":"0.4 0.4"}}}
+                ]}]
+            }]}"#,
+        )
+        .unwrap();
+
+        let object = &scene.objects[0];
+        assert!(object.visible);
+        assert_eq!(
+            object.effects[0].passes[0].constantshadervalues["scale"],
+            Value::String("0.4 0.4".to_string())
+        );
+    }
+
+    #[test]
     fn object_kind_comes_from_which_field_is_present() {
         let image: Object = serde_json::from_str(r#"{"image":"models/a.json"}"#).unwrap();
         let particle: Object =
@@ -417,6 +874,23 @@ mod tests {
         assert!(is_image(&image) && !is_particle(&image) && !is_sound(&image));
         assert!(is_particle(&particle) && !is_image(&particle));
         assert!(is_sound(&sound) && !is_image(&sound));
+    }
+
+    #[test]
+    fn an_effect_pass_may_be_a_command_rather_than_a_material() {
+        // motionblur's middle pass copies one render target to another; a
+        // definition that fails to parse takes the layer's whole chain with it.
+        let definition: EffectDefinition = serde_json::from_str(
+            r#"{"passes":[
+                {"material":"materials/effects/motionblur_accumulation.json","target":"_rt_FullCompoBuffer2"},
+                {"command":"copy","target":"_rt_FullCompoBuffer1","source":"_rt_FullCompoBuffer2"},
+                {"material":"materials/effects/motionblur_combine.json"}
+            ]}"#,
+        )
+        .unwrap();
+
+        assert_eq!(definition.passes.len(), 3);
+        assert!(definition.passes[1].material.is_none());
     }
 
     #[test]

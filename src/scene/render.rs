@@ -10,7 +10,7 @@
 //! plain composite and reported as omissions (plan.md §4.7).
 
 use super::compose::{self, Composite};
-use super::model::{self, Effect, EffectDefinition, Material, Scene};
+use super::model::{self, Effect, EffectBind, EffectDefinition, Material, Scene};
 use crate::export::Resolution;
 use crate::pkg::Archive;
 use crate::render::{capture, gpu::Gpu, pass};
@@ -125,9 +125,18 @@ pub fn render_frame(archive: &mut Archive, scene: &Scene, resolution: Option<Res
         .layers
         .iter()
         .enumerate()
-        .filter(|(_, layer)| model::visible_effects(layer.object).next().is_some())
+        .filter(|(_, layer)| !layer.composition && model::visible_effects(layer.object).next().is_some())
         .map(|(index, _)| index)
         .collect();
+
+    // A composition layer's input is the frame beneath it, which this path
+    // only has as CPU pixels after the flatten — too late to run a chain over.
+    // The live simulator, which keeps the frame on the GPU, does draw them.
+    for layer in layered.layers.iter().filter(|layer| layer.composition) {
+        layered
+            .omissions
+            .push(format!("{}: composition layer drawn only by the live simulator", model::label(layer.object)));
+    }
 
     if !effected.is_empty() {
         let gpu = Gpu::new().context("opening a headless GL context")?;
@@ -141,7 +150,10 @@ pub fn render_frame(archive: &mut Archive, scene: &Scene, resolution: Option<Res
         for index in effected {
             let name = model::label(layered.layers[index].object);
             match run_layer_chain(&gpu, archive, &layered.layers[index], &headers, time) {
-                Ok(processed) => layered.layers[index].image = processed,
+                Ok((processed, skipped)) => {
+                    layered.layers[index].image = processed;
+                    layered.omissions.extend(skipped.into_iter().map(|note| format!("{name}: {note}")));
+                }
                 Err(error) => layered.omissions.push(format!("{name}: effect chain skipped ({error:#})")),
             }
         }
@@ -151,19 +163,20 @@ pub fn render_frame(archive: &mut Archive, scene: &Scene, resolution: Option<Res
 }
 
 /// Compile and run one layer's effect chain over its own texture, returning
-/// the processed pixels.
+/// the processed pixels and a note for each effect the chain left out.
 fn run_layer_chain(
     gpu: &Gpu,
     archive: &mut Archive,
     layer: &compose::PreparedLayer,
     headers: &HashMap<String, String>,
     time: f32,
-) -> Result<RgbaImage> {
+) -> Result<(RgbaImage, Vec<String>)> {
     let effects: Vec<&Effect> = model::visible_effects(layer.object).collect();
-    let chain = prepare_effect_chain(&gpu.gl, archive, &effects, &layer.image, headers)
+    let chain = prepare_effect_chain(&gpu.gl, archive, &effects, &layer.image, headers, pass::Format::Ldr)
         .context("preparing the effect chain")?;
     let target = chain.render(&gpu.gl, time, &[]).context("running the effect chain")?;
-    capture::read_rgba(&gpu.gl, target.framebuffer, target.width, target.height)
+    let image = capture::read_rgba(&gpu.gl, target.framebuffer, target.width, target.height)?;
+    Ok((image, chain.skipped))
 }
 
 /// One compiled effect pass: everything about it is fixed once prepared —
@@ -239,6 +252,9 @@ pub struct EffectChain {
     /// when the caller does not re-feed one.
     base: glow::Texture,
     pub tweakables: Vec<Tweakable>,
+    /// Effects left out of the chain because this renderer cannot run them, one
+    /// note each — the caller folds these into its omissions.
+    pub skipped: Vec<String>,
 }
 
 impl EffectChain {
@@ -267,6 +283,14 @@ impl EffectChain {
         for (pass_index, pass) in self.passes.iter().enumerate() {
             let mut floats = pass.floats.clone();
             floats.push(("g_Time".to_string(), vec![time]));
+            // The cursor, normalised over the canvas. Shaders that use it
+            // declare it themselves with no annotation default, so nothing
+            // binds it and GL leaves it at (0, 0) — the corner — which throws
+            // anything positioned by it a full screen out.
+            // `scene_example8`'s `lens_flare_sun` puts its sun there.
+            // We do not track a real pointer yet (plan.md §14); the centre is
+            // the neutral stand-in, and is where a flare belongs by default.
+            floats.push(("g_PointerPosition".to_string(), vec![0.5, 0.5]));
             for (tweakable, &value) in self.tweakables.iter().zip(overrides) {
                 if tweakable.pass_index == pass_index
                     && let Some(entry) = floats.iter_mut().find(|(name, _)| *name == tweakable.uniform_name)
@@ -318,6 +342,7 @@ pub fn prepare_effect_chain(
     effects: &[&Effect],
     base: &RgbaImage,
     headers: &HashMap<String, String>,
+    format: pass::Format,
 ) -> Result<EffectChain> {
     let (width, height) = (base.width(), base.height());
     let quad = pass::build_quad(gl)?;
@@ -327,14 +352,35 @@ pub fn prepare_effect_chain(
     let mut current_size = (width, height);
     let mut passes = Vec::new();
     let mut tweakables = Vec::new();
+    let mut skipped = Vec::new();
 
     for effect in effects {
         let definition: EffectDefinition = serde_json::from_slice(&archive.read(&effect.file)?)
             .with_context(|| format!("parsing {}", effect.file))?;
 
+        // A definition pass with no material is a render-target command, and
+        // the targets it moves between are frame history this renderer does not
+        // keep (motionblur's `copy` between its two accumulation buffers). Half
+        // the effect is not the effect, so drop the whole one and say so.
+        if definition.passes.iter().any(|pass| pass.material.is_none()) {
+            skipped.push(format!("{} needs render-target commands", effect.file));
+            continue;
+        }
+
+        // `previous` in a bind list is the image this effect was handed, which
+        // is where the running chain stands before its first pass — not the
+        // pass that ran just before, which is what slot 0 falls back to.
+        let effect_input = (current, current_size);
+        let mut named: HashMap<String, (glow::Texture, (u32, u32))> = HashMap::new();
+
         for (definition_pass, effect_pass) in definition.passes.iter().zip(&effect.passes) {
-            let material: Material = serde_json::from_slice(&archive.read(&definition_pass.material)?)
-                .with_context(|| format!("parsing {}", definition_pass.material))?;
+            let Some(material_path) = definition_pass.material.as_deref() else {
+                continue;
+            };
+            let (target_width, target_height) =
+                target_size(&definition, definition_pass.target.as_deref(), width, height);
+            let material: Material = serde_json::from_slice(&archive.read(material_path)?)
+                .with_context(|| format!("parsing {material_path}"))?;
 
             for material_pass in &material.passes {
                 let stem = format!("shaders/{}", material_pass.shader);
@@ -357,10 +403,23 @@ pub fn prepare_effect_chain(
                 combos.extend(annotations::combo_defaults(&fragment_declarations));
                 combos.extend(bind::texture_combos(&fragment_declarations, &effect_pass.textures));
                 combos.extend(bind::texture_combos(&vertex_declarations, &effect_pass.textures));
+                // The wallpaper's own choices win over both.
+                combos.extend(
+                    effect_pass
+                        .combos
+                        .iter()
+                        .filter_map(|(name, value)| Some((name.clone(), value.as_i64()?))),
+                );
 
                 let vertex_glsl = preprocess::build(&vertex_source, preprocess::Stage::Vertex, headers, &combos)
                     .with_context(|| format!("preprocessing {stem}.vert"))?;
-                let fragment_glsl = preprocess::build(&fragment_source, preprocess::Stage::Fragment, headers, &combos)
+                let fragment_glsl = preprocess::build_against(
+                    &fragment_source,
+                    preprocess::Stage::Fragment,
+                    headers,
+                    &combos,
+                    Some(&vertex_source),
+                )
                     .with_context(|| format!("preprocessing {stem}.frag"))?;
                 let program = pass::compile_program(gl, &vertex_glsl, &fragment_glsl)
                     .with_context(|| format!("compiling {stem}"))?;
@@ -370,8 +429,8 @@ pub fn prepare_effect_chain(
                     archive,
                     &fragment_declarations,
                     &effect_pass.textures,
-                    current,
-                    current_size,
+                    &bound_slots(&definition_pass.bind, effect_input, &named),
+                    (current, current_size),
                     (width, height),
                 )?;
 
@@ -388,25 +447,71 @@ pub fn prepare_effect_chain(
                     .chain(uniform_ints(&fragment_declarations, &effect_pass.constantshadervalues))
                     .collect::<Vec<_>>();
 
-                let target = pass::Target::new(gl, width, height)
+                let target = pass::Target::with_format(gl, target_width, target_height, format)
                     .with_context(|| format!("allocating a render target for {stem}"))?;
 
                 current = target.texture;
-                current_size = (width, height);
+                current_size = (target_width, target_height);
+                if let Some(name) = &definition_pass.target {
+                    named.insert(name.clone(), (target.texture, current_size));
+                }
                 passes.push(CompiledPass { program, target, textures, floats, ints, label: stem });
             }
         }
     }
 
     if passes.is_empty() {
-        bail!("at least one pass must have run");
+        if skipped.is_empty() {
+            bail!("at least one pass must have run");
+        }
+        bail!("{}", skipped.join("; "));
     }
-    Ok(EffectChain { quad, passes, base: base_texture, tweakables })
+    Ok(EffectChain { quad, passes, base: base_texture, tweakables, skipped })
 }
 
-/// Bind every sampler the fragment shader declares: slot 0 is always the
-/// chain's running result, higher slots come from the pass's `textures[]` —
-/// indexed by slot number — or the sampler's own annotation default.
+/// The pixel size a pass renders at: its `fbos` entry's scale divides the
+/// layer, and a pass with no named target draws at full size.
+fn target_size(definition: &EffectDefinition, target: Option<&str>, width: u32, height: u32) -> (u32, u32) {
+    let scale = target
+        .and_then(|name| definition.fbos.iter().find(|fbo| fbo.name == name))
+        .map_or(1.0, |fbo| fbo.scale);
+    if !scale.is_finite() || scale <= 1.0 {
+        return (width, height);
+    }
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        clippy::cast_precision_loss,
+        reason = "canvas dimensions divided by a scale of 2 or 4, floored at 1"
+    )]
+    let divide = |size: u32| ((size as f32 / scale).round() as u32).max(1);
+    (divide(width), divide(height))
+}
+
+/// Resolve a pass's `bind` list into sampler slots. `previous` is the image the
+/// effect was handed; every other name is one of the effect's own render
+/// targets, which an earlier pass in the same effect has already written.
+fn bound_slots(
+    binds: &[EffectBind],
+    effect_input: (glow::Texture, (u32, u32)),
+    named: &HashMap<String, (glow::Texture, (u32, u32))>,
+) -> HashMap<usize, (glow::Texture, (u32, u32))> {
+    binds
+        .iter()
+        .filter_map(|bind| {
+            let source = if bind.name == "previous" {
+                effect_input
+            } else {
+                *named.get(&bind.name)?
+            };
+            Some((bind.index, source))
+        })
+        .collect()
+}
+
+/// Bind every sampler the fragment shader declares: the pass's own `bind` list
+/// first, then slot 0 as the chain's running result, then the pass's
+/// `textures[]` — indexed by slot number — or the sampler's annotation default.
 ///
 /// Returns the bound textures alongside the `g_TextureNResolution` uniform
 /// each one implies — `(width, height, width, height)`, since nothing here
@@ -420,8 +525,8 @@ fn resolve_textures(
     archive: &mut Archive,
     declarations: &Declarations,
     textures: &[Option<String>],
-    current: glow::Texture,
-    current_size: (u32, u32),
+    bound_slots: &HashMap<usize, (glow::Texture, (u32, u32))>,
+    current: (glow::Texture, (u32, u32)),
     layer_size: (u32, u32),
 ) -> Result<BoundTextures> {
     let mut bound = Vec::new();
@@ -433,8 +538,10 @@ fn resolve_textures(
         };
 
         let name = textures.get(slot).and_then(Option::as_deref);
-        let (texture, size) = if slot == 0 {
-            (PassTexture::Fixed(current), current_size)
+        let (texture, size) = if let Some(&(texture, size)) = bound_slots.get(&slot) {
+            (PassTexture::Fixed(texture), size)
+        } else if slot == 0 {
+            (PassTexture::Fixed(current.0), current.1)
         } else if name.is_some_and(is_layer_composite_target) {
             (PassTexture::LayerBase, layer_size)
         } else {

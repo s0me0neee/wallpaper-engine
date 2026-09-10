@@ -2,5 +2,6 @@
 
 pub mod annotations;
 pub mod bind;
+pub mod hlsl;
 pub mod preprocess;
 pub mod shim;

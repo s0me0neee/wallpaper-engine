@@ -7,6 +7,8 @@
 # in a folder named after the wallpaper's title, not a fixed path — ignore the
 # common choice of running it from the repo root with `--out export`.
 /export
+# ...and of running it without `--out` at all, which makes that folder here.
+/\[*\]*/
 
 # Python reference implementation
 __pycache__/
