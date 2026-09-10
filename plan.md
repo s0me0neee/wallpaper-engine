@@ -908,6 +908,83 @@ image — `full_rect`, `blend_backdrop`'s size, a composition layer's `region`
 target, and both particle scales, which must compose with the render scale
 rather than replace it.
 
+### 4.19 Measured against real Wallpaper Engine, second round
+
+§4.12's captures are gone and its numbers are not comparable to these: those were
+taken before the bloom, the sprite-coverage and REFRACT fixes (§4.13, §4.14) and
+before particles moved to the GPU (§4.17). A fresh set was taken on a Windows box
+running the real thing — seven wallpapers, lossless 1920x1080 `CopyFromScreen`
+grabs, each reloaded through `wallpaper32.exe -control openWallpaper` with a
+stopwatch started when the control call returned and the frame taken at a recorded
+~10.02 s. They live in `papers/_we_captures/`, ignored like the rest of `papers/`.
+
+Two things about the captures decide how to read them. The desktop is **1920x1080**,
+so Wallpaper Engine renders `scene_example8` at half its authored 4K canvas and ours
+has to be downscaled to match — the same finding §4.18 reaches from the performance
+side, from the other direction. And a taskbar occupies the bottom ~44 px of every
+frame, excluded from every number below.
+
+Only two of the seven are not clean baselines: `scene_example6` has "Screen water
+flow" and "Screen raindrops" switched on where both default to off, and
+`scene_example1` runs at `rate: 200`, so its capture sits at a `g_Time` of ~20.06 s
+rather than ~10.03 s. `scene_example6` and `scene_example8` also carry a text layer
+driven by the real system clock, which no `g_Time` will ever match.
+
+| scene | PSNR | our luminance | reference |
+|---|---:|---:|---:|
+| ex1 ATRI | 25.22 | 188.6 | 190.8 |
+| ex2 Dusk Town | 29.88 | 153.3 | 152.6 |
+| ex3 Hope | 14.73 | 162.7 | 133.1 |
+| ex4 Into the night | 23.82 | 62.5 | 62.1 |
+| ex5 听星·伊蕾娜 | 19.73 | 83.0 | 82.5 |
+| ex6 Rainy Day | 14.77 | 42.0 | 43.6 |
+| ex8 Matte Clouds | 19.44 | 91.5 | 77.3 |
+
+**There is no global tone or colour-space error, and that is now settled rather
+than suspected.** §4.14 rejected a gamma by argument; this rejects it by
+measurement. Binning every pixel by the reference's own value and taking our mean
+in each bin gives, for `scene_example2` and `scene_example4`, a deviation of at
+most 2 levels anywhere from black to white — an identity transfer. Whatever is
+wrong with ex3 and ex8 is *something in the frame*, not a curve over it, which is
+a far smaller search space than a curve fit.
+
+For ex3 the same transfer is a flat **+35 to +40 levels at every input level** up
+to ~200 — the signature of a uniform veil laid over the picture. `SIMULATE_LAYERS`
+finds it in one layer: compositing 0–13 gives luminance 140.1, and adding layer 14
+alone — a `particles/presets/fog1.json` system with `instanceoverride`
+`{alpha: 0.3, rate: 0.6}` — takes it to 162.9 and costs 1.8 dB. Solving
+`162.9 = 140.1(1-a) + 255a` puts that layer at a 20 % white veil over the whole
+canvas. The override *is* read and applied (`particle.rs` folds `alpha` into the
+sprite weight and `rate` into the emission rate), so the surplus is population
+rather than a dropped field: `maxcount` is a hard slot count, so a system that
+fills to it ignores `rate` entirely at steady state and runs ~1.7x too many
+particles.
+
+For ex8 the surplus is +15 levels through the dark and middle range and nothing at
+the top, and two causes are stacked. One is layer 30, "Basic Clouds Movement" —
+soft light, scale 3.06, roll 0.103, rect `-152,884 5877x3306`. It composites a
+bright band with a hard tilted edge across the upper sky that the capture does not
+have; dropping that one layer is worth **+2.3 dB** (19.65 → 21.94) and moves
+luminance 90.7 → 84.9. It is the one corpus layer whose blend-mode backdrop is
+copied over a rectangle mostly *off* the canvas, and §4.18's render scaling landed
+on the same layer from a different direction, which makes that backdrop path the
+prime suspect for both. The other cause is underneath it: sampling the frame before
+layer 30 lands gives [42,42,37] and [66,63,53] where the capture has [34,39,43] and
+[45,50,54] — our dark upper sky is both brighter and *warmer*, while the sun itself
+matches ([255,222,168] against [255,217,139]). A warm lift confined to the dark end
+with the bright end already correct is what an over-wide bloom scatter looks like —
+but a soft-light layer clamping to the wrong backdrop edge would produce it too, so
+check the backdrop copy at scale 1.0 before assuming the base frame is
+independently wrong. One cause may explain both.
+
+Two dead ends worth not re-running. `pow` with a negative base is undefined in
+GLSL and `workshop/2098390419/scroll` relies on D3D folding `pow(v, 2.0)` into
+`v*v` — but a shim that mirrors the sign for integral exponents changes the frame
+by **exactly zero bits** on this driver, which evidently already folds it. And
+`blurprecise`, the obvious suspect for a smear, cannot be one: its offsets are
+`g_Scale / g_TextureNResolution`, and `SIMULATE_TRACE` confirms the resolutions it
+is handed are the real target sizes, putting its widest tap at about two pixels.
+
 ---
 
 ## 5. The `common.h` problem
