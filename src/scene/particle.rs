@@ -1133,10 +1133,15 @@ fn render_preset(
         })
         .collect();
 
-    let base = preset.sprite.clone().unwrap_or_else(|| sprite::stand_in("particle/halo"));
+    // By reference: the stock sprites are 1024x1024, so cloning one per system
+    // per frame is megabytes of memcpy before a single particle is drawn.
+    let fallback = preset.sprite.is_none().then(|| sprite::stand_in("particle/halo"));
+    let Some(base) = preset.sprite.as_ref().or(fallback.as_ref()) else {
+        return;
+    };
     let cache_key = fnv1a(key);
     for (n, birth, live) in &alive {
-        draw_particle(pixmap, place, renderer, live, preset.blend, &base, cache, cache_key);
+        draw_particle(pixmap, place, renderer, live, preset.blend, base, cache, cache_key);
         if depth + 1 < MAX_DEPTH {
             for child in children.clone().filter(|child| child.r#type == "eventfollow") {
                 let at = to_screen(place, live.pos);
@@ -1195,8 +1200,16 @@ pub fn render_system(
     time: f32,
 ) -> Result<ParticleLayer> {
     let presets = collect_system(archive, assets, preset_path)?;
-    render_system_from(&presets, preset_path, place, time)
+    render_system_from(&presets, preset_path, place, time, &mut TintCache::new())
 }
+
+/// Sprites recoloured for a particle's tint, kept across frames.
+///
+/// Building one is a clone plus a pass over every pixel, and the stock sprites
+/// are 1024x1024 — rebuilding the cache each frame costs more than the whole
+/// simulation. Most systems fix their colour, so it almost always holds one
+/// entry per system and is never invalidated.
+pub type TintCache = HashMap<(u64, u32), Pixmap>;
 
 /// Read and parse a preset and every child it names — the file work, done once
 /// so a live redraw can call `render_system_from` each frame without touching
@@ -1218,6 +1231,7 @@ pub fn render_system_from(
     preset_path: &str,
     place: &Placement,
     time: f32,
+    tints: &mut TintCache,
 ) -> Result<ParticleLayer> {
     let start = presets.get(preset_path).context("particle preset had no body")?.starttime;
 
@@ -1226,9 +1240,8 @@ pub fn render_system_from(
     let mut unsupported = Vec::new();
 
     let salt = 0x5EED_u64.wrapping_add(fnv1a(preset_path));
-    let mut tints = HashMap::new();
     render_preset(
-        presets, preset_path, &mut pixmap, place, time, start, salt, 0, &mut unsupported, &mut tints,
+        presets, preset_path, &mut pixmap, place, time, start, salt, 0, &mut unsupported, tints,
     );
 
     Ok(ParticleLayer { image: pixmap_to_rgba(&pixmap), unsupported })

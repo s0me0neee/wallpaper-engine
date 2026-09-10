@@ -93,7 +93,30 @@ enum LiveKind {
         placement: particle::Placement,
         preset_path: String,
         presets: HashMap<String, particle::Preset>,
+        /// Recoloured sprites, kept for the life of the window: rebuilding
+        /// them is a pass over every pixel of a 1024x1024 sprite, which costs
+        /// more per frame than simulating the particles that use it.
+        tints: particle::TintCache,
     },
+}
+
+/// Parse a particle system once and draw its first frame, leaving behind the
+/// state the per-frame redraw needs.
+fn live_particle(
+    archive: &mut Archive,
+    assets: Option<&Path>,
+    system: &compose::StaticParticle<'_>,
+    sim_scale: f32,
+) -> Result<(image::RgbaImage, LiveKind)> {
+    let placement = scaled_placement(&system.place, sim_scale);
+    let presets = particle::collect_system(archive, assets, &system.preset_path)
+        .with_context(|| format!("loading {}", system.preset_path))?;
+    let mut tints = particle::TintCache::new();
+    let image = particle::render_system_from(&presets, &system.preset_path, &placement, 0.0, &mut tints)
+        .with_context(|| format!("simulating {}", system.preset_path))?
+        .image;
+    let kind = LiveKind::Particle { placement, preset_path: system.preset_path.clone(), presets, tints };
+    Ok((image, kind))
 }
 
 /// Simulate particles into a canvas this fraction of the real one when the real
@@ -421,17 +444,7 @@ impl App<'_> {
                     (image, rect, puppet.blend, LiveKind::Puppet(index), puppet.object)
                 }
                 StaticItem::Particle(system) => {
-                    let placement = scaled_placement(&system.place, sim_scale);
-                    let presets = particle::collect_system(archive, assets, &system.preset_path)
-                        .with_context(|| format!("loading {}", system.preset_path))?;
-                    let image = particle::render_system_from(&presets, &system.preset_path, &placement, 0.0)
-                        .with_context(|| format!("simulating {}", system.preset_path))?
-                        .image;
-                    let kind = LiveKind::Particle {
-                        placement,
-                        preset_path: system.preset_path.clone(),
-                        presets,
-                    };
+                    let (image, kind) = live_particle(archive, assets, system, sim_scale)?;
                     (image, full_rect, system.blend, kind, system.object)
                 }
             };
@@ -631,8 +644,8 @@ fn redraw(app: &mut App, time: f32) -> Result<bool> {
     let cpu_start = Instant::now();
     let refreshed = state
         .layers
-        .par_iter()
-        .map(|layer| match &layer.kind {
+        .par_iter_mut()
+        .map(|layer| match &mut layer.kind {
             // A composition layer's input is produced on the GPU during the
             // composite pass below, not here.
             LiveKind::Image | LiveKind::Composition { .. } => Ok(None),
@@ -644,8 +657,8 @@ fn redraw(app: &mut App, time: f32) -> Result<bool> {
                 let rect = rect_of(left, top, &image);
                 Ok(Some((image, rect)))
             }
-            LiveKind::Particle { placement, preset_path, presets } => {
-                let image = particle::render_system_from(presets, preset_path, placement, time)
+            LiveKind::Particle { placement, preset_path, presets, tints } => {
+                let image = particle::render_system_from(presets, preset_path, placement, time, tints)
                     .with_context(|| format!("simulating {preset_path}"))?
                     .image;
                 Ok(Some((image, layer.rect)))
