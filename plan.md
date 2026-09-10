@@ -751,6 +751,41 @@ wallpaper's own settings and neither is implemented, which offsets every pixel i
 the frame. The sprites remain plausible rather than identical: a Perlin cloud is
 not WE's cloud.
 
+### 4.16 Where the live frame time actually goes
+
+The live simulator runs the corpus's heavy scenes at 9–17 fps where Wallpaper
+Engine runs them at 60, and the gap is entirely CPU: `scene_example3` settles at
+66 ms of CPU a frame against 4 ms of upload and 0 ms of GPU, `scene_example6` at
+~105 ms, `scene_example8` at ~40 ms.
+
+The obvious suspect is wrong, and it is worth writing down so it is not
+re-suspected. Particles are re-integrated from birth every frame — the stateless
+design that makes any `g_Time` independently addressable — and the per-frame cost
+visibly climbs (10 ms → 66 ms over `scene_example3`'s first few seconds), which
+looks exactly like an integration cost growing with particle age. It is not.
+Measured by disabling the particle raster and leaving everything else running:
+
+| `scene_example3` | CPU/frame |
+|---|---|
+| full | 66 ms |
+| particle raster disabled, integrating from birth | 9 ms |
+| particle raster disabled, one incremental step per particle | 9 ms |
+
+Integration is free — 1600 particles × up to 90 steps is a few hundred thousand
+float operations spread across every core by `rayon`. The climb is the particle
+*population* filling to `maxcount`, and the cost is tiny-skia filling sprite
+rects. It is pixel-bound, not particle-bound: dropping `particle_sim_scale` from
+0.28 to 0.2 (a 0.51× area) takes 65 ms to 33 ms, and turning off anti-aliasing
+and dropping to nearest-neighbour sampling change nothing at all.
+
+So an incremental live particle state — keeping each slot's `Motion` and
+advancing it by one frame — buys nothing, and was reverted after being measured.
+The fix is to stop rasterizing particles on the CPU: draw them as instanced
+quads through the GL context that is already open, which removes the fill *and*
+the 4–19 ms per frame spent uploading the finished raster back to the GPU. That
+is a large change (blend-mode parity with tiny-skia's `Plus`/`SourceOver`, and
+the still exporter has to keep working) and is not started.
+
 ---
 
 ## 5. The `common.h` problem
