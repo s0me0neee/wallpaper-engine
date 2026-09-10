@@ -18,7 +18,7 @@
 //! parameter away from the wallpaper's own preset, live.
 
 use crate::pkg::Archive;
-use crate::render::{bloom, capture, pass};
+use crate::render::{bloom, capture, particles, pass};
 use crate::scene::compose::{self, StaticItem};
 use crate::scene::model::{self, Blend, Scene};
 use crate::scene::particle;
@@ -84,11 +84,35 @@ enum LiveKind {
     /// cropped to the layer's own rectangle into `region` each frame, then run
     /// through the layer's chain and drawn back over the same rectangle.
     Composition { region: pass::Target },
-    /// A particle system, re-simulated each frame into `placement`'s canvas —
-    /// which may be a fraction of the real one (soft glows survive a bilinear
-    /// upscale, and a full-res tiny-skia raster every frame is what pins a big
-    /// scene to single digits). The compositor stretches it back to full size.
-    /// `presets` is parsed once so the redraw never re-reads the archive.
+    /// A particle system re-simulated each frame and drawn on the GPU as
+    /// instanced quads — no CPU fill and no per-frame upload, which is where
+    /// the live frame budget went (plan.md §4.16, §4.17).
+    ///
+    /// `ground` decides where they land, and `placement` follows it: onto the
+    /// frame itself at full canvas resolution, or into the shared scratch
+    /// target at `particle_gpu_scale` of it. `presets` is parsed once so the
+    /// redraw never re-reads the archive, and `sprites` is one texture per
+    /// entry in `table`.
+    ParticleGpu {
+        placement: particle::Placement,
+        preset_path: String,
+        presets: HashMap<String, particle::Preset>,
+        table: particle::SpriteTable,
+        sprites: Vec<particles::Sprite>,
+        /// Whether this system can blend straight onto the frame, or needs a
+        /// scratch layer of its own first.
+        ground: particles::Ground,
+    },
+    /// A particle system that carries effects, and so still rasterizes on the
+    /// CPU: its chain needs a straight-alpha texture of a fixed size, which is
+    /// not what the GPU pass produces. No corpus scene has one — every
+    /// particle object in all eight scenes declares zero effects — so this is
+    /// the path that keeps a wallpaper that does have one rendering, at the
+    /// old speed, rather than a shape the fast path has to bend around.
+    ///
+    /// `placement` may cover a fraction of the real canvas (soft glows survive
+    /// a bilinear upscale, and a full-res tiny-skia raster every frame is what
+    /// pins a big scene to single digits); the compositor stretches it back.
     Particle {
         placement: particle::Placement,
         preset_path: String,
@@ -117,6 +141,76 @@ fn live_particle(
         .image;
     let kind = LiveKind::Particle { placement, preset_path: system.preset_path.clone(), presets, tints };
     Ok((image, kind))
+}
+
+/// Parse a particle system once and upload one texture per sprite it draws
+/// with, leaving every frame's work to the GPU pass.
+fn gpu_particle(
+    gl: &glow::Context,
+    archive: &mut Archive,
+    assets: Option<&Path>,
+    system: &compose::StaticParticle<'_>,
+    scale: f32,
+    layered: bool,
+) -> Result<LiveKind> {
+    let presets = particle::collect_system(archive, assets, &system.preset_path)
+        .with_context(|| format!("loading {}", system.preset_path))?;
+    let uniform = particle::uniform_blend(&presets) == Some(system.blend);
+    let ground = if layered || !uniform { particles::Ground::Fresh } else { particles::Ground::Over };
+    let table = particle::sprite_table(&presets);
+    let mut sprites = Vec::with_capacity(particle::sprite_count(&table));
+    for slot in 0..particle::sprite_count(&table) {
+        // A preset with no sprite still takes a slot: the draw list indexes
+        // this by number, so skipping one would shift every sprite after it.
+        let sprite = match particle::sprite_rgba(&presets, &table, slot) {
+            Some(image) => {
+                particles::Sprite { texture: pass::upload_texture(gl, &image)?, size: image.dimensions() }
+            }
+            None => particles::Sprite { texture: pass::solid_texture(gl, [0, 0, 0, 0])?, size: (1, 1) },
+        };
+        sprites.push(sprite);
+    }
+    // Drawing onto the frame means drawing at the frame's resolution — which
+    // is also the sharpest these have ever been, the CPU raster having had to
+    // shrink them to stay affordable at all.
+    let placement = match ground {
+        particles::Ground::Over => particle::Placement { max_sim_steps: LIVE_SIM_STEPS, ..system.place.clone() },
+        particles::Ground::Fresh => scaled_placement(&system.place, scale),
+    };
+    Ok(LiveKind::ParticleGpu {
+        placement,
+        preset_path: system.preset_path.clone(),
+        presets,
+        table,
+        sprites,
+        ground,
+    })
+}
+
+/// Size the shared scratch target at this fraction of the canvas.
+///
+/// Only a system that cannot blend straight onto the frame draws here — one
+/// mixing `additive` and `translucent` presets, or whose layer carries a
+/// `colorBlendMode` or an alpha track. Those pay a canvas-sized composite each,
+/// which is what actually costs on a big scene (§4.17), so the target they
+/// composite *from* is kept small; the tiers are far gentler than the CPU
+/// raster's because the fill itself is no longer the constraint.
+///
+/// Soft additive sprites survive a bilinear upscale, which is what makes this
+/// legitimate rather than a fudge: these presets are fog, smoke, rain and
+/// embers, not line art.
+fn particle_gpu_scale(canvas: (u32, u32), systems: usize) -> f32 {
+    let base = match canvas.0.max(canvas.1) {
+        0..=1999 => 1.0,
+        2000..=3199 => 0.75,
+        _ => 0.5,
+    };
+    let crowded = match systems {
+        0..=8 => 1.0,
+        9..=20 => 0.85,
+        _ => 0.7,
+    };
+    base * crowded
 }
 
 /// Simulate particles into a canvas this fraction of the real one when the real
@@ -231,8 +325,9 @@ struct LiveLayer {
     /// This chain's slice of `State::tweak_values`, one entry per tweakable.
     tweaks: Range<usize>,
     /// The current image: a single texture for `Image`, a re-uploaded ring for
-    /// `Puppet` / `Particle`.
-    textures: LayerTextures,
+    /// `Puppet` / `Particle`. `None` for `ParticleGpu`, whose pixels are drawn
+    /// straight into the shared particle target and never leave the GPU.
+    textures: Option<LayerTextures>,
     /// Placement on the canvas — `(left, top, width, height)` in pixels,
     /// measured from the top-left. Re-derived each frame for `Puppet`.
     rect: (i32, i32, i32, i32),
@@ -273,6 +368,8 @@ struct State {
     region_copy: pass::RegionCopy,
     /// Canvas-sized accumulator the layers are stacked into each frame.
     composite: pass::Target,
+    /// `None` when no layer draws through the instanced particle pass.
+    particles: Option<LiveParticles>,
     /// Scene-wide bloom over the finished frame, when `general.bloom` is on.
     bloom: Option<(bloom::Bloom, bloom::Settings)>,
     /// The scene's own pixel dimensions — every layer and the composite match
@@ -352,7 +449,8 @@ impl App<'_> {
             .context("allocating the composite target")?;
         let bloom = compile_bloom(&gl, self.static_scene.bloom, width, height, format)?;
 
-        let Built { layers, tweak_values, omissions } = self.build_layers(&gl)?;
+        let Built { layers, tweak_values, omissions, particle_scale } = self.build_layers(&gl)?;
+        let particles = compile_particles(&gl, &layers, (width, height), particle_scale)?;
         for note in &omissions {
             println!("  not simulated: {note}");
         }
@@ -372,6 +470,7 @@ impl App<'_> {
             compositor,
             region_copy,
             composite,
+            particles,
             bloom,
             content_size: (width, height),
             background: normalized_rgba(self.static_scene.background),
@@ -407,11 +506,15 @@ impl App<'_> {
 
         let systems = static_scene.items.iter().filter(|item| matches!(item, StaticItem::Particle(_))).count();
         let sim_scale = particle_sim_scale((static_scene.width, static_scene.height), systems);
+        let gpu_scale = particle_gpu_scale((static_scene.width, static_scene.height), systems);
         #[expect(clippy::cast_possible_wrap, reason = "wallpaper canvas dims are nowhere near i32::MAX")]
         let full_rect = (0, 0, static_scene.width as i32, static_scene.height as i32);
 
         for (index, item) in static_scene.items.iter().enumerate() {
-            let (image, rect, blend, kind, object) = match item {
+            // `image` is the layer's t=0 pixels, which a chain compiles against
+            // and a texture ring is sized from. A GPU particle layer has
+            // neither, so it carries only the size its backdrop would need.
+            let (image, size, rect, blend, kind, object) = match item {
                 StaticItem::Image(layer) => {
                     if let Some(error) = &layer.warp_error {
                         swap_note(
@@ -428,7 +531,8 @@ impl App<'_> {
                         LiveKind::Image
                     };
                     (
-                        layer.image.clone(),
+                        Some(layer.image.clone()),
+                        layer.image.dimensions(),
                         rect_of(layer.left, layer.top, &layer.image),
                         layer.blend,
                         kind,
@@ -441,35 +545,51 @@ impl App<'_> {
                     });
                     let (image, left, top) = compose::warp_frame(puppet, 0.0);
                     let rect = rect_of(left, top, &image);
-                    (image, rect, puppet.blend, LiveKind::Puppet(index), puppet.object)
+                    let size = image.dimensions();
+                    (Some(image), size, rect, puppet.blend, LiveKind::Puppet(index), puppet.object)
+                }
+                // Effects are what decides the path: a chain wants a
+                // straight-alpha texture of a fixed size, which is not what the
+                // instanced pass leaves behind.
+                StaticItem::Particle(system) if model::visible_effects(system.object).next().is_none() => {
+                    // A colorBlendMode needs the frame beneath readable and an
+                    // alpha track scales the layer as a whole, so both need the
+                    // system on a layer of its own before it meets the frame.
+                    let layered =
+                        layer_blend_mode(system.object, item) != 0 || system.object.alphatrack.is_some();
+                    let kind = gpu_particle(gl, archive, assets, system, gpu_scale, layered)?;
+                    (None, (static_scene.width, static_scene.height), full_rect, system.blend, kind, system.object)
                 }
                 StaticItem::Particle(system) => {
                     let (image, kind) = live_particle(archive, assets, system, sim_scale)?;
-                    (image, full_rect, system.blend, kind, system.object)
+                    let size = image.dimensions();
+                    (Some(image), size, full_rect, system.blend, kind, system.object)
                 }
             };
 
-            let chain = compile_chain(
-                gl,
-                archive,
-                headers,
-                object,
-                &image,
-                target_format(static_scene.hdr),
-                &mut omissions,
-            );
+            let chain = image.as_ref().and_then(|image| {
+                compile_chain(
+                    gl,
+                    archive,
+                    headers,
+                    object,
+                    image,
+                    target_format(static_scene.hdr),
+                    &mut omissions,
+                )
+            });
 
             let start = tweak_values.len();
             if let Some(chain) = &chain {
                 tweak_values.extend(chain.tweakables.iter().map(|tweakable| tweakable.default));
             }
 
-            let textures = if matches!(kind, LiveKind::Image) {
-                LayerTextures::once(gl, &image)?
-            } else {
-                LayerTextures::ring(gl, &image)?
+            let textures = match &image {
+                Some(image) if matches!(kind, LiveKind::Image) => Some(LayerTextures::once(gl, image)?),
+                Some(image) => Some(LayerTextures::ring(gl, image)?),
+                None => None,
             };
-            let backdrop = blend_backdrop(gl, object, item, &image)?;
+            let backdrop = blend_backdrop(gl, object, item, size)?;
             layers.push(LiveLayer {
                 kind,
                 name: model::label(object),
@@ -486,7 +606,7 @@ impl App<'_> {
             });
         }
 
-        Ok(Built { layers, tweak_values, omissions })
+        Ok(Built { layers, tweak_values, omissions, particle_scale: gpu_scale })
     }
 }
 
@@ -525,6 +645,59 @@ fn target_format(hdr: bool) -> pass::Format {
     if hdr { pass::Format::Hdr } else { pass::Format::Ldr }
 }
 
+/// The instanced-quad program and the one scratch target every GPU particle
+/// layer draws into, in turn, before being composited.
+///
+/// Sharing one target works because a layer's particles are consumed by the
+/// composite immediately after they are drawn, and it keeps a 35-system scene
+/// from allocating 35 canvases.
+struct LiveParticles {
+    program: particles::Particles,
+    /// `None` when every particle layer blends straight onto the frame, which
+    /// is the common case and costs no memory at all.
+    target: Option<pass::Target>,
+    /// The target's size as a fraction of the canvas, so a rectangle in target
+    /// pixels can be scaled back up to scissor the composite.
+    scale: f32,
+}
+
+/// Compile the instanced particle pass and its scratch target, if any layer
+/// draws through it.
+///
+/// The target is `Ldr` on purpose even in an HDR scene: it holds one system's
+/// particles, which is exactly what the CPU raster it replaces produced as an
+/// 8-bit image, and `Plus` clipping at 1.0 is part of how a dense additive
+/// system is meant to look.
+fn compile_particles(
+    gl: &glow::Context,
+    layers: &[LiveLayer],
+    (width, height): (u32, u32),
+    scale: f32,
+) -> Result<Option<LiveParticles>> {
+    if !layers.iter().any(|layer| matches!(layer.kind, LiveKind::ParticleGpu { .. })) {
+        return Ok(None);
+    }
+    let program = particles::compile(gl).context("compiling the particle pass")?;
+    let layered = layers.iter().any(|layer| {
+        matches!(layer.kind, LiveKind::ParticleGpu { ground: particles::Ground::Fresh, .. })
+    });
+    if !layered {
+        return Ok(Some(LiveParticles { program, target: None, scale }));
+    }
+    let scaled = |side: u32| -> u32 {
+        #[expect(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            reason = "a wallpaper canvas side scaled down and rounded stays a small positive integer"
+        )]
+        let side = (f64::from(side) * f64::from(scale)).round().max(1.0) as u32;
+        side
+    };
+    let target = pass::Target::new(gl, scaled(width), scaled(height))
+        .context("allocating the particle target")?;
+    Ok(Some(LiveParticles { program, target: Some(target), scale }))
+}
+
 /// Compile the scene's bloom post-process, when it asks for one.
 fn compile_bloom(
     gl: &glow::Context,
@@ -539,7 +712,10 @@ fn compile_bloom(
 }
 
 /// Draw one finished layer into the composite under its blend mode.
-fn composite_one(state: &State, layer: &LiveLayer, source: glow::Texture, time: f32) {
+///
+/// `premultiplied` is true only for the particle pass's target — every other
+/// layer texture holds straight alpha, the way `upload_texture` left it.
+fn composite_one(state: &State, layer: &LiveLayer, source: glow::Texture, time: f32, premultiplied: bool) {
     // A blend-mode layer needs the frame beneath it readable, so lift that
     // rectangle out before overwriting it.
     if let Some(backdrop) = &layer.backdrop {
@@ -563,7 +739,63 @@ fn composite_one(state: &State, layer: &LiveLayer, source: glow::Texture, time: 
         layer.backdrop.as_ref().map(|target| target.texture),
         layer.roll,
         track_alpha(layer, time),
+        premultiplied,
     );
+}
+
+/// Draw one particle layer's shapes and composite the result.
+///
+/// The composite is scissored to the rectangle the particles actually cover:
+/// a system filling one corner of a 4K canvas should not cost a full-canvas
+/// blend, and `scene_example8` has 35 of them.
+fn composite_particles(
+    state: &State,
+    layer: &LiveLayer,
+    sprites: &[particles::Sprite],
+    ground: particles::Ground,
+    shapes: Option<&particle::DrawList>,
+    time: f32,
+) {
+    let (Some(live), Some(list)) = (&state.particles, shapes) else { return };
+    let alpha = track_alpha(layer, time);
+
+    // Straight onto the frame: the particles *are* the composite, so there is
+    // no second pass and the layer's alpha rides on each quad instead.
+    if ground == particles::Ground::Over {
+        particles::draw(&state.gl, &live.program, &state.composite, list, sprites, alpha, ground);
+        return;
+    }
+
+    let Some(target) = &live.target else { return };
+    let Some(rect) = particles::draw(&state.gl, &live.program, target, list, sprites, 1.0, ground) else {
+        return;
+    };
+    #[expect(clippy::cast_possible_wrap, reason = "wallpaper canvases are nowhere near i32::MAX")]
+    let height = state.composite.height as i32;
+    pass::set_scissor(&state.gl, canvas_rect(rect, live.scale), height);
+    composite_one(state, layer, target.texture, time, true);
+    pass::clear_scissor(&state.gl);
+}
+
+/// A rectangle in particle-target pixels, back in canvas pixels — rounded
+/// outwards, so the bilinear upscale's edge taps stay inside the scissor.
+fn canvas_rect((left, top, width, height): particles::Rect, scale: f32) -> particles::Rect {
+    if scale >= 1.0 {
+        return (left, top, width, height);
+    }
+    let up = 1.0 / scale;
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_precision_loss,
+        reason = "canvas coordinates, nowhere near 2^24"
+    )]
+    let scaled = |value: i32, round_up: bool| -> i32 {
+        let scaled = value as f32 * up;
+        if round_up { scaled.ceil() as i32 + 1 } else { scaled.floor() as i32 - 1 }
+    };
+    let (right, bottom) = (scaled(left + width, true), scaled(top + height, true));
+    let (left, top) = (scaled(left, false), scaled(top, false));
+    (left, top, right - left, bottom - top)
 }
 
 /// Roll for the composited quad.
@@ -602,14 +834,23 @@ fn blend_backdrop(
     gl: &glow::Context,
     object: &model::Object,
     item: &StaticItem,
-    image: &image::RgbaImage,
+    (width, height): (u32, u32),
 ) -> Result<Option<pass::Target>> {
     if layer_blend_mode(object, item) == 0 {
         return Ok(None);
     }
-    let target = pass::Target::new(gl, image.width().max(1), image.height().max(1))
+    let target = pass::Target::new(gl, width.max(1), height.max(1))
         .with_context(|| format!("allocating {}'s backdrop", model::label(object)))?;
     Ok(Some(target))
+}
+
+/// What a layer's per-frame CPU work produced, before the GL context gets it.
+enum Refreshed {
+    /// Fresh pixels and where they sit: a re-skinned puppet, or a particle
+    /// system that still rasterizes on the CPU.
+    Image(RgbaImage, (i32, i32, i32, i32)),
+    /// A particle system's shapes for this frame, for the instanced pass.
+    Shapes(particle::DrawList),
 }
 
 /// `build_layers`' output: the z-ordered layers, the flattened tweakable
@@ -618,6 +859,8 @@ struct Built {
     layers: Vec<LiveLayer>,
     tweak_values: Vec<f32>,
     omissions: Vec<String>,
+    /// What fraction of the canvas the shared particle target covers.
+    particle_scale: f32,
 }
 
 /// Replace `stale` with `replacement` in `notes`, if present.
@@ -635,52 +878,19 @@ fn redraw(app: &mut App, time: f32) -> Result<bool> {
 
     run_panel(state);
 
-    // Per-frame CPU work: re-skin puppets, re-simulate particles, then upload
-    // each fresh image into the next texture in its ring.
-    // Each layer's own image is independent of every other layer's, so the two
-    // halves are split: raster across all cores, then upload on this thread,
-    // which is the one that owns the GL context. `scene_example8` has 35
-    // particle systems and spent 230 ms a frame here doing them one at a time.
-    let cpu_start = Instant::now();
-    let refreshed = state
-        .layers
-        .par_iter_mut()
-        .map(|layer| match &mut layer.kind {
-            // A composition layer's input is produced on the GPU during the
-            // composite pass below, not here.
-            LiveKind::Image | LiveKind::Composition { .. } => Ok(None),
-            LiveKind::Puppet(index) => {
-                let StaticItem::Puppet(puppet) = &static_scene.items[*index] else {
-                    unreachable!("a Puppet LiveKind always points at a Puppet item")
-                };
-                let (image, left, top) = compose::warp_frame(puppet, time);
-                let rect = rect_of(left, top, &image);
-                Ok(Some((image, rect)))
-            }
-            LiveKind::Particle { placement, preset_path, presets, tints } => {
-                let image = particle::render_system_from(presets, preset_path, placement, time, tints)
-                    .with_context(|| format!("simulating {preset_path}"))?
-                    .image;
-                Ok(Some((image, layer.rect)))
-            }
-        })
-        .collect::<Result<Vec<_>>>()?;
-
-    let upload_start = Instant::now();
-    for (layer, refreshed) in state.layers.iter_mut().zip(refreshed) {
-        if let Some((image, rect)) = refreshed {
-            layer.rect = rect;
-            layer.textures.refresh(&state.gl, &image)?;
-        }
-    }
-    state.frames_since.upload += upload_start.elapsed();
-
-    state.frames_since.cpu += cpu_start.elapsed();
+    let shapes = refresh_layers(state, static_scene, time)?;
 
     // Stack the layers into the composite target, each under its blend mode.
     let gpu_start = Instant::now();
     pass::clear_target(&state.gl, &state.composite, state.background);
-    for layer in &state.layers {
+    for (index, layer) in state.layers.iter().enumerate() {
+        // A GPU particle layer draws its own pixels and composites them under
+        // a scissor, so it never touches a layer texture at all.
+        if let LiveKind::ParticleGpu { sprites, ground, .. } = &layer.kind {
+            composite_particles(state, layer, sprites, *ground, shapes[index].as_ref(), time);
+            continue;
+        }
+
         // A composition layer renders the frame beneath it, so lift that
         // rectangle out of the composite before its chain runs.
         if let LiveKind::Composition { region } = &layer.kind {
@@ -694,6 +904,9 @@ fn redraw(app: &mut App, time: f32) -> Result<bool> {
             );
         }
 
+        // Every remaining layer kind owns a texture; only `ParticleGpu`, handled
+        // above, does not.
+        let Some(textures) = &layer.textures else { continue };
         let source = match &layer.chain {
             Some(chain) => {
                 // A static image's chain keeps its baked-in base; a puppet or
@@ -701,15 +914,17 @@ fn redraw(app: &mut App, time: f32) -> Result<bool> {
                 let base = match &layer.kind {
                     LiveKind::Image => None,
                     LiveKind::Composition { region } => Some(region.texture),
-                    LiveKind::Puppet(_) | LiveKind::Particle { .. } => Some(layer.textures.current()),
+                    LiveKind::Puppet(_) | LiveKind::Particle { .. } | LiveKind::ParticleGpu { .. } => {
+                        Some(textures.current())
+                    }
                 };
                 chain
                     .render_over(&state.gl, base, time, &state.tweak_values[layer.tweaks.clone()])?
                     .texture
             }
-            None => layer.textures.current(),
+            None => textures.current(),
         };
-        composite_one(state, layer, source, time);
+        composite_one(state, layer, source, time, false);
     }
 
     // Scene bloom runs over the finished stack, the way WE post-processes the
@@ -748,6 +963,75 @@ fn redraw(app: &mut App, time: f32) -> Result<bool> {
 
     report_fps(&mut state.frames_since);
     Ok(false)
+}
+
+/// Every layer's per-frame CPU work, and the uploads that follow it.
+///
+/// Returns each layer's particle shapes, for the composite to draw in z-order:
+/// they cannot be drawn here, because this thread owns the GL context and the
+/// draw has to happen between the layers beneath and above them.
+fn refresh_layers(
+    state: &mut State,
+    static_scene: &compose::StaticScene<'_>,
+    time: f32,
+) -> Result<Vec<Option<particle::DrawList>>> {
+    // Per-frame CPU work: re-skin puppets, re-simulate particles, then upload
+    // each fresh image into the next texture in its ring.
+    // Each layer's own image is independent of every other layer's, so the two
+    // halves are split: raster across all cores, then upload on this thread,
+    // which is the one that owns the GL context. `scene_example8` has 35
+    // particle systems and spent 230 ms a frame here doing them one at a time.
+    let cpu_start = Instant::now();
+    let refreshed = state
+        .layers
+        .par_iter_mut()
+        .map(|layer| match &mut layer.kind {
+            // A composition layer's input is produced on the GPU during the
+            // composite pass below, not here.
+            LiveKind::Image | LiveKind::Composition { .. } => Ok(None),
+            LiveKind::Puppet(index) => {
+                let StaticItem::Puppet(puppet) = &static_scene.items[*index] else {
+                    unreachable!("a Puppet LiveKind always points at a Puppet item")
+                };
+                let (image, left, top) = compose::warp_frame(puppet, time);
+                let rect = rect_of(left, top, &image);
+                Ok(Some(Refreshed::Image(image, rect)))
+            }
+            LiveKind::ParticleGpu { placement, preset_path, presets, table, .. } => {
+                let list = particle::build_draw_list(presets, table, preset_path, placement, time)
+                    .with_context(|| format!("simulating {preset_path}"))?;
+                Ok(Some(Refreshed::Shapes(list)))
+            }
+            LiveKind::Particle { placement, preset_path, presets, tints } => {
+                let image = particle::render_system_from(presets, preset_path, placement, time, tints)
+                    .with_context(|| format!("simulating {preset_path}"))?
+                    .image;
+                Ok(Some(Refreshed::Image(image, layer.rect)))
+            }
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    // Shapes cannot be drawn here — this thread owns the GL context, and the
+    // composite below needs them in z-order — so they ride along to it.
+    let upload_start = Instant::now();
+    let mut shapes = Vec::with_capacity(state.layers.len());
+    for (layer, refreshed) in state.layers.iter_mut().zip(refreshed) {
+        match refreshed {
+            Some(Refreshed::Image(image, rect)) => {
+                layer.rect = rect;
+                if let Some(textures) = &mut layer.textures {
+                    textures.refresh(&state.gl, &image)?;
+                }
+                shapes.push(None);
+            }
+            Some(Refreshed::Shapes(list)) => shapes.push(Some(list)),
+            None => shapes.push(None),
+        }
+    }
+    state.frames_since.upload += upload_start.elapsed();
+
+    state.frames_since.cpu += cpu_start.elapsed();
+    Ok(shapes)
 }
 
 /// Frame rate plus where the frame went, split at the one seam that matters:

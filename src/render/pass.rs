@@ -342,7 +342,7 @@ fn build_quad_from(gl: &glow::Context, vertices: &[f32; 20]) -> Result<Quad> {
     Ok(Quad { vertex_array, _buffer: buffer })
 }
 
-fn bytes_of(values: &[f32]) -> &[u8] {
+pub fn bytes_of(values: &[f32]) -> &[u8] {
     // Safety: any bit pattern is a valid `f32`, and the slice's lifetime and
     // length are carried through unchanged — this is a reinterpretation, not
     // a resize.
@@ -636,10 +636,15 @@ const COMPOSITE_MAIN: &str = "\n\
     uniform sampler2D u_Backdrop;\n\
     uniform int u_Mode;\n\
     uniform float u_Alpha;\n\
+    uniform int u_Premultiplied;\n\
     void main() {\n\
         vec4 src = texture(u_Texture, v_TexCoord);\n\
         src *= u_Alpha;\n\
         if (u_Mode == 0) { o_Color = src; return; }\n\
+        // The blend arms below are written against straight alpha, so a\n\
+        // premultiplied source (the particle pass's target) has to be undone\n\
+        // first — this is the path `scene_example8`'s refracting wet snow takes.\n\
+        if (u_Premultiplied != 0) { src.rgb /= max(src.a, 1.0 / 255.0); }\n\
         vec4 dst = texture(u_Backdrop, clamp(v_Backdrop, 0.0, 1.0));\n\
         vec3 blended = ApplyBlending(u_Mode, dst.rgb, src.rgb, src.a);\n\
         o_Color = vec4(mix(dst.rgb, blended, dst.a), dst.a);\n\
@@ -671,6 +676,22 @@ pub fn clear_target(gl: &glow::Context, target: &Target, color: [f32; 4]) {
     }
 }
 
+/// Confine every following draw to `(left, top, width, height)`, measured from
+/// the target's top-left — GL's own scissor box counts rows from the bottom.
+///
+/// The particle pass knows the rectangle its system actually covers, and a
+/// canvas-sized composite over a corner of the screen is pure fill.
+pub fn set_scissor(gl: &glow::Context, (left, top, width, height): (i32, i32, i32, i32), target_height: i32) {
+    unsafe {
+        gl.enable(glow::SCISSOR_TEST);
+        gl.scissor(left, target_height - top - height, width, height);
+    }
+}
+
+pub fn clear_scissor(gl: &glow::Context) {
+    unsafe { gl.disable(glow::SCISSOR_TEST) };
+}
+
 /// Composite `texture` into `target` at pixel rectangle `(left, top, width,
 /// height)` measured from the canvas's top-left. `additive` picks between
 /// `dst·(1-srcA) + src·srcA` (normal) and `dst + src·srcA` with the alpha
@@ -692,6 +713,7 @@ pub fn composite_layer_blended(
     backdrop: Option<glow::Texture>,
     roll: f32,
     alpha: f32,
+    premultiplied: bool,
 ) {
     let blended = mode != 0 && backdrop.is_some();
     #[expect(clippy::cast_possible_wrap, reason = "wallpaper canvases are nowhere near i32::MAX")]
@@ -705,19 +727,24 @@ pub fn composite_layer_blended(
             // The shader has already folded the backdrop in, so writing must
             // replace rather than blend a second time.
             gl.disable(glow::BLEND);
-        } else if additive {
-            gl.enable(glow::BLEND);
-            gl.blend_equation_separate(glow::FUNC_ADD, glow::MAX);
-            gl.blend_func_separate(glow::SRC_ALPHA, glow::ONE, glow::ONE, glow::ONE);
         } else {
+            // A premultiplied source has its alpha already folded into RGB, so
+            // it needs no source factor of its own; everything else is the same
+            // rule.
+            let source = if premultiplied { glow::ONE } else { glow::SRC_ALPHA };
             gl.enable(glow::BLEND);
-            gl.blend_equation_separate(glow::FUNC_ADD, glow::FUNC_ADD);
-            gl.blend_func_separate(
-                glow::SRC_ALPHA,
-                glow::ONE_MINUS_SRC_ALPHA,
-                glow::ONE,
-                glow::ONE_MINUS_SRC_ALPHA,
-            );
+            if additive {
+                gl.blend_equation_separate(glow::FUNC_ADD, glow::MAX);
+                gl.blend_func_separate(source, glow::ONE, glow::ONE, glow::ONE);
+            } else {
+                gl.blend_equation_separate(glow::FUNC_ADD, glow::FUNC_ADD);
+                gl.blend_func_separate(
+                    source,
+                    glow::ONE_MINUS_SRC_ALPHA,
+                    glow::ONE,
+                    glow::ONE_MINUS_SRC_ALPHA,
+                );
+            }
         }
 
         gl.use_program(Some(compositor.program.handle));
@@ -745,6 +772,9 @@ pub fn composite_layer_blended(
         }
         if let Some(location) = gl.get_uniform_location(compositor.program.handle, "u_Alpha") {
             gl.uniform_1_f32(Some(&location), alpha.clamp(0.0, 1.0));
+        }
+        if let Some(location) = gl.get_uniform_location(compositor.program.handle, "u_Premultiplied") {
+            gl.uniform_1_i32(Some(&location), i32::from(premultiplied));
         }
         gl.active_texture(glow::TEXTURE1);
         // Bind *something* even when there is no backdrop: the sampler is

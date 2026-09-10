@@ -485,13 +485,12 @@ pub struct Placement {
 pub const EXACT_SIM_STEPS: u32 = MAX_STEPS;
 
 /// A live particle's local position (sim units) to an output-pixel point.
-fn to_screen(place: &Placement, local: Vec2) -> Point {
+fn to_screen(place: &Placement, local: Vec2) -> Vec2 {
     // Roll in the system's own (Y-up) space, before the flip to image rows.
     let (cos, sin) = place.roll;
     let rolled = Vec2::new(local.x * cos - local.y * sin, local.x * sin + local.y * cos);
     let scaled = Vec2::new(rolled.x * place.scale.x, -rolled.y * place.scale.y) * place.px_per_unit;
-    let p = place.origin_px + scaled;
-    Point::from_xy(p.x, p.y)
+    place.origin_px + scaled
 }
 
 // ---------------------------------------------------------------------------
@@ -878,6 +877,97 @@ fn slot_particle(em: &Emission, slot: u32, time: f32) -> Option<(u64, f32)> {
 }
 
 // ---------------------------------------------------------------------------
+// Draw lists
+// ---------------------------------------------------------------------------
+
+/// What one particle contributes to a frame, in output pixels.
+///
+/// Simulation stops here. Turning a list of these into pixels is the caller's:
+/// the live window feeds them to the GPU as instanced quads, the still
+/// exporter fills them with tiny-skia. They were the same code until the CPU
+/// fill turned out to be the entire live frame budget (plan.md §4.16).
+pub enum Shape {
+    /// `radius` sets the longer side of the sprite's rect and its own aspect
+    /// sets the other; `rotation` rolls it about its centre, in radians.
+    Sprite { center: Vec2, radius: f32, rotation: f32 },
+    /// A stroke through `points`, `radius` wide, painted with the sprite
+    /// pattern anchored on the head's own rect — so the tail carries the
+    /// sprite's clamped edge, not a repeat of it.
+    Trail { points: Vec<Vec2>, radius: f32 },
+}
+
+pub struct DrawItem {
+    /// Which sprite, as an index into the system's `SpriteTable`.
+    pub sprite: usize,
+    pub blend: model::Blend,
+    /// Multiplier on the sprite's RGB.
+    pub color: Vec3,
+    pub weight: f32,
+    pub shape: Shape,
+}
+
+/// One frame of one particle object, in draw order.
+pub struct DrawList {
+    pub canvas_px: (u32, u32),
+    pub items: Vec<DrawItem>,
+    /// Names of preset features encountered but not simulated.
+    pub unsupported: Vec<String>,
+}
+
+/// The presets a draw list can name, in a fixed order.
+///
+/// A `DrawItem` names its sprite by number so the list carries no borrow of
+/// the presets and can cross a thread boundary; the order has to be stable
+/// across frames because the GPU renderer uploads one texture per entry once
+/// and indexes it every frame. `HashMap`'s own iteration order is not.
+pub struct SpriteTable {
+    keys: Vec<String>,
+    index: HashMap<String, usize>,
+}
+
+pub fn sprite_table(presets: &HashMap<String, Preset>) -> SpriteTable {
+    let mut keys: Vec<String> = presets.keys().cloned().collect();
+    keys.sort();
+    let index = keys.iter().cloned().enumerate().map(|(slot, key)| (key, slot)).collect();
+    SpriteTable { keys, index }
+}
+
+pub fn sprite_count(table: &SpriteTable) -> usize {
+    table.keys.len()
+}
+
+/// The blend every preset in the system shares, or `None` when they differ.
+///
+/// A system whose presets all draw the same way can be drawn straight onto the
+/// frame instead of into a layer of its own: summing into a transparent layer
+/// and then adding that layer is the same arithmetic as adding each particle,
+/// and alpha-over is associative, so the two-stage version is a no-op either
+/// way. A system mixing `additive` and `translucent` presets is neither, and
+/// has to keep its own layer.
+pub fn uniform_blend(presets: &HashMap<String, Preset>) -> Option<model::Blend> {
+    let mut blends = presets.values().map(|preset| preset.blend);
+    let first = blends.next()?;
+    blends.all(|blend| blend == first).then_some(first)
+}
+
+fn sprite_of<'a>(
+    presets: &'a HashMap<String, Preset>,
+    table: &SpriteTable,
+    slot: usize,
+) -> Option<&'a Pixmap> {
+    presets.get(table.keys.get(slot)?)?.sprite.as_ref()
+}
+
+/// The `slot`th sprite as straight-alpha RGBA, for a GL upload.
+pub fn sprite_rgba(
+    presets: &HashMap<String, Preset>,
+    table: &SpriteTable,
+    slot: usize,
+) -> Option<RgbaImage> {
+    Some(pixmap_to_rgba(sprite_of(presets, table, slot)?))
+}
+
+// ---------------------------------------------------------------------------
 // Rasterization
 // ---------------------------------------------------------------------------
 
@@ -929,16 +1019,15 @@ fn channel(value: u8, factor: f32) -> u8 {
     (f32::from(value) * factor.clamp(0.0, 1.0)).round() as u8
 }
 
-#[expect(clippy::too_many_arguments, reason = "one particle's full draw state")]
-fn draw_particle(
-    pixmap: &mut Pixmap,
+/// Turn one live particle into the shapes that draw it: an optional trail,
+/// then the sprite itself, in that order.
+fn push_particle(
+    out: &mut DrawList,
+    sprite: usize,
     place: &Placement,
     renderer: &Renderer,
     live: &Live,
     blend: model::Blend,
-    base: &Pixmap,
-    cache: &mut HashMap<(u64, u32), Pixmap>,
-    cache_key: u64,
 ) {
     let over = &place.overrides;
     let center = to_screen(place, live.pos);
@@ -951,7 +1040,7 @@ fn draw_particle(
         * place.tint
         * over.brightness.max(0.0);
     let weight = live.alpha * place.alpha * over.alpha.max(0.0);
-    let sprite = tinted_sprite(cache, cache_key, base, color);
+    let mut push = |shape, weight| out.items.push(DrawItem { sprite, blend, color, weight, shape });
 
     let to_px = place.scale.x.abs() * place.px_per_unit;
     match renderer {
@@ -964,31 +1053,59 @@ fn draw_particle(
             let back = by_speed.min(by_cap);
             if back.is_finite() && back > 1.0 {
                 let dir = vel_px.normalize_or_zero();
-                let tail = Point::from_xy(center.x - dir.x * back, center.y - dir.y * back);
-                stroke_trail(pixmap, sprite, &[tail, center], radius, weight * 0.6, blend);
+                let tail = center - dir * back;
+                push(Shape::Trail { points: vec![tail, center], radius }, weight * 0.6);
             }
         }
         Renderer::RopeTrail { .. } if live.trail.len() > 1 => {
-            let points: Vec<Point> = live.trail.iter().map(|p| to_screen(place, *p)).collect();
-            stroke_trail(pixmap, sprite, &points, radius, weight * 0.6, blend);
+            let points = live.trail.iter().map(|p| to_screen(place, *p)).collect();
+            push(Shape::Trail { points, radius }, weight * 0.6);
         }
         _ => {}
     }
 
-    let Some(rect) = sprite_rect(sprite, center, radius) else {
-        return;
-    };
-    let Some(paint) = sprite_paint(sprite, weight, rect, blend) else {
-        return;
-    };
-    // Rolled about the sprite's own centre. tiny-skia applies the transform to
-    // the pattern as well as to the rectangle, so the sprite turns with it.
-    let transform = if live.rotation.abs() > 1e-4 {
-        Transform::from_rotate_at(live.rotation.to_degrees(), center.x, center.y)
-    } else {
-        Transform::identity()
-    };
-    pixmap.fill_rect(rect, &paint, transform, None);
+    push(Shape::Sprite { center, radius, rotation: live.rotation }, weight);
+}
+
+/// Fill a draw list with tiny-skia.
+///
+/// The still exporter's path, and the live window's fallback for a particle
+/// layer that carries effects. `tints` survives across frames: building a
+/// recoloured copy of a 1024x1024 sprite costs more than simulating every
+/// particle that uses it.
+pub fn rasterize(
+    presets: &HashMap<String, Preset>,
+    table: &SpriteTable,
+    list: &DrawList,
+    tints: &mut TintCache,
+) -> Result<RgbaImage> {
+    let (width, height) = list.canvas_px;
+    let mut pixmap = Pixmap::new(width.max(1), height.max(1)).context("allocating a particle canvas")?;
+    for item in &list.items {
+        let Some(base) = sprite_of(presets, table, item.sprite) else { continue };
+        let sprite = tinted_sprite(tints, item.sprite as u64, base, item.color);
+        match &item.shape {
+            Shape::Sprite { center, radius, rotation } => {
+                let head = Point::from_xy(center.x, center.y);
+                let Some(rect) = sprite_rect(sprite, head, *radius) else { continue };
+                let Some(paint) = sprite_paint(sprite, item.weight, rect, item.blend) else { continue };
+                // Rolled about the sprite's own centre. tiny-skia applies the
+                // transform to the pattern as well as to the rectangle, so the
+                // sprite turns with it.
+                let transform = if rotation.abs() > 1e-4 {
+                    Transform::from_rotate_at(rotation.to_degrees(), head.x, head.y)
+                } else {
+                    Transform::identity()
+                };
+                pixmap.fill_rect(rect, &paint, transform, None);
+            }
+            Shape::Trail { points, radius } => {
+                let points: Vec<Point> = points.iter().map(|p| Point::from_xy(p.x, p.y)).collect();
+                stroke_trail(&mut pixmap, sprite, &points, *radius, item.weight, item.blend);
+            }
+        }
+    }
+    Ok(pixmap_to_rgba(&pixmap))
 }
 
 /// Stroke a sprite-coloured line through `points` — how both trail renderers
@@ -1076,23 +1193,22 @@ fn blend_mode(blend: model::Blend) -> BlendMode {
     }
 }
 
-/// Render one preset and its child systems into `pixmap`.
+/// Collect one preset and its child systems into `out`.
 ///
 /// A plain (sibling) child system is independent of the parent's particles and
 /// is rendered **once**; an `eventfollow` child rides each parent particle, so
 /// it is rendered once per live parent with its origin moved to that particle.
-#[expect(clippy::too_many_arguments, reason = "recursion carries the full render context")]
-fn render_preset(
+#[expect(clippy::too_many_arguments, reason = "recursion carries the full collect context")]
+fn collect_preset(
     presets: &HashMap<String, Preset>,
+    table: &SpriteTable,
     key: &str,
-    pixmap: &mut Pixmap,
+    out: &mut DrawList,
     place: &Placement,
     time: f32,
     starttime: f32,
     salt: u64,
     depth: u32,
-    unsupported: &mut Vec<String>,
-    cache: &mut HashMap<(u64, u32), Pixmap>,
 ) {
     let Some(preset) = presets.get(key) else {
         return;
@@ -1100,7 +1216,7 @@ fn render_preset(
     let Some(emitter) = preset.emitter.first() else {
         return;
     };
-    note_unsupported(preset, emitter, unsupported);
+    note_unsupported(preset, emitter, &mut out.unsupported);
 
     let renderer = preset.renderer.first().unwrap_or(&Renderer::Sprite);
     let flow = Perlin::new((salt & 0xFFFF_FFFF) as u32);
@@ -1111,17 +1227,18 @@ fn render_preset(
     // Sibling child systems: rendered once, alongside the parent system.
     if depth + 1 < MAX_DEPTH {
         for child in children.clone().filter(|child| child.r#type != "eventfollow") {
-            render_preset(
-                presets, &child.name, pixmap, place, time, starttime,
-                salt ^ fnv1a(&child.name), depth + 1, unsupported, cache,
+            collect_preset(
+                presets, table, &child.name, out, place, time, starttime,
+                salt ^ fnv1a(&child.name), depth + 1,
             );
         }
     }
 
     // Each slot's whole trajectory is re-integrated from birth (the stateless
     // design that keeps frames independently addressable), which gets costly as
-    // particles age — so integrate every alive slot in parallel, then rasterize
-    // and hang `eventfollow` children serially since `Pixmap` is not `Sync`.
+    // particles age — so integrate every alive slot in parallel, then emit the
+    // shapes and hang `eventfollow` children serially, which is what fixes
+    // their draw order.
     let alive: Vec<(u64, f32, Live)> = (0..em.maxcount)
         .into_par_iter()
         .filter_map(|slot| {
@@ -1133,22 +1250,20 @@ fn render_preset(
         })
         .collect();
 
-    // By reference: the stock sprites are 1024x1024, so cloning one per system
-    // per frame is megabytes of memcpy before a single particle is drawn.
-    let fallback = preset.sprite.is_none().then(|| sprite::stand_in("particle/halo"));
-    let Some(base) = preset.sprite.as_ref().or(fallback.as_ref()) else {
+    // `collect_presets` resolves a sprite for every preset it parses (falling
+    // back to a stand-in itself), so a missing one means a hand-built preset
+    // with nothing to draw.
+    let Some(sprite) = table.index.get(key).copied().filter(|_| preset.sprite.is_some()) else {
         return;
     };
-    let cache_key = fnv1a(key);
     for (n, birth, live) in &alive {
-        draw_particle(pixmap, place, renderer, live, preset.blend, base, cache, cache_key);
+        push_particle(out, sprite, place, renderer, live, preset.blend);
         if depth + 1 < MAX_DEPTH {
             for child in children.clone().filter(|child| child.r#type == "eventfollow") {
-                let at = to_screen(place, live.pos);
-                let child_place = Placement { origin_px: Vec2::new(at.x, at.y), ..place.clone() };
-                render_preset(
-                    presets, &child.name, pixmap, &child_place, time, *birth,
-                    salt ^ n.wrapping_mul(0x9E37_79B9), depth + 1, unsupported, cache,
+                let child_place = Placement { origin_px: to_screen(place, live.pos), ..place.clone() };
+                collect_preset(
+                    presets, table, &child.name, out, &child_place, time, *birth,
+                    salt ^ n.wrapping_mul(0x9E37_79B9), depth + 1,
                 );
             }
         }
@@ -1203,6 +1318,22 @@ pub fn render_system(
     render_system_from(&presets, preset_path, place, time, &mut TintCache::new())
 }
 
+/// Simulate an already-parsed system at `time` into the shapes that draw it,
+/// without touching a pixel. Both renderers start here.
+pub fn build_draw_list(
+    presets: &HashMap<String, Preset>,
+    table: &SpriteTable,
+    preset_path: &str,
+    place: &Placement,
+    time: f32,
+) -> Result<DrawList> {
+    let start = presets.get(preset_path).context("particle preset had no body")?.starttime;
+    let mut list = DrawList { canvas_px: place.canvas_px, items: Vec::new(), unsupported: Vec::new() };
+    let salt = 0x5EED_u64.wrapping_add(fnv1a(preset_path));
+    collect_preset(presets, table, preset_path, &mut list, place, time, start, salt, 0);
+    Ok(list)
+}
+
 /// Sprites recoloured for a particle's tint, kept across frames.
 ///
 /// Building one is a clone plus a pass over every pixel, and the stock sprites
@@ -1233,18 +1364,10 @@ pub fn render_system_from(
     time: f32,
     tints: &mut TintCache,
 ) -> Result<ParticleLayer> {
-    let start = presets.get(preset_path).context("particle preset had no body")?.starttime;
-
-    let (w, h) = place.canvas_px;
-    let mut pixmap = Pixmap::new(w.max(1), h.max(1)).context("allocating a particle canvas")?;
-    let mut unsupported = Vec::new();
-
-    let salt = 0x5EED_u64.wrapping_add(fnv1a(preset_path));
-    render_preset(
-        presets, preset_path, &mut pixmap, place, time, start, salt, 0, &mut unsupported, tints,
-    );
-
-    Ok(ParticleLayer { image: pixmap_to_rgba(&pixmap), unsupported })
+    let table = sprite_table(presets);
+    let list = build_draw_list(presets, &table, preset_path, place, time)?;
+    let image = rasterize(presets, &table, &list, tints)?;
+    Ok(ParticleLayer { image, unsupported: list.unsupported })
 }
 
 fn collect_presets(

@@ -782,9 +782,65 @@ So an incremental live particle state — keeping each slot's `Motion` and
 advancing it by one frame — buys nothing, and was reverted after being measured.
 The fix is to stop rasterizing particles on the CPU: draw them as instanced
 quads through the GL context that is already open, which removes the fill *and*
-the 4–19 ms per frame spent uploading the finished raster back to the GPU. That
-is a large change (blend-mode parity with tiny-skia's `Plus`/`SourceOver`, and
-the still exporter has to keep working) and is not started.
+the 4–19 ms per frame spent uploading the finished raster back to the GPU.
+
+### 4.17 Particles on the GPU — what it cost and what it bought
+
+Done (`render/particles.rs`). Simulation now stops at a `particle::DrawList`;
+what turns that into pixels is the caller's, so the same simulation feeds the
+instanced GL pass and tiny-skia both. The CPU raster survives as the still
+exporter's path and as the live fallback for a particle layer carrying effects
+— no corpus particle object has any, all 41 across eight scenes declare zero.
+
+| live, at `g_Time` 6 s | before | after |
+|---|---|---|
+| `scene_example3` | 15 fps (cpu 66, upload 4, gpu 0 ms) | **120 fps** (cpu 0, upload 0, gpu 1 ms) |
+| `scene_example6` | 10 fps (cpu 95, upload 15, gpu 2 ms) | **50 fps** (cpu 15, upload 4, gpu 3 ms) |
+| `scene_example8` | 15 fps (cpu 43, upload 19, gpu 5 ms) | 15 fps (cpu 1, upload 0, gpu 50 ms) |
+
+Verified as a number, not an impression: forcing the CPU path at full
+resolution and diffing the composited frame puts the instanced pass at 51.2 dB
+PSNR on `scene_example3` and 47.5 dB on `scene_example6`. Against the
+*unmodified* pre-change baseline `scene_example3` is 65.8 dB — the remaining
+gap on the other two is resolution, not rasterization, because the CPU path had
+to shrink its canvas and this one does not.
+
+Three things were only learnt by measuring:
+
+- **The per-layer composite was the cost, not the fill.** The obvious shape —
+  each system into its own scratch target, then composite — made
+  `scene_example8` *worse* than the CPU path (11 fps, 88 ms of GPU). Dropping
+  the scratch to 0.35× the canvas moved it by 5 ms, which is what proved the
+  fill was never the problem: 35 canvas-sized composites were. Drawing
+  straight onto the frame instead removed both the clear and the composite and
+  took it to 50 ms. A system only needs a layer of its own when it mixes
+  `additive` and `translucent` presets, or its layer carries a
+  `colorBlendMode` or an alpha track; otherwise summing into a transparent
+  layer and adding that layer is the same arithmetic as adding each particle,
+  and alpha-over is associative.
+- **Premultiplied alpha is what makes the blends match.** GL's fixed-function
+  blending reproduces tiny-skia's `Plus`/`SourceOver` exactly on premultiplied
+  source and cannot on straight. So the particle pass writes premultiplied and
+  `composite_layer_blended` takes a flag, rather than the pass paying a
+  full-canvas unpremultiply the compositor would only undo. The flag matters
+  for exactly one thing: the blend-mode arms are written against straight
+  alpha, which is the path `scene_example8`'s refracting wet snow takes.
+- **`glDrawArraysInstancedBaseInstance` is GL 4.2 and macOS stops at 4.1.**
+  Each batch re-points its four instance attributes at its own slice instead.
+
+`scene_example8` is unchanged in frame rate but draws its particles at the full
+4K canvas instead of 0.24× of it, and is visibly closer to its own
+`preview.gif` for it — the upscale was smearing fog across the whole frame.
+Its remaining 50 ms is real overdraw: 35 fog and smoke systems whose sprites
+each cover most of a 4K canvas. The next move for it is one of
+
+- merge a *run* of consecutive particle layers into one reduced-resolution
+  scratch composited once — `scene_example8`'s 41 particle objects fall into
+  runs of 29, 1, 6 and 4, so the big run would collapse to a single composite
+  and could then afford to be drawn at half resolution;
+- or render the whole scene at display resolution rather than at the authored
+  canvas resolution, which is what Wallpaper Engine itself does and would help
+  every layer, not just particles.
 
 ---
 
