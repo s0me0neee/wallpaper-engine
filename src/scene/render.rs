@@ -453,6 +453,15 @@ pub fn prepare_effect_chain(
                     .chain(uniform_ints(&fragment_declarations, &effect_pass.constantshadervalues))
                     .collect::<Vec<_>>();
 
+                if std::env::var_os("SIMULATE_TRACE").is_some() {
+                    let bound: Vec<String> = floats
+                        .iter()
+                        .filter(|(name, _)| name.ends_with("Resolution"))
+                        .map(|(name, value)| format!("{name}={:?}", &value[..2]))
+                        .collect();
+                    eprintln!("    pass {stem} target {target_width}x{target_height}  {}", bound.join(" "));
+                }
+
                 let target = pass::Target::with_format(gl, target_width, target_height, format)
                     .with_context(|| format!("allocating a render target for {stem}"))?;
 

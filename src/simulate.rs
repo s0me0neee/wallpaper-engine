@@ -32,7 +32,7 @@ use glutin::surface::{GlSurface, Surface, SurfaceAttributesBuilder, SwapInterval
 use glutin_winit::{DisplayBuilder, GlWindow};
 use image::RgbaImage;
 use raw_window_handle::HasWindowHandle;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ffi::CString;
 use std::num::NonZeroU32;
 use std::ops::Range;
@@ -386,6 +386,10 @@ struct State {
     panel: Vec<(String, f32, f32)>,
     /// Rolling frame counter and per-phase timings for the once-a-second line.
     frames_since: FrameStats,
+    /// Frames drawn since the window opened, for `SIMULATE_DUMP`'s warm-up.
+    /// Separate from `frames_since.frames`, which the fps line resets every
+    /// second: a scene slower than 1 fps never reached the warm-up count.
+    frames_drawn: u32,
 }
 
 /// `(left, top, width, height)` in canvas pixels for an image placed with its
@@ -454,6 +458,7 @@ impl App<'_> {
         for note in &omissions {
             println!("  not simulated: {note}");
         }
+        report_layer_roster(&layers);
         report_tweakables(&layers);
         let panel = panel_labels(&layers);
 
@@ -479,6 +484,7 @@ impl App<'_> {
             tweak_values,
             panel,
             frames_since: FrameStats::new(),
+            frames_drawn: 0,
         })
     }
 
@@ -883,7 +889,12 @@ fn redraw(app: &mut App, time: f32) -> Result<bool> {
     // Stack the layers into the composite target, each under its blend mode.
     let gpu_start = Instant::now();
     pass::clear_target(&state.gl, &state.composite, state.background);
+    let only = layer_filter();
     for (index, layer) in state.layers.iter().enumerate() {
+        if only.as_ref().is_some_and(|wanted| !wanted.contains(&index)) {
+            continue;
+        }
+
         // A GPU particle layer draws its own pixels and composites them under
         // a scissor, so it never touches a layer texture at all.
         if let LiveKind::ParticleGpu { sprites, ground, .. } = &layer.kind {
@@ -940,8 +951,8 @@ fn redraw(app: &mut App, time: f32) -> Result<bool> {
     // per-layer chains + GPU compositing can be eyeballed headlessly.
     // Pair with `SIMULATE_TIME=<secs>` to pin `g_Time`.
     if let Ok(path) = std::env::var("SIMULATE_DUMP") {
-        state.frames_since.frames += 1;
-        if state.frames_since.frames >= 2 {
+        state.frames_drawn += 1;
+        if state.frames_drawn >= 2 {
             let frame = capture::read_rgba(
                 &state.gl,
                 state.composite.framebuffer,
@@ -1034,6 +1045,33 @@ fn refresh_layers(
     Ok(shapes)
 }
 
+/// `SIMULATE_LAYERS=0,4,7-9` composites only those layers, so a defect can be
+/// bisected down to the layer that carries it. `all` keeps every layer and just
+/// prints the roster, which is how the indices are discovered. Unset means every
+/// layer, silently.
+fn layer_filter() -> Option<HashSet<usize>> {
+    let spec = std::env::var("SIMULATE_LAYERS").ok()?;
+    if spec.trim() == "all" {
+        return None;
+    }
+    let mut wanted = HashSet::new();
+    for part in spec.split(',').map(str::trim).filter(|part| !part.is_empty()) {
+        match part.split_once('-') {
+            Some((first, last)) => {
+                if let (Ok(first), Ok(last)) = (first.trim().parse(), last.trim().parse::<usize>()) {
+                    wanted.extend(first..=last);
+                }
+            }
+            None => {
+                if let Ok(index) = part.parse() {
+                    wanted.insert(index);
+                }
+            }
+        }
+    }
+    Some(wanted)
+}
+
 /// Frame rate plus where the frame went, split at the one seam that matters:
 /// the CPU half re-skins puppets and re-simulates particles, the GPU half runs
 /// the effect chains and composites. A scene that is slow is almost always slow
@@ -1099,6 +1137,28 @@ fn panel_labels(layers: &[LiveLayer]) -> Vec<(String, f32, f32)> {
         }
     }
     labels
+}
+
+/// The composite order, so `SIMULATE_LAYERS` can name an index.
+fn report_layer_roster(layers: &[LiveLayer]) {
+    if std::env::var_os("SIMULATE_LAYERS").is_none() {
+        return;
+    }
+    for (index, layer) in layers.iter().enumerate() {
+        let kind = match layer.kind {
+            LiveKind::Image => "image",
+            LiveKind::Composition { .. } => "composition",
+            LiveKind::Puppet(_) => "puppet",
+            LiveKind::Particle { .. } => "particle",
+            LiveKind::ParticleGpu { .. } => "particle/gl",
+        };
+        let chain = if layer.chain.is_some() { "chain" } else { "     " };
+        let (left, top, width, height) = layer.rect;
+        println!(
+            "  [{index:2}] {kind:11} blend {:2} {chain} rect {left},{top} {width}x{height} roll {:.3}  {}",
+            layer.blend_mode, layer.roll, layer.name
+        );
+    }
 }
 
 fn report_tweakables(layers: &[LiveLayer]) {
