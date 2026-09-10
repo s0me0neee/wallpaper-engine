@@ -36,7 +36,17 @@ use std::io::{Cursor, Read, Seek, SeekFrom};
 /// cap is 256, but the common case stays on the stack.
 type PerBone<T> = SmallVec<[T; 16]>;
 
-const VERTEX_SIZE: usize = 52; // pos(12) + 4 bone indices(16) + 4 weights(16) + uv(8)
+/// `pos(12) + 4 bone indices(16) + 4 weights(16) + uv(8)`, the layout the
+/// vertex-format word's low half calls 9.
+const VERTEX_SIZE: usize = 52;
+
+/// Format 15 inserts a normal, a tangent and a handedness sign between the
+/// position and the bone indices: `pos(12) + normal(12) + tangent(12) +
+/// handedness(4) + bones(16) + weights(16) + uv(8)`. None of the three matters
+/// to a flat warp — every normal in the corpus is exactly `(0, 0, 1)` — so
+/// they are skipped, but the stride they add is what tells the two apart.
+const VERTEX_SIZE_LIT: usize = 80;
+const LIT_VERTEX_PREFIX: i64 = 28;
 const FRAME_SIZE: usize = 36; // 9 floats: translation(3), euler(3), scale(3)
 const BONE_MATRIX_SIZE: usize = 64; // 4x4 f32 bind matrix, unused (bind pose == clip frame 0)
 
@@ -111,32 +121,61 @@ fn skip(cursor: &mut Cursor<&[u8]>, count: i64) -> Result<()> {
     Ok(())
 }
 
-/// Parse an `MDLV0013` puppet: an `MDLV` mesh block, an `MDLS0001` skeleton,
-/// and an optional `MDLA0001` animation block.
+/// Parse a puppet: an `MDLV` mesh block, an `MDLS` skeleton, and an optional
+/// `MDLA` animation block.
+///
+/// Two container versions are in the corpus and they differ in exactly one
+/// thing that matters — `MDLV0023` carries lit vertices (see `VERTEX_SIZE_LIT`)
+/// and declares the format again just before the buffer. Its `MDLS0004`
+/// skeleton and `MDLA0006` animation blocks are laid out identically to
+/// `MDLS0001`/`MDLA0001`; what looked like differences were two fields this
+/// parser had been reading as fixed one-byte skips and which are really
+/// strings — a bone's name (`眼球` in one corpus model) and a bone's editor
+/// metadata (a JSON blob in `MDLS0004`, empty in `MDLS0001`).
 pub fn parse(bytes: &[u8]) -> Result<Puppet> {
     let mut cursor = Cursor::new(bytes);
 
     let mut magic = [0u8; 8];
     cursor.read_exact(&mut magic)?;
-    if &magic != b"MDLV0013" {
-        bail!("not an MDLV0013 puppet model");
-    }
-    skip(&mut cursor, 1)?;
+    let lit = match &magic {
+        b"MDLV0013" => false,
+        b"MDLV0023" => true,
+        other => bail!("not a puppet model ({})", String::from_utf8_lossy(other)),
+    };
+    read_cstring(&mut cursor)?; // model name, empty throughout the corpus
     cursor.read_u32::<LittleEndian>()?;
     cursor.read_u32::<LittleEndian>()?;
     cursor.read_u32::<LittleEndian>()?;
     read_cstring(&mut cursor)?; // material path, resolved via the model JSON instead
-    cursor.read_u32::<LittleEndian>()?;
+
+    // The newer container repeats the vertex format immediately before the
+    // buffer, behind 28 bytes that are zero in every corpus model. Only the
+    // low half of the word carries the attribute mask: one model writes it as
+    // `0x0000000f` where the rest write `0x0180000f`.
+    let vertex_size = if lit {
+        skip(&mut cursor, LIT_VERTEX_PREFIX)?;
+        match cursor.read_u32::<LittleEndian>()? & 0xffff {
+            15 => VERTEX_SIZE_LIT,
+            9 => VERTEX_SIZE,
+            other => bail!("unknown puppet vertex format ({other})"),
+        }
+    } else {
+        cursor.read_u32::<LittleEndian>()?;
+        VERTEX_SIZE
+    };
 
     let vertex_bytes = cursor.read_u32::<LittleEndian>()? as usize;
-    if !vertex_bytes.is_multiple_of(VERTEX_SIZE) || vertex_bytes / VERTEX_SIZE > MAX_VERTICES {
+    if !vertex_bytes.is_multiple_of(vertex_size) || vertex_bytes / vertex_size > MAX_VERTICES {
         bail!("implausible puppet vertex block ({vertex_bytes} bytes)");
     }
-    let mut vertices = Vec::with_capacity(vertex_bytes / VERTEX_SIZE);
-    for _ in 0..vertex_bytes / VERTEX_SIZE {
+    let mut vertices = Vec::with_capacity(vertex_bytes / vertex_size);
+    for _ in 0..vertex_bytes / vertex_size {
         let x = cursor.read_f32::<LittleEndian>()?;
         let y = cursor.read_f32::<LittleEndian>()?;
         cursor.read_f32::<LittleEndian>()?; // z, always 0 for these 2D puppets
+        if vertex_size == VERTEX_SIZE_LIT {
+            skip(&mut cursor, LIT_VERTEX_PREFIX)?; // normal, tangent, handedness
+        }
         let mut bones = [0i32; 4];
         let mut weights = [0f32; 4];
         for bone in &mut bones {
@@ -163,12 +202,16 @@ pub fn parse(bytes: &[u8]) -> Result<Puppet> {
         triangles.push(index);
     }
 
-    let mut skeleton_magic = [0u8; 8];
-    cursor.read_exact(&mut skeleton_magic)?;
-    if &skeleton_magic != b"MDLS0001" {
-        bail!("puppet model has no MDLS0001 skeleton block");
-    }
-    skip(&mut cursor, 1)?;
+    // `MDLV0023` follows its index block with a per-bone trailer (sixteen bytes
+    // each behind a ten-byte header) that `MDLV0013` does not have, so the
+    // skeleton is found rather than assumed to come next — in the older
+    // container the search matches at offset zero.
+    let after_indices = usize::try_from(cursor.position()).unwrap_or(usize::MAX).min(bytes.len());
+    let Some(at) = find(&bytes[after_indices..], b"MDLS") else {
+        bail!("puppet model has no MDLS skeleton block");
+    };
+    cursor.seek(SeekFrom::Start((after_indices + at + 8) as u64))?;
+    read_cstring(&mut cursor)?; // skeleton name, empty throughout the corpus
     cursor.read_u32::<LittleEndian>()?;
     let bone_count = cursor.read_u32::<LittleEndian>()? as usize;
     if bone_count == 0 || bone_count > MAX_BONES {
@@ -176,7 +219,7 @@ pub fn parse(bytes: &[u8]) -> Result<Puppet> {
     }
     let mut bones = Vec::with_capacity(bone_count);
     for _ in 0..bone_count {
-        skip(&mut cursor, 1)?;
+        read_cstring(&mut cursor)?; // bone name
         cursor.read_u32::<LittleEndian>()?;
         let parent = cursor.read_i32::<LittleEndian>()?;
         let matrix_bytes = cursor.read_u32::<LittleEndian>()? as usize;
@@ -184,23 +227,42 @@ pub fn parse(bytes: &[u8]) -> Result<Puppet> {
             bail!("unexpected puppet bone matrix size ({matrix_bytes} bytes)");
         }
         skip(&mut cursor, 64)?; // BONE_MATRIX_SIZE
-        skip(&mut cursor, 1)?;
+        read_cstring(&mut cursor)?; // editor metadata: JSON in MDLS0004, empty in MDLS0001
         bones.push(Bone { parent });
     }
 
+    // `MDLS0004` follows its bones with an editor rig section — handle
+    // positions, colours, a per-bone record we have no use for — so the
+    // animation block is found by looking for it rather than by assuming it
+    // comes next. In `MDLS0001` there is nothing in between and the search
+    // matches at offset zero.
     let consumed = usize::try_from(cursor.position()).unwrap_or(usize::MAX).min(bytes.len());
-    let animations = if bytes[consumed..].starts_with(b"MDLA0001") {
-        parse_animations(&mut cursor, bone_count)?
-    } else {
-        Vec::new()
+    let animations = match find(&bytes[consumed..], b"MDLA") {
+        Some(at) => {
+            cursor.seek(SeekFrom::Start((consumed + at) as u64))?;
+            parse_animations(&mut cursor, bone_count)?
+        }
+        None => Vec::new(),
     };
 
     Ok(Puppet { vertices, triangles, bones, animations })
 }
 
+fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack.windows(needle.len()).position(|window| window == needle)
+}
+
 fn parse_animations(cursor: &mut Cursor<&[u8]>, bone_count: usize) -> Result<Vec<Animation>> {
-    skip(cursor, 8)?; // MDLA0001
-    skip(cursor, 1)?;
+    // The two block versions lay a record out identically and differ only in
+    // the run of bytes separating one record from the next: four in
+    // `MDLA0001`, thirty-five in `MDLA0006`. Both are measured off the
+    // multi-clip models — `jiemao` for the older, `人物`'s three clips for the
+    // newer — and a single-clip model cannot distinguish them, since what
+    // follows the last record is the end of the file either way.
+    let mut magic = [0u8; 8];
+    cursor.read_exact(&mut magic)?;
+    let trailer: i64 = if &magic == b"MDLA0001" { 4 } else { 35 };
+    read_cstring(cursor)?; // block name, empty throughout the corpus
     cursor.read_u32::<LittleEndian>()?;
     let animation_count = cursor.read_u32::<LittleEndian>()? as usize;
     if animation_count > MAX_ANIMATIONS {
@@ -243,7 +305,7 @@ fn parse_animations(cursor: &mut Cursor<&[u8]>, bone_count: usize) -> Result<Vec
             }
             tracks.push(poses);
         }
-        skip(cursor, 4)?; // trailer separating animation records
+        skip(cursor, trailer)?;
 
         let frame_count = tracks.iter().map(Vec::len).min().unwrap_or(0);
         if frame_count == 0 {

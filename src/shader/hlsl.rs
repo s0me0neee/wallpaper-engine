@@ -40,16 +40,95 @@ use std::sync::OnceLock;
 /// Apply every relaxation, innermost constructs first so that the declaration
 /// cast wraps an expression the earlier passes have already made legal.
 pub fn relax(source: &str) -> String {
-    let types = declared_types(source);
+    // One chunk per top-level function body, so a local name types only inside
+    // the function that declares it. Without that, one file's worth of text —
+    // the shader plus every shim header expanded into it — puts `s` at both
+    // `float` and `vec4`, and `delta` at both `float` and `vec2`, and whichever
+    // way that is resolved corrupts one of the two.
+    let (chunks, scope) = top_level_chunks(source);
+    let global = declared_types(&scope);
+    let signatures = function_parameters(source);
+
+    let mut out = String::with_capacity(source.len());
+    for &(start, end) in &chunks {
+        let chunk = &source[start..end];
+        let mut types = global.clone();
+        types.extend(declared_types(chunk));
+        out.push_str(&relax_chunk(chunk, &types, &signatures));
+    }
+    out
+}
+
+fn relax_chunk(
+    source: &str,
+    types: &HashMap<String, Type>,
+    signatures: &HashMap<String, Vec<Option<Type>>>,
+) -> String {
     let mut out = array_initializers(source);
     out = bool_in_arithmetic(&out);
-    out = float_modulo(&out, &types);
-    out = match_integer_signedness(&out, &types);
-    out = promote_scalar_arguments(&out, &types);
-    out = truncate_call_arguments(&out, &types);
-    out = truncate_mixed_operands(&out, &types);
-    out = cast_assignments(&out, &types);
+    out = float_modulo(&out, types);
+    out = match_integer_signedness(&out, types);
+    out = promote_scalar_arguments(&out, types);
+    out = truncate_call_arguments(&out, types, signatures);
+    out = truncate_mixed_operands(&out, types);
+    out = cast_assignments(&out, types);
     cast_initializers(&out)
+}
+
+/// Chunks that each end just after a brace-depth-0 `}` (so a chunk holds at
+/// most one function body), and separately the text that lies outside every
+/// body — the uniforms, varyings and file-scope constants every chunk can see.
+/// Comments are skipped so a brace inside one does not open a body.
+fn top_level_chunks(source: &str) -> (Vec<(usize, usize)>, String) {
+    let bytes = source.as_bytes();
+    let mut chunks = Vec::new();
+    let mut scope = String::with_capacity(source.len() / 4);
+    let (mut start, mut outside, mut depth, mut at) = (0_usize, 0_usize, 0_i32, 0_usize);
+    while at < bytes.len() {
+        match bytes[at] {
+            b'/' if bytes.get(at + 1) == Some(&b'/') => {
+                while at < bytes.len() && bytes[at] != b'\n' {
+                    at += 1;
+                }
+            }
+            b'/' if bytes.get(at + 1) == Some(&b'*') => {
+                at += 2;
+                while at + 1 < bytes.len() && !(bytes[at] == b'*' && bytes[at + 1] == b'/') {
+                    at += 1;
+                }
+                at = (at + 2).min(bytes.len());
+            }
+            b'{' => {
+                if depth == 0 {
+                    scope.push_str(&source[outside..at]);
+                    scope.push('\n');
+                }
+                depth += 1;
+                at += 1;
+            }
+            b'}' => {
+                depth -= 1;
+                at += 1;
+                if depth <= 0 {
+                    depth = 0;
+                    outside = at;
+                    chunks.push((start, at));
+                    start = at;
+                }
+            }
+            _ => at += 1,
+        }
+    }
+    if outside < bytes.len() {
+        scope.push_str(&source[outside..]);
+    }
+    if start < bytes.len() {
+        chunks.push((start, bytes.len()));
+    }
+    if chunks.is_empty() {
+        chunks.push((0, bytes.len()));
+    }
+    (chunks, scope)
 }
 
 // ---------------------------------------------------------------------------
@@ -775,9 +854,14 @@ fn function_parameters(source: &str) -> HashMap<String, Vec<Option<Type>>> {
 }
 
 /// Narrow any argument passed wider than the parameter it binds to.
-fn truncate_call_arguments(source: &str, types: &HashMap<String, Type>) -> String {
+/// `signatures` comes from the whole file, not from `source`: a function is
+/// routinely defined in one chunk and called from another.
+fn truncate_call_arguments(
+    source: &str,
+    types: &HashMap<String, Type>,
+    signatures: &HashMap<String, Vec<Option<Type>>>,
+) -> String {
     static PATTERN: OnceLock<Regex> = OnceLock::new();
-    let signatures = function_parameters(source);
     let pattern = PATTERN.get_or_init(|| {
         Regex::new(r"\b([A-Za-z_]\w*)\s*\(")
             .unwrap_or_else(|_| unreachable!("the call pattern is a literal"))
@@ -1230,11 +1314,31 @@ mod tests {
     }
 
     #[test]
-    fn a_name_declared_at_two_types_types_nothing() {
-        // The shim headers land in the same text as the shader, so a local
-        // name can genuinely be both. Rewriting either one corrupts the other.
-        let source = "float delta; vec2 delta;\n\tfloat f = delta * 2.0;\n";
-        assert!(relax(source).contains("delta * 2.0"));
+    fn a_local_name_types_only_inside_its_own_function() {
+        // The shim headers land in the same text as the shader, so `s` is
+        // genuinely a `float` in one function and a `vec4` in another.
+        // Resolving that file-wide corrupts whichever one loses.
+        let source = concat!(
+            "uniform float k;\n",
+            "vec2 shim(float angle) { float s = sin(angle); return vec2(s * k, s); }\n",
+            "vec3 body(vec2 uv) { vec4 s = texture(g_Texture0, uv); return pow(s.rgb, k); }\n",
+        );
+        let out = relax(source);
+        assert!(out.contains("vec2(s * k, s)"), "{out}");
+        assert!(out.contains("pow(s.rgb, vec3(k))"), "{out}");
+    }
+
+    #[test]
+    fn a_signature_carries_across_function_bodies() {
+        // Per-function scoping must not hide a callee defined in another
+        // chunk: `bokeh_blur` calls `maskBokeh` forty lines after defining it.
+        let source = concat!(
+            "in vec4 v_TexCoord;\n",
+            "vec3 maskBokeh(vec2 coord, float depth) { return vec3(coord, depth); }\n",
+            "void main() { vec3 c = maskBokeh(v_TexCoord, 1.0); }\n",
+        );
+        let out = relax(source);
+        assert!(out.contains("maskBokeh(vec2(v_TexCoord), 1.0)"), "{out}");
     }
 
     #[test]
