@@ -1023,6 +1023,79 @@ by **exactly zero bits** on this driver, which evidently already folds it. And
 `g_Scale / g_TextureNResolution`, and `SIMULATE_TRACE` confirms the resolutions it
 is handed are the real target sizes, putting its widest tap at about two pixels.
 
+### 4.20 The fog veil: what it is not, and the one number that moved
+
+The veil §4.19 measures — ~2 dB on both `scene_example3` and `scene_example8`,
+the largest remaining defect in the corpus — is **not** a sprite-energy error,
+and most of this section is the list of things it is not, so they are not
+re-suspected.
+
+**Ruled out, each by measurement:**
+
+- *Sprite energy.* The stand-in was suspected of being uncalibrated because
+  `smoke` is absent from §4.10's table and from the test. It is not: the table
+  in `tools/make_sprites.py` carries a measured `particle/smoke/smoke2` at
+  0.462, and decoding the real texture from an install gives energy 0.4332
+  against our stand-in's 0.407 — **6% off, not the 8x the comparison against
+  our own `fog` stand-in suggested**. Real smoke really is ~8x denser than real
+  fog (0.433 vs 0.050), so that ratio is correct and is not a defect.
+- *Sprite shape, in the ordinary sense.* The predicted veil from
+  `mean_energy x weight x count` already matches the observed one, so the
+  deposit is arriving at the sprite's mean, not at a too-bright core.
+- *Blend mode.* `materials/presets/fog1.json` really is `additive`.
+- *Population.* `rate: 0.6` works: effective rate 0.9/s against `maxcount` 20
+  means the cap never binds, and the system has 5 particles alive at t=10.026 —
+  which is `rate x lifetime`, as it should be. An earlier claim here that
+  "`maxcount` is a hard slot count so `rate` does nothing at steady state" is
+  true of the code and false of this preset.
+- *Scene bloom.* `SIMULATE_BLOOM=off` leaves `scene_example8`'s dark-end lift
+  essentially unchanged (§4.19).
+
+**Neither available knob has an optimum.** Sweeping sprite energy and particle
+radius on `scene_example3` against the capture both improve monotonically
+toward the no-fog baseline and saturate there — energy peaks at 16.71 dB
+(against 14.75 at the calibrated value and 16.67 with the layer dropped
+entirely), radius at 16.75 and still climbing at 0.25x. A knob with no interior
+optimum is not the defect; both are just dialling the layer out.
+
+**The one number that moved.** Running `scene_example3` with `--we-assets`
+against a real install, so the fog systems draw the genuine
+`particle/smoke/smoke2` instead of our stand-in:
+
+| `scene_example3` at t=10.026 | PSNR vs capture |
+|---|---|
+| our stand-ins | 14.75 dB |
+| **real textures** | **15.89 dB** |
+| layer dropped entirely | 16.67 dB |
+
+**+1.13 dB from the sprite artwork alone**, at an energy calibrated to within
+6%. So shape does matter here — just not through the core. The reason is
+geometry: these particles are drawn at radius 2891–7036 px on a 3840 px canvas,
+2–4x the canvas width, so only the sprite's **central ~27%** is ever on screen.
+Our stand-in is one Perlin puff, whose centre is denser than its mean; the real
+texture is a 64-cell spritesheet, effectively uniform, whose centre *is* its
+mean. Calibrating a stand-in's whole-image mean is only sound while the whole
+image is visible, which for these systems it never is.
+
+That is the same fact §4.19 found from the other end: every stock particle
+texture is a spritesheet (`spritesheetsequences`, 64 frames of 128x128 for
+`smoke2` and `fog1`) and nothing in `tex.rs`, `sprite.rs` or `particle.rs`
+reads the field. Note the two fixes pull opposite ways and must land together:
+sampling one cell would make the real-texture path draw a single puff, which is
+structurally our stand-in — so it would give back most of the +1.13 dB unless
+the size question below is settled first.
+
+**What is still open.** 5 particles per system, each 2–4x the canvas, at ~5%
+weight each, deposits a visible veil; Wallpaper Engine's own frame has
+essentially none. Energy, count and blend are all now verified, which leaves
+**size**: `sizerandom` 1000–2200 scene units against an object `scale` of 3.71
+and 6.495, with `px_per_unit` 1.0, is what puts the radius past the canvas. The
+open question is whether an object's `scale` should multiply particle *size* at
+all, or only particle *positions* — `particle.rs` currently applies
+`place.scale.x` to both, and collapses a non-uniform scale (3.71 x 2.22) onto
+its x component to do it. Settling that needs ground truth on a scene where a
+single fog particle is separable, which no capture we have provides.
+
 ---
 
 ## 5. The `common.h` problem
