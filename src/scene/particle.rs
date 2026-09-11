@@ -79,6 +79,31 @@ const MAX_STEPS: u32 = 4096;
 const MAX_DEPTH: u32 = 2;
 /// Turbulence-noise sample rate and the pixel speed one unit of noise implies.
 const TURB_INIT_SPEED: f32 = 40.0;
+/// What a preset's `size` has to be divided by to land on screen, beyond the
+/// object's own scale and the scene's pixels-per-unit.
+///
+/// **Measured, not derived** (plan.md §4.20). Taking `size` at face value draws
+/// `scene_example3`'s fog 2-4x wider than the whole canvas. Three independent
+/// routes give the same correction:
+///
+/// - Wallpaper Engine ships 66 preset showcases (`assets/presets/*/preview*/`),
+///   each a small canvas holding one system and nothing else. At no correction,
+///   four of them draw the sprite larger than its own frame — `previewfog1` at
+///   3.2 canvas *widths*. Nobody frames a showcase with the artwork three times
+///   off the edge. The smallest divisor for which **none** of the 66 overflows
+///   is 3.22, and `previewfog1` and `previewfog2` put the ceiling within 4% of
+///   each other from different sizes and different authored scales.
+/// - The veil it causes is +32 levels of white where the capture wants +3.
+///   Deposit goes as area, so 10.2x of area is 3.2x of radius.
+/// - Fitting against five real Wallpaper Engine captures improves all five,
+///   over a peak so flat (0.013 dB across 3.6-4.8) that it cannot choose
+///   between them — so the showcases, not the fit, set the value.
+///
+/// What it *means* is still open, and the precision here is weaker than the
+/// digits suggest: the derivation assumes `previewfog1` fills its frame
+/// exactly, and 90% or 110% instead would swing this between 2.9 and 3.5. That
+/// range covers pi, which is why this is not written as pi.
+const SIZE_DIVISOR: f32 = 3.22;
 
 // ---------------------------------------------------------------------------
 // Preset schema
@@ -1031,7 +1056,10 @@ fn push_particle(
 ) {
     let over = &place.overrides;
     let center = to_screen(place, live.pos);
-    let radius = 0.5 * live.size * place.scale.x.abs() * over.size.max(0.0) * place.px_per_unit;
+    // `0.5` is the diameter-to-radius halving; `SIZE_DIVISOR` is the measured
+    // correction that keeps a fog puff inside the frame at all.
+    let radius = 0.5 * live.size * place.scale.x.abs() * over.size.max(0.0) * place.px_per_unit
+        / SIZE_DIVISOR;
     if radius < 0.25 || live.alpha <= 0.001 {
         return;
     }
