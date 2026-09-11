@@ -8,6 +8,7 @@ pub mod model;
 pub mod particle;
 pub mod puppet;
 pub mod render;
+pub mod script;
 pub mod sprite;
 pub mod text;
 

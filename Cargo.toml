@@ -49,6 +49,11 @@ lz4_flex = { version = "0.14.0", default-features = false, features = [
 # already an encoded image are passed through byte-for-byte and never hit this.
 png = "0.18.1"
 raw-window-handle = "0.6.2"
+# Runs a text layer's own JavaScript — see `scene::script`. QuickJS rather than
+# a pure-Rust engine because these scripts are real ES2020 and lean on `Date`,
+# which has to agree with the system clock a wallpaper's user is reading. It
+# builds from bundled C in a few seconds and needs nothing installed.
+rquickjs = "0.13.0"
 regex = "1.13.1"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"

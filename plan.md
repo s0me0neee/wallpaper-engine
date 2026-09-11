@@ -713,11 +713,13 @@ corpus's rotation is on particles: 31 systems in `scene_example8`, 16 in
 raster the ordinary image path then carries. Two things about the format
 dominate the implementation:
 
-- *The text is usually a script.* It arrives as `{"script", "scriptproperties",
-  "value"}`, and `value` is the design-time preview. Sometimes that is a real
-  string (`"PM O8:24\nApr. 14 2025"`), sometimes a bare placeholder
-  (`"<Date>"`). A placeholder is not drawn — putting the literal text `<Date>` on
-  a wallpaper is worse than leaving the layer out — and the omission says which.
+- *The text is usually a script*, and it is now run — see §4.21. It arrives as
+  `{"script", "scriptproperties", "value"}`, where `value` is only the
+  design-time preview: sometimes a real string frozen at publication
+  (`"PM O8:24\nApr. 14 2025"`, `"12:34"`), sometimes a bare placeholder
+  (`"<Date>"`) that was never drawable. A placeholder is still not drawn when the
+  script cannot run — putting the literal text `<Date>` on a wallpaper is worse
+  than leaving the layer out — and the omission says which.
 - *The font usually is not ours.* Exactly one font in the corpus ships inside a
   package; the rest name a Wallpaper Engine asset or a system family. The search
   is package, then an install, then the system's own fonts by family, so a
@@ -1085,16 +1087,115 @@ sampling one cell would make the real-texture path draw a single puff, which is
 structurally our stand-in — so it would give back most of the +1.13 dB unless
 the size question below is settled first.
 
-**What is still open.** 5 particles per system, each 2–4x the canvas, at ~5%
-weight each, deposits a visible veil; Wallpaper Engine's own frame has
-essentially none. Energy, count and blend are all now verified, which leaves
-**size**: `sizerandom` 1000–2200 scene units against an object `scale` of 3.71
-and 6.495, with `px_per_unit` 1.0, is what puts the radius past the canvas. The
-open question is whether an object's `scale` should multiply particle *size* at
-all, or only particle *positions* — `particle.rs` currently applies
-`place.scale.x` to both, and collapses a non-uniform scale (3.71 x 2.22) onto
-its x component to do it. Settling that needs ground truth on a scene where a
-single fog particle is separable, which no capture we have provides.
+**Settled: `size` needed a divisor, and it is 3.22** (`SIZE_DIVISOR`).
+
+The wrong answer first, because it is instructive. "An object's `scale` should
+stretch the system's space but not its sprites" improves *every* corpus capture
+— ex2 +0.69, ex3 +1.99, ex4 +0.00002, ex5 +0.36, ex8 +1.34 — and is wrong. All
+five of those scenes carry a particle scale *above* 1, so dropping it shrinks
+the sprite, and shrinking the sprite is what scored. A uniformly-signed sample
+is not a cross-validation. Wallpaper Engine's own showcase for this preset,
+`assets/presets/fog/previewfog1`, has scale **0.515**, where that change makes
+the puff nearly twice as large.
+
+The showcases are the evidence. There are 66 of them under
+`assets/presets/*/preview*/`, each a small canvas holding one system and
+nothing else. There is no common framing ratio — a dust-mote showcase and a fog
+bank are not framed alike, and the radius/canvas spread at no correction runs
+0.00 to 1.61 — so the median says nothing. The *ceiling* does: at no correction
+four showcases draw the sprite larger than their own frame, `previewfog1` at
+3.2 canvas widths. The smallest divisor for which none of the 66 overflows is
+**3.22**, and `previewfog1` and `previewfog2` put that ceiling within 4% of
+each other from different sizes (1600 vs 1700) and different authored scales
+(0.515 vs 0.468).
+
+Three independent routes agree: that ceiling; the veil being +32 levels where
+the capture wants +3, which is 10.2x of area and so 3.2x of radius; and a fit
+against the five captures, which improves all five over a peak so flat
+(0.013 dB across 3.6–4.8) that it cannot choose between 3.22 and 4 — so the
+showcases set the value and the fit only corroborates it.
+
+| scene | before | after | delta |
+|---|---|---|---|
+| `scene_example2` | 29.98 | 30.68 | +0.70 |
+| `scene_example3` | 14.75 | 16.73 | **+1.97** |
+| `scene_example4` | 23.92 | 24.42 | +0.50 |
+| `scene_example5` | 19.76 | 20.14 | +0.38 |
+| `scene_example8` | 19.51 | 21.69 | **+2.18** |
+
+`scene_example4` is the discriminating case: its particle objects sit at scale
+1.0, so the scale hypothesis could not move it at all, and the divisor both
+moves it and improves it.
+
+**Still open: what the divisor means.** Nothing yet explains where a factor of
+~3.2 comes from. It is close to pi, and that is probably noise — the derivation
+assumes `previewfog1` fills its frame exactly, and 90% or 110% instead swings
+it between 2.9 and 3.5, a range that covers pi comfortably. It is committed as
+a measured constant for that reason.
+
+**Worth building: a regression test with no capture in it.** "No preset
+showcase draws its particle larger than its own canvas" is a property over 66
+scenes that ship with the engine, needs no GPU and no Windows box, and would
+have rejected the scale-dropping version immediately — that change puts
+`previewfog1` at 3.1 canvas widths. It has to be gated on `WE_ASSETS`, since
+the showcases are engine assets (§5.2). A first attempt is not in the tree: it
+read every showcase but resolved none of them to a size, and was dropped rather
+than committed half-working.
+
+### 4.21 Text layers run their own script
+
+A text layer's string is usually not a string. It is an ES module over a host
+Wallpaper Engine provides, and what `scene.json` stores beside it is the
+design-time preview the editor last saw — frozen. `scene_example3` and
+`scene_example8` both ship clocks reading `"12:34"`, and a wallpaper that has
+been running for years still showed `12:34`. Where the preview was never
+drawable at all (`"<Date>"`, `"<Time and Date>"`) the layer was dropped, which
+is two of the corpus's layers.
+
+`scene/script.rs` runs them, on QuickJS through `rquickjs`. A pure-Rust engine
+was the alternative; QuickJS won because these are real ES2020 leaning on
+`Date`, which has to agree with the system clock the wallpaper's user is
+reading, and it builds from bundled C in seconds with nothing installed.
+
+Only one contract is implemented, and the boundary is deliberate:
+
+```js
+export var scriptProperties = createScriptProperties()
+    .addCheckbox({ name: 'use24hFormat', value: true })
+    .addText({ name: 'delimiter', value: ':' })
+    .finish();
+
+export function update(value) { … return value; }
+```
+
+Build `scriptProperties` from the declared defaults, overlay the layer's own
+settings from `scene.json`, call `update` with the stored value, take what comes
+back. Wallpaper Engine's scripting goes much further — it drives layer
+positions, colours and visibility, and exposes `engine`, `thisLayer` and the
+`wevector`/`wecolor` modules — and none of that is here. Anything outside the
+contract fails, and a failure falls back to the stored value, which is exactly
+where this stood before. Several corpus layers carry only event hooks
+(`mediaPropertiesChange`, needing now-playing media we do not have) and take
+that path.
+
+Two format details. The script has to be **hoisted before the driver strip**,
+the same trick as `hoist_alpha_tracks` (§4.15): `script` and `scriptproperties`
+are themselves driver keys, so `strip_driven_values` would collapse the whole
+`text` object to its `value` and throw the script away. The properties are
+parked as a raw `Value` rather than resolved, precisely so the strip walks them
+on its way past and leaves plain values behind — their entries are driven too
+(`{"user": "_24hourformat", "value": false}`). And `export` is rewritten to a
+plain declaration rather than a module loader being wired up: these are
+single-file scripts with no imports between them, so a module graph would be
+plumbing with nothing to resolve.
+
+All seven scripts in the corpus run. `scene_example8`'s "time and date" and
+`scene_example6`'s "Date" were omissions and now draw; `scene_example3`'s,
+`scene_example6`'s and `scene_example8`'s clocks now read the wall clock instead
+of `12:34`. Verified against the real thing by shape rather than by pixels — the
+capture's own overlay reads `PM 02:04 / Sep. 10 2026` and ours reads
+`PM 10:26 / Sep. 10 2026` at the same place in the same format, which is the
+most a clock can be checked against a capture taken at another hour.
 
 ---
 

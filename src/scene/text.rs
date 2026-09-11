@@ -23,6 +23,7 @@
 //! whose font resolves nowhere is reported rather than silently substituted.
 
 use super::model::Object;
+use super::script;
 use crate::pkg::Archive;
 use ab_glyph::{Font, FontVec, PxScale, ScaleFont};
 use image::{Rgba, RgbaImage};
@@ -90,6 +91,19 @@ fn fitted_size<F: Font>(font: &F, text: &str, (width, height): (f32, f32)) -> f3
     by_height.min(by_width).max(1.0)
 }
 
+/// What this layer's own script says the text is right now, if it has one and
+/// it runs.
+///
+/// `None` means there is nothing to prefer over the stored value — no script,
+/// or a script this host cannot drive (several layers carry only event hooks
+/// like `mediaPropertiesChange`, which need now-playing media we do not have).
+/// Either way the caller falls back to the stored string, which is where this
+/// stood before scripts ran at all.
+fn live_text(object: &Object, stored: &str) -> Option<String> {
+    let script = object.text_script.as_deref()?;
+    script::run_text(script, object.text_script_properties.as_ref(), stored).ok()
+}
+
 /// Render one text object into an image of `(width, height)` pixels.
 ///
 /// Returns `Err` with a reason the caller can surface as an omission.
@@ -99,9 +113,14 @@ pub fn render(
     object: &Object,
     (width, height): (u32, u32),
 ) -> Result<Rendered, String> {
-    let text = object.text.as_deref().unwrap_or_default();
+    let stored = object.text.as_deref().unwrap_or_default();
+    let live = live_text(object, stored);
+    let text = live.as_deref().unwrap_or(stored);
     if is_placeholder(text) {
-        return Err("text is a script we do not run, and its stored value is a placeholder".into());
+        return Err(match live {
+            Some(_) => "the layer's script produced no text".into(),
+            None => "text is a script we could not run, and its stored value is a placeholder".into(),
+        });
     }
 
     let font_name = object.font.as_deref().unwrap_or_default();

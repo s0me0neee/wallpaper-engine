@@ -88,6 +88,7 @@ fn r#true() -> bool {
 pub fn parse_scene(bytes: &[u8]) -> Result<Scene, serde_json::Error> {
     let mut document: Value = serde_json::from_slice(bytes)?;
     hoist_alpha_tracks(&mut document);
+    hoist_text_scripts(&mut document);
     strip_driven_values(&mut document);
     Scene::deserialize(document)
 }
@@ -136,6 +137,39 @@ const DRIVER_KEYS: [&str; 5] = ["user", "script", "scriptproperties", "animation
 /// Where `hoist_alpha_tracks` parks the track, and the key `strip_driven_values`
 /// leaves alone.
 const HOISTED_TRACK: &str = "alphatrack";
+
+/// Where `hoist_text_scripts` parks a text layer's script and its properties.
+const HOISTED_SCRIPT: &str = "textscript";
+const HOISTED_SCRIPT_PROPERTIES: &str = "textscriptproperties";
+
+/// Copy a text layer's script and script properties out of `text` before the
+/// strip below collapses that object to its `value`.
+///
+/// `value` is the design-time preview the editor last saw: sometimes a real
+/// string frozen at the moment the wallpaper was published (`"12:34"` on a
+/// clock that has been running for years), sometimes a bare `"<Date>"` that was
+/// never drawable at all. Running the script gives the live string instead.
+///
+/// The properties are deliberately left as a `Value` rather than resolved here:
+/// their entries are themselves driven (`{"user": "_24hourformat", "value":
+/// false}`), and parking them under a key of our own lets `strip_driven_values`
+/// walk them on its way past and leave plain values behind.
+fn hoist_text_scripts(node: &mut Value) {
+    let Some(objects) = node.get_mut("objects").and_then(Value::as_array_mut) else {
+        return;
+    };
+    for object in objects {
+        let Some(map) = object.as_object_mut() else { continue };
+        let Some(text) = map.get("text") else { continue };
+        let (script, properties) = (text.get("script").cloned(), text.get("scriptproperties").cloned());
+        if let Some(script) = script.filter(Value::is_string) {
+            map.insert(HOISTED_SCRIPT.to_string(), script);
+        }
+        if let Some(properties) = properties.filter(Value::is_object) {
+            map.insert(HOISTED_SCRIPT_PROPERTIES.to_string(), properties);
+        }
+    }
+}
 
 fn hoist_alpha_tracks(node: &mut Value) {
     let Some(objects) = node.get_mut("objects").and_then(Value::as_array_mut) else {
@@ -316,6 +350,12 @@ pub struct Object {
     /// `scene::text`.
     #[serde(default)]
     pub text: Option<String>,
+    /// That script's source, and the properties it was configured with, lifted
+    /// clear of the driver strip by `hoist_text_scripts`.
+    #[serde(default, rename = "textscript")]
+    pub text_script: Option<String>,
+    #[serde(default, rename = "textscriptproperties")]
+    pub text_script_properties: Option<serde_json::Map<String, Value>>,
     /// The font: a path inside the package or the engine's assets, or
     /// `systemfont_<family>`.
     #[serde(default)]
