@@ -557,7 +557,7 @@ fn omissions_for(object: &Object) -> Vec<String> {
 /// 0.12/0.55 for HDR and stock 2.0/0.65 for the other, and reading the wrong
 /// one drives the bloom sixteen times too hard.
 fn scene_bloom(general: &model::General) -> Option<bloom::Settings> {
-    general.bloom.then(|| {
+    let settings = general.bloom.then(|| {
         let (strength, threshold) = if general.hdr {
             (general.bloomhdrstrength, general.bloomhdrthreshold)
         } else {
@@ -572,7 +572,38 @@ fn scene_bloom(general: &model::General) -> Option<bloom::Settings> {
             scatter: if general.hdr { general.bloomhdrscatter } else { 1.0 },
             iterations: if general.hdr { general.bloomhdriterations } else { 2 },
         }
-    })
+    });
+    override_bloom(settings)
+}
+
+/// `SIMULATE_BLOOM=off` drops the scene bloom; `SIMULATE_BLOOM=s,t,sc,n`
+/// replaces strength, threshold, scatter and iterations, any of which may be
+/// left empty to keep the scene's own.
+///
+/// Bloom is the one post-process with no tweakable annotation behind it, so
+/// there is otherwise no way to ask what it contributes — and it is the
+/// standing suspect for a frame that is too bright only at the dark end
+/// (plan.md §4.19).
+fn override_bloom(settings: Option<bloom::Settings>) -> Option<bloom::Settings> {
+    let Ok(spec) = std::env::var("SIMULATE_BLOOM") else { return settings };
+    if spec.trim() == "off" {
+        return None;
+    }
+    let mut settings = settings?;
+    let mut fields = spec.split(',').map(str::trim);
+    if let Some(Ok(strength)) = fields.next().filter(|f| !f.is_empty()).map(str::parse) {
+        settings.strength = strength;
+    }
+    if let Some(Ok(threshold)) = fields.next().filter(|f| !f.is_empty()).map(str::parse) {
+        settings.threshold = threshold;
+    }
+    if let Some(Ok(scatter)) = fields.next().filter(|f| !f.is_empty()).map(str::parse) {
+        settings.scatter = scatter;
+    }
+    if let Some(Ok(iterations)) = fields.next().filter(|f| !f.is_empty()).map(str::parse) {
+        settings.iterations = iterations;
+    }
+    Some(settings)
 }
 
 /// The scene's background fill: the clear colour when clearing is on, fully

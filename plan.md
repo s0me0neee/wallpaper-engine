@@ -955,27 +955,65 @@ alone — a `particles/presets/fog1.json` system with `instanceoverride`
 `{alpha: 0.3, rate: 0.6}` — takes it to 162.9 and costs 1.8 dB. Solving
 `162.9 = 140.1(1-a) + 255a` puts that layer at a 20 % white veil over the whole
 canvas. The override *is* read and applied (`particle.rs` folds `alpha` into the
-sprite weight and `rate` into the emission rate), so the surplus is population
-rather than a dropped field: `maxcount` is a hard slot count, so a system that
-fills to it ignores `rate` entirely at steady state and runs ~1.7x too many
-particles.
+sprite weight and `rate` into the emission rate), so the surplus is not a dropped
+field.
+
+Two mechanisms proposed for it are ruled out, recorded because both are plausible
+enough to be proposed again. It is **not** population: the preset's emitter rate is
+1.5 and the override 0.6, so the effective rate is 0.9/s against a `maxcount` of 20
+— the cap never binds, `rate` does exactly what it should, and tracing the slots at
+this timestamp gives ~4 live particles, matching rate x lifetime. And it is **not**
+sprite energy: the preset draws `particle/smoke/smoke2`, not fog, and decoding that
+texture out of a real Wallpaper Engine install measures `mean(rgb·a)` = 0.4332
+against our hand-drawn stand-in's 0.407 — 6 % apart, not the 8x an earlier guess
+assumed. (`particle/fog/fog1` measures 0.0502 against the 0.052 already recorded in
+§4.14, which is what makes the smoke number trustworthy.)
+
+One thing found while measuring those textures does need fixing, though it is
+appearance rather than luminance: **nearly every stock particle texture is a
+spritesheet, and nothing here reads one.** `smoke2.tex-json` and `fog1.tex-json`
+both declare `"spritesheetsequences": [{"duration": 1, "frames": 64, "width": 128,
+"height": 128}]` — the 1024x1024 image is 64 frames of 128x128, and a particle is
+meant to sample one cell and animate through them over its life. We draw the whole
+sheet as one sprite, so a fog puff renders as an 8x8 grid of puffs. Across the
+engine's `materials/particle/` tree: fog1/2/3 and fire1 and bubble3 and
+energyball and lightning1 at 64 frames, fire3 at 128, explosion1 at 72, lightning3
+at 50, jellyfish1 at 36, all ten `leaves*` at 30, fire2 and lightning2 at 32, wave
+at 24, fish1 at 16, debris1 at 8, rosepetals at 5, rain1 at 4. Several have
+fractional cell sizes (170.6667, 85.334, 102.4), so the grid does not divide evenly
+and the UV maths has to carry that. Mean energy over a sheet equals mean energy over
+a cell, so this is unlikely to move the veil — it is the "sprites remain plausible
+rather than identical" note in §4.15, finally named.
 
 For ex8 the surplus is +15 levels through the dark and middle range and nothing at
-the top, and two causes are stacked. One is layer 30, "Basic Clouds Movement" —
-soft light, scale 3.06, roll 0.103, rect `-152,884 5877x3306`. It composites a
-bright band with a hard tilted edge across the upper sky that the capture does not
-have; dropping that one layer is worth **+2.3 dB** (19.65 → 21.94) and moves
-luminance 90.7 → 84.9. It is the one corpus layer whose blend-mode backdrop is
-copied over a rectangle mostly *off* the canvas, and §4.18's render scaling landed
-on the same layer from a different direction, which makes that backdrop path the
-prime suspect for both. The other cause is underneath it: sampling the frame before
-layer 30 lands gives [42,42,37] and [66,63,53] where the capture has [34,39,43] and
-[45,50,54] — our dark upper sky is both brighter and *warmer*, while the sun itself
-matches ([255,222,168] against [255,217,139]). A warm lift confined to the dark end
-with the bright end already correct is what an over-wide bloom scatter looks like —
-but a soft-light layer clamping to the wrong backdrop edge would produce it too, so
-check the backdrop copy at scale 1.0 before assuming the base frame is
-independently wrong. One cause may explain both.
+the top, and it is **the same veil**. Compositing its six image and composition
+layers without any of its 40 particle systems gives luminance **78.3 against the
+capture's 77.3** — within 1.3 % — and collapses the transfer to within a few levels
+from reference level 32 upward. That is **+2.0 dB** (19.69 → 21.73) from one
+change. So ex3 and ex8 are one bug wearing two presets, worth about 2 dB on each,
+which makes particle sprite deposition the largest remaining defect in the corpus
+by a wide margin. A fix has to be tested against both: ex3 reaches +22.8 levels
+from ~4 live particles in one system where ex8 reaches +15 from forty systems, and
+two such different system counts landing on a similar total veil is itself evidence
+that the error is per-*sprite* rather than per-particle or per-system.
+
+Two things that are **not** causes, both measured rather than argued. Scene bloom
+contributes nothing to the lift: `SIMULATE_BLOOM=off` moves the dark-end delta from
++20.1 to +19.9 and leaves the mid-range identical, so the "over-wide bloom scatter"
+reading an earlier draft of this section carried is wrong. And there is no second,
+independent problem with the base frame — an earlier measurement of the dark upper
+sky as "brighter and warmer" than the capture was taken on a frame that still had
+all forty particle systems in it. The warm cast *was* the veil.
+
+What was separately real on ex8 is layer 30, "Basic Clouds Movement" — soft light,
+scale 3.06, roll 0.103, rect `-152,884 5877x3306`. It composited a bright band with
+a hard tilted edge across the upper sky. The cause: a `colorBlendMode` layer's
+backdrop was copied over the layer's *rect*, but the quad is drawn rolled about its
+centre, so the rotated overhang — 293 rows for this layer, reaching canvas row 591
+where the copy starts at 884 — sampled past the end of the copy and clamped,
+smearing one frame row down every column. Copying over the rolled quad's own
+bounding box instead, clipped to the canvas, removes it; worth +0.25 dB, and it
+drops that layer's backdrop target from 19 megatexels to at most the canvas.
 
 Two dead ends worth not re-running. `pow` with a negative base is undefined in
 GLSL and `workshop/2098390419/scroll` relies on D3D folding `pow(v, 2.0)` into
