@@ -581,6 +581,7 @@ const COMPOSITE_VERTEX: &str = "#version 330 core\n\
     layout(location = 0) in vec3 a_Position;\n\
     layout(location = 1) in vec2 a_TexCoord;\n\
     uniform vec4 u_Rect;\n\
+    uniform vec4 u_BackdropRect;\n\
     uniform vec2 u_Target;\n\
     uniform vec2 u_Roll;\n\
     out vec2 v_TexCoord;\n\
@@ -591,9 +592,58 @@ const COMPOSITE_VERTEX: &str = "#version 330 core\n\
                            local.x * u_Roll.y + local.y * u_Roll.x);\n\
         vec2 pixel = u_Rect.xy + u_Rect.zw * 0.5 + rolled;\n\
         v_TexCoord = a_TexCoord;\n\
-        v_Backdrop = (pixel - u_Rect.xy) / u_Rect.zw;\n\
+        v_Backdrop = (pixel - u_BackdropRect.xy) / u_BackdropRect.zw;\n\
         gl_Position = vec4(pixel / u_Target * 2.0 - 1.0, 0.0, 1.0);\n\
     }\n";
+
+/// The rectangle a blend-mode layer's backdrop has to be copied out of, and the
+/// one `v_Backdrop` is measured against — they must be the same rectangle or the
+/// blend reads the wrong pixel.
+///
+/// It is *not* the layer's own rect. A rolled quad reaches outside it: the layer
+/// is drawn by rotating its rect about its own centre, so the corners swing out
+/// and the fragments there have no backdrop under the old mapping. They clamped
+/// to the copy's edge instead, which reads as a band of the frame's edge row
+/// smeared down every column — `scene_example8`'s layer 30 is rolled 0.103 rad
+/// across a 5877x3306 rect, which puts 293 rows of it above its own rect, and
+/// those rows all soft-lit against canvas row 884 instead of against themselves.
+///
+/// Clipped to the canvas because nothing outside survives the viewport anyway,
+/// and a layer's rect can be much larger than the frame — clipping keeps that
+/// same layer's backdrop from being a 19-megatexel copy of a 8-megatexel canvas.
+pub fn backdrop_rect(
+    (left, top, width, height): (i32, i32, i32, i32),
+    roll: f32,
+    (canvas_width, canvas_height): (u32, u32),
+) -> (i32, i32, i32, i32) {
+    #[expect(clippy::cast_precision_loss, reason = "canvas coordinates, nowhere near 2^24")]
+    let (half_w, half_h) = (width as f32 / 2.0, height as f32 / 2.0);
+    // Half-extent of the rotated rect's own bounding box, the standard form.
+    let (cos, sin) = (roll.cos().abs(), roll.sin().abs());
+    let (bound_w, bound_h) = (half_w * cos + half_h * sin, half_w * sin + half_h * cos);
+    #[expect(clippy::cast_precision_loss, reason = "canvas coordinates, nowhere near 2^24")]
+    let (centre_x, centre_y) = (left as f32 + half_w, top as f32 + half_h);
+
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "a bounding box around a wallpaper layer, then clipped to the canvas"
+    )]
+    let (min_x, min_y, max_x, max_y) = (
+        (centre_x - bound_w).floor() as i32,
+        (centre_y - bound_h).floor() as i32,
+        (centre_x + bound_w).ceil() as i32,
+        (centre_y + bound_h).ceil() as i32,
+    );
+
+    #[expect(clippy::cast_possible_wrap, reason = "wallpaper canvases are nowhere near i32::MAX")]
+    let (canvas_w, canvas_h) = (canvas_width as i32, canvas_height as i32);
+    let (clipped_left, clipped_top) = (min_x.max(0), min_y.max(0));
+    // Both sides floored at one pixel: a layer entirely off-canvas would
+    // otherwise invert the rectangle and divide by zero in the shader.
+    let clipped_w = (max_x.min(canvas_w) - clipped_left).max(1);
+    let clipped_h = (max_y.min(canvas_h) - clipped_top).max(1);
+    (clipped_left, clipped_top, clipped_w, clipped_h)
+}
 /// The shim's blend-mode dispatch, reused verbatim.
 ///
 /// It is self-contained GLSL — no includes, no HLSL intrinsics — so it drops
@@ -699,8 +749,10 @@ pub fn clear_scissor(gl: &glow::Context) {
 /// `compose::blit` uses on the CPU.
 /// Composite a layer with `scene.json`'s `colorBlendMode` applied
 /// against `backdrop` — the frame beneath this layer, already copied out of
-/// `target` at the same rectangle. Mode 0 ignores the backdrop entirely and
-/// takes the fixed-function path, which is every layer in the corpus but four.
+/// `target` over `backdrop_area`, which must be the rectangle `backdrop_rect`
+/// returns for this layer and not the layer's own rect. Mode 0 ignores the
+/// backdrop entirely and takes the fixed-function path, which is every layer in
+/// the corpus but four.
 #[expect(clippy::too_many_arguments, reason = "one layer's full composite state")]
 pub fn composite_layer_blended(
     gl: &glow::Context,
@@ -708,6 +760,7 @@ pub fn composite_layer_blended(
     target: &Target,
     texture: glow::Texture,
     (left, top, width, height): (i32, i32, i32, i32),
+    backdrop_area: (i32, i32, i32, i32),
     additive: bool,
     mode: i32,
     backdrop: Option<glow::Texture>,
@@ -761,8 +814,18 @@ pub fn composite_layer_blended(
         let rect = [left as f32, top as f32, width as f32, height as f32];
         #[expect(clippy::cast_precision_loss, reason = "canvas dimensions, nowhere near 2^24")]
         let size = [target.width as f32, target.height as f32];
+        #[expect(clippy::cast_precision_loss, reason = "canvas coordinates, nowhere near 2^24")]
+        let backdrop_rect = [
+            backdrop_area.0 as f32,
+            backdrop_area.1 as f32,
+            backdrop_area.2 as f32,
+            backdrop_area.3 as f32,
+        ];
         if let Some(location) = gl.get_uniform_location(compositor.program.handle, "u_Rect") {
             gl.uniform_4_f32_slice(Some(&location), &rect);
+        }
+        if let Some(location) = gl.get_uniform_location(compositor.program.handle, "u_BackdropRect") {
+            gl.uniform_4_f32_slice(Some(&location), &backdrop_rect);
         }
         if let Some(location) = gl.get_uniform_location(compositor.program.handle, "u_Target") {
             gl.uniform_2_f32_slice(Some(&location), &size);

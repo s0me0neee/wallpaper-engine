@@ -595,7 +595,7 @@ impl App<'_> {
                 Some(image) => Some(LayerTextures::ring(gl, image)?),
                 None => None,
             };
-            let backdrop = blend_backdrop(gl, object, item, size)?;
+            let backdrop = blend_backdrop(gl, object, item, size, (static_scene.width, static_scene.height))?;
             layers.push(LiveLayer {
                 kind,
                 name: model::label(object),
@@ -723,7 +723,9 @@ fn compile_bloom(
 /// layer texture holds straight alpha, the way `upload_texture` left it.
 fn composite_one(state: &State, layer: &LiveLayer, source: glow::Texture, time: f32, premultiplied: bool) {
     // A blend-mode layer needs the frame beneath it readable, so lift that
-    // rectangle out before overwriting it.
+    // rectangle out before overwriting it. The rectangle is the rolled quad's
+    // own bounding box, not the layer rect — see `pass::backdrop_rect`.
+    let backdrop_area = pass::backdrop_rect(layer.rect, layer.roll, state.content_size);
     if let Some(backdrop) = &layer.backdrop {
         pass::copy_region(
             &state.gl,
@@ -731,7 +733,7 @@ fn composite_one(state: &State, layer: &LiveLayer, source: glow::Texture, time: 
             backdrop,
             state.composite.texture,
             state.content_size,
-            layer.rect,
+            backdrop_area,
         );
     }
     pass::composite_layer_blended(
@@ -740,6 +742,7 @@ fn composite_one(state: &State, layer: &LiveLayer, source: glow::Texture, time: 
         &state.composite,
         source,
         layer.rect,
+        backdrop_area,
         layer.additive,
         layer.blend_mode,
         layer.backdrop.as_ref().map(|target| target.texture),
@@ -841,11 +844,17 @@ fn blend_backdrop(
     object: &model::Object,
     item: &StaticItem,
     (width, height): (u32, u32),
+    canvas: (u32, u32),
 ) -> Result<Option<pass::Target>> {
     if layer_blend_mode(object, item) == 0 {
         return Ok(None);
     }
-    let target = pass::Target::new(gl, width.max(1), height.max(1))
+    // Capped at the canvas: what gets copied in is `pass::backdrop_rect`, which
+    // is clipped to the canvas, so anything larger is resolution the copy can
+    // never fill. `scene_example8`'s layer 30 is 5877x3306 over a 3840x2160
+    // frame, and uncapped it allocated 19 megatexels to hold 8.
+    let (width, height) = (width.clamp(1, canvas.0.max(1)), height.clamp(1, canvas.1.max(1)));
+    let target = pass::Target::new(gl, width, height)
         .with_context(|| format!("allocating {}'s backdrop", model::label(object)))?;
     Ok(Some(target))
 }
