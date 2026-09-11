@@ -76,6 +76,10 @@ pub struct StaticScene<'a> {
     pub bloom: Option<bloom::Settings>,
     /// `general.hdr`: render every target in floating point.
     pub hdr: bool,
+    /// `general.zoom`: the camera's magnification about the canvas centre,
+    /// applied to the finished frame. 1.0 for all of the corpus but
+    /// `scene_example8`, which zooms 1.03.
+    pub zoom: f32,
     pub items: Vec<StaticItem<'a>>,
     pub omissions: Vec<String>,
     /// A Wallpaper Engine asset tree to resolve stock textures and fonts from,
@@ -868,6 +872,7 @@ pub fn prepare_static<'a>(
         background: background_pixel(scene),
         bloom: scene_bloom(&scene.general),
         hdr: scene.general.hdr,
+        zoom: scene.general.zoom,
         items,
         omissions,
         assets: assets.map(Path::to_path_buf),

@@ -372,6 +372,9 @@ struct State {
     particles: Option<LiveParticles>,
     /// Scene-wide bloom over the finished frame, when `general.bloom` is on.
     bloom: Option<(bloom::Bloom, bloom::Settings)>,
+    /// The camera transform over the finished frame, when it is not the
+    /// identity. `None` costs nothing per frame.
+    camera: Option<Camera>,
     /// The scene's own pixel dimensions — every layer and the composite match
     /// this, so the window letterboxes to it rather than stretching.
     content_size: (u32, u32),
@@ -452,6 +455,7 @@ impl App<'_> {
         let composite = pass::Target::with_format(&gl, width, height, format)
             .context("allocating the composite target")?;
         let bloom = compile_bloom(&gl, self.static_scene.bloom, width, height, format)?;
+        let camera = build_camera(&gl, self.static_scene.zoom, width, height, format)?;
 
         let Built { layers, tweak_values, omissions, particle_scale } = self.build_layers(&gl)?;
         let particles = compile_particles(&gl, &layers, (width, height), particle_scale)?;
@@ -477,6 +481,7 @@ impl App<'_> {
             composite,
             particles,
             bloom,
+            camera,
             content_size: (width, height),
             background: normalized_rgba(self.static_scene.background),
             layers,
@@ -717,6 +722,70 @@ fn compile_bloom(
     Ok(Some((compiled, settings)))
 }
 
+/// The scene camera's effect on the finished frame, plus the scratch target the
+/// resample needs. Zoom is the whole of it so far; shake and parallax belong
+/// here too and are not implemented (plan.md §4.19).
+struct Camera {
+    zoom: f32,
+    scratch: pass::Target,
+}
+
+/// Build the camera, or `None` when it would be the identity.
+///
+/// `SIMULATE_ZOOM=<factor>` overrides the scene's own, which is how the
+/// direction of the magnification was settled against a capture rather than
+/// assumed — WE's slider reads "zoom in" for values above 1.
+fn build_camera(gl: &glow::Context, scene_zoom: f32, width: u32, height: u32, format: pass::Format) -> Result<Option<Camera>> {
+    let zoom = std::env::var("SIMULATE_ZOOM").ok().and_then(|value| value.parse().ok()).unwrap_or(scene_zoom);
+    if !zoom.is_finite() || (zoom - 1.0).abs() < 1e-4 {
+        return Ok(None);
+    }
+    let scratch = pass::Target::with_format(gl, width.max(1), height.max(1), format)
+        .context("allocating the camera's scratch target")?;
+    Ok(Some(Camera { zoom: zoom.max(1e-3), scratch }))
+}
+
+/// Apply `general.zoom` to the finished frame.
+///
+/// Wallpaper Engine's camera zoom magnifies about the canvas centre, so a zoom
+/// of `z` shows `1/z` of the frame filled back out to the whole canvas. It runs
+/// after the bloom because it is a property of the camera, not of the picture:
+/// zooming first would magnify the bloom's own spread with it.
+///
+/// The frame cannot be resampled in place — that is a feedback loop — so it goes
+/// out to a scratch target and back. Both passes are skipped entirely at zoom
+/// 1.0, which is every corpus scene but `scene_example8`.
+fn apply_camera(state: &State) {
+    let Some(camera) = &state.camera else { return };
+    let (width, height) = state.content_size;
+    #[expect(clippy::cast_precision_loss, reason = "canvas dimensions, nowhere near 2^24")]
+    let (full_w, full_h) = (width as f32, height as f32);
+    let (view_w, view_h) = (full_w / camera.zoom, full_h / camera.zoom);
+
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "a fraction of the canvas, which is a few thousand pixels"
+    )]
+    let window = (
+        ((full_w - view_w) / 2.0).round() as i32,
+        ((full_h - view_h) / 2.0).round() as i32,
+        view_w.round() as i32,
+        view_h.round() as i32,
+    );
+
+    #[expect(clippy::cast_possible_wrap, reason = "wallpaper canvases are nowhere near i32::MAX")]
+    let whole = (0, 0, width as i32, height as i32);
+    pass::copy_region(&state.gl, &state.region_copy, &camera.scratch, state.composite.texture, state.content_size, window);
+    pass::copy_region(
+        &state.gl,
+        &state.region_copy,
+        &state.composite,
+        camera.scratch.texture,
+        (camera.scratch.width, camera.scratch.height),
+        whole,
+    );
+}
+
 /// Draw one finished layer into the composite under its blend mode.
 ///
 /// `premultiplied` is true only for the particle pass's target — every other
@@ -952,6 +1021,10 @@ fn redraw(app: &mut App, time: f32) -> Result<bool> {
     if let Some((compiled, settings)) = &state.bloom {
         bloom::apply(&state.gl, compiled, &state.composite, *settings);
     }
+
+    // The camera acts on the finished frame, after every layer and the bloom,
+    // which is the one point where the whole picture exists in canvas pixels.
+    apply_camera(state);
 
     state.frames_since.gpu += gpu_start.elapsed();
 
