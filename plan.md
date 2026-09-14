@@ -1282,34 +1282,31 @@ elsewhere are not the search finding slack in a noisy comparison. The two
 shallow fits — ex6 and ex8, both under half a dB — should not be read as
 offsets at all; their minima are flat and the shift they name is arbitrary.
 
-Three causes, and one scene that does not have any of them:
+Candidate causes, of which §4.24 rules the first one out:
 
-- **Camera parallax is not implemented.** `general.cameraparallax` is true on
+- ~~**Camera parallax is not implemented.**~~ `general.cameraparallax` is true on
   ex3 (amount 0.1) and ex8 (0.5), every object in those scenes carries a
   `parallaxDepth`, and `rg parallax src` returns one comment
-  (`simulate.rs:726`, "shake and parallax belong there"). A capture taken on a
-  real desktop has the cursor *somewhere*, so the reference is parallaxed and we
-  are not. ex8 additionally sets `camerashake: true` and `zoom: 1.03`, and shake
-  is time-varying, which is why ex8 cannot be registered against a capture at a
-  single instant at all.
+  (`simulate.rs:726`, "shake and parallax belong there") — so the gap is real,
+  but §4.24 shows the arithmetic cannot produce this signature. ex8 separately
+  sets `camerashake: true`, which *is* time-varying and is why ex8 cannot be
+  registered against a capture at a single instant at all.
 - **Non-16:9 canvases.** ex5's `orthogonalprojection` is 5824x3264 — 1.7843
   against the display's 1.7778 — so it has to be fitted and cropped to 16:9, and
   a different fit convention is a translation. ex1 (7680x4320) and ex2
   (3840x2160) are exact multiples and land at (0, +1) and (0, 0).
-- **ex4 is a per-layer placement bug, not a frame offset,** and it is the
-  cleanest thing to pick up next: parallax off, shake off, zoom 1.0, canvas an
-  exact 2x. Its shift is not uniform — the top-left and top-right regions want
-  dy −3 and −2 for almost nothing (rms 9.7 → 9.2), while the lower-centre region
-  wants **dy −6 and halves its error** (20.8 → 10.6). One layer is about 12
-  canvas pixels too low.
+- **ex4 is a per-layer placement bug, not a frame offset.** Parallax off, shake
+  off, zoom 1.0, canvas an exact 2x, and its shift is not uniform — the top-left
+  and top-right regions want dy −3 and −2 for almost nothing (rms 9.7 → 9.2),
+  while the lower-centre region wants **dy −6 and halves its error** (20.8 →
+  10.6). One layer is about 12 canvas pixels too low.
 
-`scene_example3`'s residual, by contrast, *is* uniform: left, right and centre
-regions covering three different layers at two different `parallaxDepth`s all
-minimise at (−5, +6). Its remaining error is concentrated in the two side
-building layers and the top-left sky — 37 % of the frame's squared error in the
-top-left three cells of a 6x4 grid, 18 % in the right column, against 0.6 % in
-the featureless bright sky between them, which is the signature of
-misregistration rather than shading.
+`scene_example3`'s error is concentrated in the two side building layers and the
+top-left sky — 37 % of the frame's squared error in the top-left three cells of
+a 6x4 grid, 18 % in the right column, against 0.6 % in the featureless bright
+sky between them, which is the signature of misregistration rather than shading.
+An earlier reading of this section called that residual a *uniform* shift; §4.24
+measures it properly and it is not one.
 
 **ex6 is not a baseline and should stop being read as one.** Its capture has
 "Screen water flow" and "Screen raindrops" switched on where both default to
@@ -1371,6 +1368,85 @@ is a property of that wallpaper rather than a defect to fix.
 The default stays monitor-derived regardless. A wallpaper engine cannot spend a
 4K frame budget on a 1080p display, and five of seven scenes are better for it;
 `SIMULATE_SCALE=1` is there for when a comparison needs the authored canvas.
+
+### 4.24 Cross-referenced against `linux-wallpaperengine`
+
+`Almamu/linux-wallpaperengine` (GPL-3.0, C++, checked at `b016d7d`, 2026-06-09)
+is an independent reimplementation of the same runtime, and it is a *second
+kind* of evidence: everything else here is measured off captures, where this is
+somebody else's reading of the same formats. It is not authoritative — it is a
+reconstruction too — but where it and a measurement agree the question is
+closed, and where it contradicts a guess of ours, the guess is the thing to
+re-examine. It renders through Wallpaper Engine's own installed shaders, so it
+settles what the *host* does and deliberately says nothing about what the
+shaders do.
+
+**It rules parallax out as §4.22's registration cause.** The model is scene-wide
+displacement, per-layer application:
+
+```
+displacement = mix(displacement, (mouse_uv - 0.5) * amount * mouseInfluence,
+                   clamp(delay * dt, 0, 1))              // CScene.cpp:304
+offset       = (parallaxDepth + amount) * displacement * sceneWidth   // CImage.cpp:1110
+```
+
+Two consequences. At rest the displacement is zero, so an unparallaxed render is
+*correct* for a centred cursor. And the offset is scaled by each layer's own
+`parallaxDepth`, so parallax can never move the whole frame by one vector —
+which is exactly what §4.22 attributed to it.
+
+**What `scene_example3` actually has is a horizontal scale error.** Re-measuring
+with regions that each sit inside a single layer, rather than the mixed regions
+§4.22 used:
+
+| region | layer | `parallaxDepth` | best shift | rms |
+|---|---|---:|---|---|
+| x60+340 | `layer_04` (left buildings) | −0.35 | **dx −26**, dy +4 | 40.4 → 26.1 |
+| x1500+380 | `layer_05` (right buildings) | −0.35 | **dx +23**, dy +4 | 43.8 → 36.9 |
+| x660+300 | `layer_01` (background) | −0.50 | dx −5, dy +6 | 52.3 → 11.6 |
+| x700+420 y790 | foreground | −0.15/−0.10 | dx −5, dy +5 | 20.4 → 11.6 |
+
+The two side layers are at the *same* depth and move in *opposite* directions,
+which no translation and no parallax can do. Solving `dx = (s−1)(x − 960)` gives
+s = 1.036, 1.032 and 1.033 from the first three rows independently: **our frame
+is about 3.4 % wider than Wallpaper Engine's, about the canvas centre**, and the
+(−5, +6) §4.22 found is that stretch sampled near the middle. Vertically the
+same fit does not hold — the signs disagree — and a flat +5 px does, so the two
+axes are not the same defect. ex3's 16.70 dB is mostly this.
+
+**Two placement details we do not implement, either of which could be it:**
+
+- **`alignment`.** `CImage::updateScenePosition` offsets a layer's rectangle by
+  half its *scaled* size when the string contains `top`/`bottom`/`left`/`right`.
+  `rg alignment src` finds the word only in `text.rs` and an unrelated comment
+  in `still.rs`, so the image path never reads it.
+- **Padded textures.** `uploadGeometryBuffers` corrects the UVs whenever
+  `textureWidth != realWidth` — a `.tex` may store a power-of-two padded image.
+  `tex.rs` parses both fields; whether the scene path uses the real one is
+  unverified, and getting it wrong stretches a layer by exactly the padding
+  ratio.
+
+**It also gives two numbers for the particle size question (§4.20).** Their size
+initializer is `(min + t·(max−min)) · sizeOverride / 2.0` and their no-
+initializer default is `20.0 · sizeOverride` where ours is `32.0`. Our
+`SIZE_DIVISOR` is 3.22 ≈ **2 × 1.61**, and that factor of two is now
+independently attested rather than fitted; 32/20 is 1.6 as well. That is not a
+derivation, but it is the first evidence that the constant decomposes rather
+than being one empirical number, and it is the thread to pull.
+
+**And it specifies the spritesheet gap (§4.19) completely.** The header carries
+`spritesheetCols/Rows/Frames/Duration`; the per-particle frame index is encoded
+into the vertex `lifetime` attribute as `frame / numFrames`, which WE's own
+shader reconstructs with `floor(lifetime · numFrames)` for the cell and
+`frac(...)` to blend toward the next; `animationMode == "randomframe"` sends
+`(frame + 0.5) / numFrames` instead, centred to keep the blend off a cell edge.
+That is enough to implement without a Wallpaper Engine install to check against.
+
+For §14 it is a second data point rather than a decision: separate output
+drivers per display server (`Render/Drivers/{GLFW,Wayland}OpenGLDriver`), audio
+capture as a first-class subsystem (PulseAudio → the audio-response uniforms),
+an `Input/InputContext` feeding the mouse, and QuickJS for scripting — the same
+engine §4.21 picked, arrived at independently.
 
 ---
 
