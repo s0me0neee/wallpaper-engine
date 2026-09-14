@@ -993,8 +993,10 @@ layers without any of its 40 particle systems gives luminance **78.3 against the
 capture's 77.3** — within 1.3 % — and collapses the transfer to within a few levels
 from reference level 32 upward. That is **+2.0 dB** (19.69 → 21.73) from one
 change. So ex3 and ex8 are one bug wearing two presets, worth about 2 dB on each,
-which makes particle sprite deposition the largest remaining defect in the corpus
-by a wide margin. A fix has to be tested against both: ex3 reaches +22.8 levels
+which made particle sprite deposition the largest defect in the corpus at the time
+of writing. **§4.20 found it and the size divisor took most of it** — the figures
+in this paragraph are the diagnosis, not the standing state; see §4.22 for where
+the corpus actually sits. A fix has to be tested against both: ex3 reaches +22.8 levels
 from ~4 live particles in one system where ex8 reaches +15 from forty systems, and
 two such different system counts landing on a similar total veil is itself evidence
 that the error is per-*sprite* rather than per-particle or per-system.
@@ -1196,6 +1198,98 @@ of `12:34`. Verified against the real thing by shape rather than by pixels — t
 capture's own overlay reads `PM 02:04 / Sep. 10 2026` and ours reads
 `PM 10:26 / Sep. 10 2026` at the same place in the same format, which is the
 most a clock can be checked against a capture taken at another hour.
+
+### 4.22 Where the corpus sits, and what the next defect is
+
+§4.19's table is the diagnosis that led to §4.20; this is the standing state
+after it. Same captures, same timestamps (~10.026 s, ex1 at ~20.06 s because it
+runs at `rate: 200`), and the same convention, which is now written down because
+it was not: **709 luma, full range, over the top 1036 rows** — the taskbar's
+bottom 44 px excluded — with our canvas-resolution frame lanczos-downscaled to
+the capture's 1920x1080. That convention reproduces §4.19's reference column
+exactly on all seven scenes, so the two tables are comparable.
+
+| scene | PSNR | vs §4.19 | our luminance | reference |
+|---|---:|---:|---:|---:|
+| ex1 ATRI | 25.22 | +0.00 | 188.6 | 190.8 |
+| ex2 Dusk Town | 30.52 | +0.64 | 152.5 | 152.6 |
+| ex3 Hope | 16.70 | **+1.97** | 136.0 | 133.1 |
+| ex4 Into the night | 24.32 | +0.50 | 62.2 | 62.1 |
+| ex5 听星·伊蕾娜 | 20.10 | +0.37 | 82.2 | 82.5 |
+| ex6 Rainy Day | 14.74 | −0.03 | 40.4 | 43.6 |
+| ex8 Matte Clouds | 21.69 | **+2.25** | 81.6 | 77.3 |
+
+**The particle veil is closed.** It is worth stating as an ablation rather than
+as a table delta, because that is the measurement §4.19 used to name it.
+Dropping *both* of `scene_example3`'s fog systems now moves it by **−0.03 dB**
+(16.70 → 16.67) where §4.19 measured layer 14 alone costing **1.8 dB**; dropping
+all forty of `scene_example8`'s particle systems now buys **+0.16 dB** where it
+bought **+2.0 dB**. Particles went from the largest defect in the corpus to
+within noise of free, and the surviving luminance surplus is not theirs — ex8 is
+still 2.8 levels bright with every particle system switched off.
+
+**What is left is not a curve over the frame.** Fitting the best per-channel
+gain+offset from our frame onto the capture — the strongest global tone
+correction that exists — buys +0.02 dB on ex2, +0.21 on ex3 and +0.75 on ex8. So
+§4.19's finding survives the fix: whatever is wrong is *in* the frame.
+
+**It is registration.** Searching one integer (dx, dy) for the whole frame:
+
+| scene | best shift | PSNR at (0,0) | shifted | gain |
+|---|---|---:|---:|---:|
+| ex2 | (0, 0) | 30.51 | 30.51 | **+0.00** |
+| ex1 | (0, +1) | 25.20 | 26.14 | +0.94 |
+| ex3 | (−5, +6) | 16.68 | 20.07 | **+3.39** |
+| ex4 | (0, −5) | 24.12 | 26.48 | **+2.35** |
+| ex5 | (−4, −3) | 19.97 | 21.80 | +1.83 |
+| ex6 | (−9, −6) | 14.69 | 14.99 | +0.29 |
+| ex8 | (+10, −2) | 21.64 | 22.05 | +0.41 |
+
+ex2 is the control that makes the rest readable: a scene that is *already*
+registered gains exactly nothing from being allowed to move, so the gains
+elsewhere are not the search finding slack in a noisy comparison. The two
+shallow fits — ex6 and ex8, both under half a dB — should not be read as
+offsets at all; their minima are flat and the shift they name is arbitrary.
+
+Three causes, and one scene that does not have any of them:
+
+- **Camera parallax is not implemented.** `general.cameraparallax` is true on
+  ex3 (amount 0.1) and ex8 (0.5), every object in those scenes carries a
+  `parallaxDepth`, and `rg parallax src` returns one comment
+  (`simulate.rs:726`, "shake and parallax belong there"). A capture taken on a
+  real desktop has the cursor *somewhere*, so the reference is parallaxed and we
+  are not. ex8 additionally sets `camerashake: true` and `zoom: 1.03`, and shake
+  is time-varying, which is why ex8 cannot be registered against a capture at a
+  single instant at all.
+- **Non-16:9 canvases.** ex5's `orthogonalprojection` is 5824x3264 — 1.7843
+  against the display's 1.7778 — so it has to be fitted and cropped to 16:9, and
+  a different fit convention is a translation. ex1 (7680x4320) and ex2
+  (3840x2160) are exact multiples and land at (0, +1) and (0, 0).
+- **ex4 is a per-layer placement bug, not a frame offset,** and it is the
+  cleanest thing to pick up next: parallax off, shake off, zoom 1.0, canvas an
+  exact 2x. Its shift is not uniform — the top-left and top-right regions want
+  dy −3 and −2 for almost nothing (rms 9.7 → 9.2), while the lower-centre region
+  wants **dy −6 and halves its error** (20.8 → 10.6). One layer is about 12
+  canvas pixels too low.
+
+`scene_example3`'s residual, by contrast, *is* uniform: left, right and centre
+regions covering three different layers at two different `parallaxDepth`s all
+minimise at (−5, +6). Its remaining error is concentrated in the two side
+building layers and the top-left sky — 37 % of the frame's squared error in the
+top-left three cells of a 6x4 grid, 18 % in the right column, against 0.6 % in
+the featureless bright sky between them, which is the signature of
+misregistration rather than shading.
+
+**ex6 is not a baseline and should stop being read as one.** Its capture has
+"Screen water flow" and "Screen raindrops" switched on where both default to
+off (§4.19), and the transfer says exactly that: binned against the reference we
+are +13 levels in the darkest bin and **−203 in the brightest**, with the bright
+bins covering under 0.5 % of the frame — missing specular highlights, not a tone
+error. Its 14.74 dB is the corpus's worst number and is measuring a
+configuration difference.
+
+Renders remain byte-identical across runs (`scene_example3` at t=10.026, same
+sha1 twice), so every number here is reproducible rather than sampled.
 
 ---
 
