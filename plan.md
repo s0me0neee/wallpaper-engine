@@ -1235,7 +1235,10 @@ runs at `rate: 200`), and the same convention, which is now written down because
 it was not: **709 luma, full range, over the top 1036 rows** — the taskbar's
 bottom 44 px excluded — with our canvas-resolution frame lanczos-downscaled to
 the capture's 1920x1080. That convention reproduces §4.19's reference column
-exactly on all seven scenes, so the two tables are comparable.
+exactly on all seven scenes, so the two tables are comparable. Every figure in
+this section is at `SIMULATE_SCALE=1`, the authored canvas — since §4.18 the
+default is the monitor's, which would otherwise make the numbers depend on which
+machine ran them (§4.23).
 
 | scene | PSNR | vs §4.19 | our luminance | reference |
 |---|---:|---:|---:|---:|
