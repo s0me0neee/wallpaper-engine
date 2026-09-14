@@ -846,8 +846,9 @@ each cover most of a 4K canvas. The next move for it is one of
 
 ### 4.18 Render resolution is the next lever, and it is the *chains* that matter
 
-Measured, not built — the implementation is written up at the end of this
-section along with the bug that stopped it.
+**Built** (§4.23 is what it cost). The measurements below are what motivated it
+and they reproduce exactly; the attempt described at the end of the section is
+not the one that landed.
 
 `scene_example8` is not particle-bound and never was after §4.17. Ablations,
 all at `g_Time` 6 s:
@@ -883,7 +884,8 @@ This is also what Wallpaper Engine does. Captures from a real install on a
 is 3840x2160 — it renders at the display, not at the canvas, and 0.5 is exactly
 the scale that gives us 66 fps.
 
-**The attempt, and why it is not in.** A `render_scale` taken once from
+**The attempt that was abandoned, kept because its failure is the instructive
+part.** A `render_scale` taken once from
 `window.current_monitor()` (capped at 1.0 and at the canvas), layer images
 resized to it before upload and chain compile, every rect, particle placement,
 composite and bloom target in render pixels — all inside `simulate.rs`, no
@@ -904,11 +906,37 @@ for particle layers while `full_rect` is in render pixels, and
 5877x3306`) extends outside the canvas on three sides, which is exactly where a
 space mismatch would show up first. Not yet confirmed.
 
-Whoever picks this up: every canvas-space quantity has to move to render space
-in one go, and the ones that are easy to miss are the ones not derived from an
-image — `full_rect`, `blend_backdrop`'s size, a composition layer's `region`
-target, and both particle scales, which must compose with the render scale
-rather than replace it.
+That diagnosis stands, and the fix is not to chase it: the bug is the *shape* of
+the attempt. Scaling at the end means two coordinate spaces exist at once and
+every quantity has to be moved by hand — `full_rect`, `blend_backdrop`'s size, a
+composition layer's `region` target, both particle scales — so missing one is a
+matter of when, not whether.
+
+**What landed instead: scale at the source.** `prepare_static` already takes an
+`Option<Resolution>` and threads it through `canvas_for` as `Canvas::scale`,
+which `to_pixels`, `extent` and `static_particle` all read — the still exporter's
+`--resolution` path, never wired to the simulator. `simulate` now passes one, so
+every layer texture is decoded *directly* at render size, every particle
+placement is resolved in render pixels, and `StaticScene::width/height` is the
+render canvas. Nothing downstream knows the difference, which is the point:
+there is only one space, so no quantity can be left behind in the other. It also
+resamples once rather than twice, and `warp_frame` gets cheaper for free, its
+output size coming from the (now scaled) `rect_px`.
+
+The cost is that the resolution has to be known before the groundwork runs, and
+only an `ActiveEventLoop` can name a monitor — so `prepare_static` moved out of
+`run` and into `open_window`, and `App::static_scene` became an `Option` built
+there. `SIMULATE_SCALE=<factor>` overrides the monitor, which is the only way to
+compare two scales without moving machines.
+
+Verified three ways. The frame cost reproduces the table above exactly — 44 ms
+at 1.0, 20 ms at 0.667, 11 ms at 0.5 on `scene_example8`, or **19 → 42 → 69
+fps**. The alpha channel, which is what gave the old attempt away at 6.5 dB, is
+now **bit-identical** (`a:inf`) between a half-scale render and the full-scale
+render downscaled to match, on `scene_example3`, `scene_example5` and
+`scene_example8` alike, with colour at 24–36 dB, which is ordinary resolution
+loss and not structure. And `scene_example5`'s 5824x3264 comes back 2912x1632,
+so the non-16:9 canvas scales uniformly rather than being fitted by width.
 
 ### 4.19 Measured against real Wallpaper Engine, second round
 
@@ -1290,6 +1318,56 @@ configuration difference.
 
 Renders remain byte-identical across runs (`scene_example3` at t=10.026, same
 sha1 twice), so every number here is reproducible rather than sampled.
+
+### 4.23 What rendering at the display costs, and the one scene that pays
+
+§4.18's render scale is a 4x performance win and it is not free. Measured the
+same way as §4.22, against the same captures, comparing a full-canvas render to
+one at the scale Wallpaper Engine itself used — 1920 wide, the capture machine's
+display:
+
+| scene | canvas | at 1.0 | at display scale | delta |
+|---|---|---:|---:|---:|
+| ex1 ATRI | 7680x4320 | 25.22 | 25.59 | +0.37 |
+| ex2 Dusk Town | 3840x2160 | 30.52 | 30.29 | −0.23 |
+| ex3 Hope | 3840x2160 | 16.70 | 16.92 | +0.22 |
+| ex4 Into the night | 3840x2160 | 24.32 | 24.96 | +0.64 |
+| ex5 听星·伊蕾娜 | 5824x3264 | 20.10 | 20.29 | +0.19 |
+| ex6 Rainy Day | 1920x1080 | 14.74 | 14.74 | ±0 |
+| ex8 Matte Clouds | 3840x2160 | 21.69 | **19.89** | **−1.80** |
+
+Five of seven get *closer* to the capture, which is the expected direction:
+rendering where Wallpaper Engine rendered is more faithful than rendering
+elsewhere and resampling. ex6 is the control — its canvas is already 1920x1080,
+the scale is exactly 1.0, and the frame is unchanged to the bit.
+
+**ex8 is the exception, and the cause is one of its own shaders.** At half scale
+it grows a bright orange sun disc in the upper left that neither the capture nor
+our own full-scale render has. It is not the scene bloom — `SIMULATE_BLOOM=off`
+leaves it exactly there — and `SIMULATE_LAYERS=0` puts it in the `MAIN` layer's
+chain alone. That chain's third effect is
+`effects/workshop/2487531853/lens_flare_sun`, whose fragment shader opens with
+
+```glsl
+vec2 uv = v_TexCoord.xy / g_Texture0Resolution.y / u_Scale * 100 - 0.5;
+```
+
+— the flare's whole coordinate space is divided by the frame *height in pixels*,
+so the flare is half the size at twice the resolution. It was authored against
+one resolution and is a different picture at any other. We are not wrong to draw
+it; the shader is resolution-dependent by construction.
+
+The disc itself is not the cost, though, and measuring that is what stops this
+being a guess: masking a 480x480 box around it moves the half-scale number by
+0.03 dB (19.89 → 19.86). The loss is frame-wide — the clouds also come back
+colder and the lit rims harder — and all four of `MAIN`'s effects read
+`g_Texture0Resolution`. So ex8's 1.8 dB is the honest price of running a chain
+of resolution-sensitive shaders at a resolution their author did not use, and it
+is a property of that wallpaper rather than a defect to fix.
+
+The default stays monitor-derived regardless. A wallpaper engine cannot spend a
+4K frame budget on a 1080p display, and five of seven scenes are better for it;
+`SIMULATE_SCALE=1` is there for when a comparison needs the authored canvas.
 
 ---
 

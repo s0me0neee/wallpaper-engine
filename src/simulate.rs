@@ -17,6 +17,7 @@
 //! yet; see plan.md. An `egui` overlay lets you drag any range-annotated shader
 //! parameter away from the wallpaper's own preset, live.
 
+use crate::export::Resolution;
 use crate::pkg::Archive;
 use crate::render::{bloom, capture, particles, pass};
 use crate::scene::compose::{self, StaticItem};
@@ -36,7 +37,7 @@ use std::collections::{HashMap, HashSet};
 use std::ffi::CString;
 use std::num::NonZeroU32;
 use std::ops::Range;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use rayon::prelude::*;
 use std::time::{Duration, Instant};
@@ -48,16 +49,17 @@ use winit::window::{Window, WindowId};
 
 /// Open a window and play `scene` in it until it is closed.
 pub fn run(archive: &mut Archive, scene: &Scene, assets: Option<&Path>, title: &str) -> Result<()> {
-    let static_scene = compose::prepare_static(archive, scene, assets, None)?;
-
-    // What is left unsimulated depends on which layer chains compile, which
-    // needs the window's GL context — so the report is printed from
-    // `open_window`, not here.
+    // The groundwork is deliberately *not* done here: which resolution to
+    // decode at depends on the monitor, and only an `ActiveEventLoop` can name
+    // one. So does the unsimulated report, which depends on which layer chains
+    // compile — both happen in `open_window`.
     let event_loop = EventLoop::new().context("opening a window event loop")?;
     let mut app = App {
         title: title.to_string(),
         archive,
-        static_scene,
+        scene,
+        assets: assets.map(Path::to_path_buf),
+        static_scene: None,
         headers: shim::headers(),
         start: Instant::now(),
         state: None,
@@ -68,7 +70,10 @@ pub fn run(archive: &mut Archive, scene: &Scene, assets: Option<&Path>, title: &
 struct App<'a> {
     title: String,
     archive: &'a mut Archive,
-    static_scene: compose::StaticScene<'a>,
+    scene: &'a Scene,
+    assets: Option<PathBuf>,
+    /// Built by `open_window`, once the monitor it will render for is known.
+    static_scene: Option<compose::StaticScene<'a>>,
     headers: HashMap<String, String>,
     start: Instant,
     state: Option<State>,
@@ -402,9 +407,77 @@ fn rect_of(left: i64, top: i64, image: &RgbaImage) -> (i32, i32, i32, i32) {
     (left as i32, top as i32, image.width() as i32, image.height() as i32)
 }
 
+/// The resolution to render this canvas at, or `None` to keep it as authored.
+///
+/// Wallpaper Engine renders at the display, not at the authored canvas: a
+/// capture of `scene_example8` from a real install on a 1080p machine comes
+/// back 1920x1080 against its 4K canvas. Doing the same is the single largest
+/// performance lever there is, because a layer's effect chain is sized from the
+/// image it was compiled against — quartering the pixel count is worth 16 % if
+/// the chains stay at 4K and 4x if they do not (plan.md §4.18).
+///
+/// Uniform, so the aspect ratio is preserved and `canvas_for`'s letterboxing
+/// arm never fires, and capped at 1.0 — a small canvas on a big monitor is not
+/// worth upscaling before the blit already does it.
+///
+/// `SIMULATE_SCALE=<factor>` overrides it, which is how a render at one scale
+/// is compared against the same frame at another without moving machines.
+fn render_resolution(canvas: (u32, u32), monitor: Option<(u32, u32)>) -> Option<Resolution> {
+    match std::env::var("SIMULATE_SCALE").ok().and_then(|value| value.parse::<f32>().ok()) {
+        Some(scale) => scaled_resolution(canvas, scale),
+        None => scaled_resolution(canvas, fit_scale(canvas, monitor?)),
+    }
+}
+
+/// The uniform scale that fits `canvas` inside `monitor` — the tighter of the
+/// two ratios, so the aspect ratio is preserved on a canvas that is not the
+/// display's (`scene_example5` is 5824x3264, which is not 16:9).
+#[expect(clippy::cast_precision_loss, reason = "display and canvas dimensions, nowhere near 2^24")]
+fn fit_scale((canvas_w, canvas_h): (u32, u32), (mon_w, mon_h): (u32, u32)) -> f32 {
+    if canvas_w == 0 || canvas_h == 0 {
+        return 1.0;
+    }
+    (mon_w as f32 / canvas_w as f32).min(mon_h as f32 / canvas_h as f32)
+}
+
+/// `canvas` at `scale`, or `None` when that is not a reduction worth making.
+#[expect(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::cast_precision_loss,
+    reason = "a canvas side scaled down and rounded stays a small positive integer"
+)]
+fn scaled_resolution(canvas: (u32, u32), scale: f32) -> Option<Resolution> {
+    if canvas.0 == 0 || canvas.1 == 0 || !scale.is_finite() || scale <= 0.0 || scale >= 1.0 {
+        return None;
+    }
+    let side = |side: u32| -> u32 { ((side as f32 * scale).round() as u32).max(1) };
+    Some(Resolution { width: side(canvas.0), height: side(canvas.1) })
+}
+
 impl App<'_> {
     fn open_window(&mut self, event_loop: &ActiveEventLoop) -> Result<State> {
-        let (width, height) = (self.static_scene.width, self.static_scene.height);
+        let ortho = self
+            .scene
+            .general
+            .orthographic
+            .context("scene has no orthographic projection, so it is not a flat wallpaper")?;
+        let monitor = event_loop.primary_monitor().map(|monitor| {
+            let size = monitor.size();
+            (size.width, size.height)
+        });
+        let resolution = render_resolution((ortho.width, ortho.height), monitor);
+        if let Some(resolution) = resolution {
+            println!("  rendering at {resolution} for a {}x{} canvas", ortho.width, ortho.height);
+        }
+        let static_scene =
+            compose::prepare_static(self.archive, self.scene, self.assets.as_deref(), resolution)?;
+        // Everything the window and its targets need is read out here, before
+        // the scene is parked: `build_layers` below takes `self` mutably.
+        let (width, height) = (static_scene.width, static_scene.height);
+        let (hdr, scene_bloom, zoom) = (static_scene.hdr, static_scene.bloom, static_scene.zoom);
+        let background = normalized_rgba(static_scene.background);
+        self.static_scene = Some(static_scene);
         let attributes = Window::default_attributes()
             .with_title(self.title.clone())
             .with_inner_size(winit::dpi::PhysicalSize::new(width, height));
@@ -451,11 +524,11 @@ impl App<'_> {
         let blit = pass::compile_blit_program(&gl)?;
         let compositor = pass::compile_layer_compositor(&gl)?;
         let region_copy = pass::compile_region_copy(&gl)?;
-        let format = target_format(self.static_scene.hdr);
+        let format = target_format(hdr);
         let composite = pass::Target::with_format(&gl, width, height, format)
             .context("allocating the composite target")?;
-        let bloom = compile_bloom(&gl, self.static_scene.bloom, width, height, format)?;
-        let camera = build_camera(&gl, self.static_scene.zoom, width, height, format)?;
+        let bloom = compile_bloom(&gl, scene_bloom, width, height, format)?;
+        let camera = build_camera(&gl, zoom, width, height, format)?;
 
         let Built { layers, tweak_values, omissions, particle_scale } = self.build_layers(&gl)?;
         let particles = compile_particles(&gl, &layers, (width, height), particle_scale)?;
@@ -483,7 +556,7 @@ impl App<'_> {
             bloom,
             camera,
             content_size: (width, height),
-            background: normalized_rgba(self.static_scene.background),
+            background,
             layers,
             egui,
             tweak_values,
@@ -500,8 +573,8 @@ impl App<'_> {
     /// still exporter degrades it.
     fn build_layers(&mut self, gl: &glow::Context) -> Result<Built> {
         let App { archive, static_scene, headers, .. } = self;
-        let assets = static_scene.assets.clone();
-        let assets = assets.as_deref();
+        let static_scene = static_scene.as_ref().context("build_layers runs after the scene is prepared")?;
+        let assets = static_scene.assets.as_deref();
         let mut layers = Vec::with_capacity(static_scene.items.len());
         let mut tweak_values = Vec::new();
 
@@ -958,7 +1031,9 @@ fn swap_note(notes: &mut [String], stale: &str, replacement: String) {
 /// asks for this after writing its frame).
 fn redraw(app: &mut App, time: f32) -> Result<bool> {
     let App { static_scene, state, .. } = app;
-    let Some(state) = state.as_mut() else { return Ok(false) };
+    let (Some(state), Some(static_scene)) = (state.as_mut(), static_scene.as_ref()) else {
+        return Ok(false);
+    };
 
     run_panel(state);
 
@@ -1321,5 +1396,50 @@ impl ApplicationHandler for App<'_> {
         if let Some(state) = &mut self.state {
             state.egui.destroy();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{fit_scale, scaled_resolution};
+
+    #[test]
+    fn a_4k_canvas_on_a_1080p_display_renders_at_the_display() {
+        let scale = fit_scale((3840, 2160), (1920, 1080));
+        assert!((scale - 0.5).abs() < 1e-6, "{scale}");
+        let resolution = scaled_resolution((3840, 2160), scale).expect("a reduction");
+        assert_eq!((resolution.width, resolution.height), (1920, 1080));
+    }
+
+    /// `scene_example5`'s canvas is 5824x3264, which is wider than 16:9: fitting
+    /// it by width alone would push it off the bottom of the display.
+    #[test]
+    fn a_canvas_that_is_not_the_display_aspect_fits_by_its_tighter_side() {
+        let scale = fit_scale((5824, 3264), (1920, 1080));
+        assert!((scale - 1920.0 / 5824.0).abs() < 1e-6, "{scale}");
+        let resolution = scaled_resolution((5824, 3264), scale).expect("a reduction");
+        assert_eq!(resolution.width, 1920);
+        assert!(resolution.height <= 1080, "{resolution}");
+    }
+
+    #[test]
+    fn a_canvas_the_display_can_already_show_is_left_alone() {
+        assert!(scaled_resolution((1920, 1080), fit_scale((1920, 1080), (3840, 2160))).is_none());
+        assert!(scaled_resolution((1920, 1080), fit_scale((1920, 1080), (1920, 1080))).is_none());
+    }
+
+    #[test]
+    fn a_scale_that_is_not_a_reduction_is_refused_rather_than_upscaled() {
+        for scale in [1.0, 2.0, 0.0, -0.5, f32::NAN] {
+            assert!(scaled_resolution((3840, 2160), scale).is_none(), "{scale}");
+        }
+    }
+
+    /// Rounding must not produce a zero-sided target for a scale small enough
+    /// to take a side below half a pixel.
+    #[test]
+    fn a_tiny_scale_still_leaves_at_least_one_pixel_a_side() {
+        let resolution = scaled_resolution((3840, 2160), 0.0001).expect("a reduction");
+        assert_eq!((resolution.width, resolution.height), (1, 1));
     }
 }
