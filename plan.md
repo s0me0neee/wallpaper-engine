@@ -1305,8 +1305,9 @@ Candidate causes, of which §4.24 rules the first one out:
 top-left sky — 37 % of the frame's squared error in the top-left three cells of
 a 6x4 grid, 18 % in the right column, against 0.6 % in the featureless bright
 sky between them, which is the signature of misregistration rather than shading.
-An earlier reading of this section called that residual a *uniform* shift; §4.24
-measures it properly and it is not one.
+An earlier reading of this section called that residual a *uniform* shift, and
+§4.24 then called it a scale; §4.25 maps the whole field and it is a uniform
+shift of everything *plus* the two side layers displaced on top of it.
 
 **ex6 is not a baseline and should stop being read as one.** Its capture has
 "Screen water flow" and "Screen raindrops" switched on where both default to
@@ -1395,9 +1396,12 @@ Two consequences. At rest the displacement is zero, so an unparallaxed render is
 `parallaxDepth`, so parallax can never move the whole frame by one vector —
 which is exactly what §4.22 attributed to it.
 
-**What `scene_example3` actually has is a horizontal scale error.** Re-measuring
-with regions that each sit inside a single layer, rather than the mixed regions
-§4.22 used:
+~~**What `scene_example3` actually has is a horizontal scale error.**~~ Wrong
+too, and for the same reason: three regions are not enough to tell a warp from a
+pile of per-layer offsets. §4.25 measures the whole field and it is piecewise
+constant. The region measurements below stand; the reading of them does not.
+Re-measuring with regions that each sit inside a single layer, rather than the
+mixed regions §4.22 used:
 
 | region | layer | `parallaxDepth` | best shift | rms |
 |---|---|---:|---|---|
@@ -1408,23 +1412,27 @@ with regions that each sit inside a single layer, rather than the mixed regions
 
 The two side layers are at the *same* depth and move in *opposite* directions,
 which no translation and no parallax can do. Solving `dx = (s−1)(x − 960)` gives
-s = 1.036, 1.032 and 1.033 from the first three rows independently: **our frame
-is about 3.4 % wider than Wallpaper Engine's, about the canvas centre**, and the
-(−5, +6) §4.22 found is that stretch sampled near the middle. Vertically the
-same fit does not hold — the signs disagree — and a flat +5 px does, so the two
-axes are not the same defect. ex3's 16.70 dB is mostly this.
+s = 1.036, 1.032 and 1.033 from the first three rows independently, which looked
+like a 3.4 % horizontal stretch about the canvas centre — but a three-point fit
+cannot distinguish that from two layers displaced outward, and §4.25 shows it is
+the latter.
 
-**Two placement details we do not implement, either of which could be it:**
+**Two placement details we do not implement, and neither is it:**
 
 - **`alignment`.** `CImage::updateScenePosition` offsets a layer's rectangle by
   half its *scaled* size when the string contains `top`/`bottom`/`left`/`right`.
   `rg alignment src` finds the word only in `text.rs` and an unrelated comment
-  in `still.rs`, so the image path never reads it.
+  in `still.rs`, so the image path never reads it. Every object in all seven
+  scenes is `"center"`, which is the branch that does nothing, so this is a gap
+  in coverage and not a defect anywhere we can measure.
 - **Padded textures.** `uploadGeometryBuffers` corrects the UVs whenever
   `textureWidth != realWidth` — a `.tex` may store a power-of-two padded image.
-  `tex.rs` parses both fields; whether the scene path uses the real one is
-  unverified, and getting it wrong stretches a layer by exactly the padding
-  ratio.
+  Ours never sees the padding: every ex3 layer is an *embedded* png or jpg whose
+  mip0 is the real size (`layer_01` is `image 3840x2160  texture 4096x4096`, and
+  the decoded mipmap is 3840x2160), so `texture_width` describes the GPU slot
+  lwe allocates, not the pixels `decode_rgba` hands back. The correction is a
+  no-op for us by construction. Worth re-checking only if a raw or
+  block-compressed `.tex` ever decodes to the padded size.
 
 **It also gives two numbers for the particle size question (§4.20).** Their size
 initializer is `(min + t·(max−min)) · sizeOverride / 2.0` and their no-
@@ -1447,6 +1455,76 @@ drivers per display server (`Render/Drivers/{GLFW,Wayland}OpenGLDriver`), audio
 capture as a first-class subsystem (PulseAudio → the audio-response uniforms),
 an `Input/InputContext` feeding the mouse, and QuickJS for scripting — the same
 engine §4.21 picked, arrived at independently.
+
+---
+
+### 4.25 The whole displacement field, and why ex3 is still open
+
+§4.22 and §4.24 each fitted a model to three or four sampled regions and each
+got a different answer. The mistake is the sampling, so stop sampling: block-
+match the *entire* frame against the capture and look at the field. 120×100
+blocks, integer search to ±55 px, and a contrast gate that prints `.` rather
+than a fake zero for a block with nothing to match (a flat sky block minimises
+everywhere). `scratchpad/flowmap.py`.
+
+```
+ex3          x90      x210      x330      x450  …    x1410     x1530     x1650     x1770
+y80      -30, +4   -30, +4    -5, +6    -5, +6       -5, +6    -5, +6    -5, +6    -5, +6
+y380     -30, +4   -30, +4   -30, +4    -5, +6       -5, +6    -5, +6    -5, +6   +23, +5
+y580     -30, +4   -30, +4   -30, +4    -5, +6       -5, +6    -5, +6    -5, +6   +23, +4
+y780     -30, +4   -30, +4   -30, +4    -8, +7       -5, +6    -5, +5   +20, +3   +23, +4
+y880      -5, +6    -5, +6   -30, +4    -8, +6       -4, +5    -5, +6   +23, +4   +23, +4
+```
+
+Piecewise constant, with boundaries that follow layer silhouettes — not a warp.
+A warp's field varies smoothly with position; this one takes three values. A
+second measurement agrees: sweeping a scale-about-centre plus translation over
+the whole frame (`warp_psnr.py`) peaks at **sx = 1.004**, i.e. no scale, and
+buys +2.4 dB (17.60 → 19.99) from the translation alone. §4.24's s ≈ 1.034 was
+three points of a step function fitted with a straight line.
+
+So the residual is **one global translation plus exactly two displaced layers**.
+Reading offsets as *Wallpaper Engine minus ours*, in capture pixels:
+
+| layer | `parallaxDepth` | `origin.x` | `cropoffset` | offset |
+|---|---:|---:|---|---:|
+| `layer_01` background, `layer_tree` | −0.50 / −0.15 | 1920 / 1916 | — / (0, −796) | **+5, −6** |
+| `layer_grass` | −0.10 | 1200 | (−719.5, −805) | +2, −5 |
+| `layer_04` left buildings | −0.35 | 377.2 | (−1436.5, 0) | **+30**, −4 |
+| `layer_05` right buildings | −0.35 | 3437.4 | (+1422.5, 0) | **−23**, −4 |
+
+The two buildings layers are each pulled ~50 canvas px *toward the centre*
+relative to everything else. Within a layer the offset is constant to ±1 px
+across 240 px of width, so Wallpaper Engine scales their content by the same
+1.04 we do — they are translated, not resized.
+
+What that rules out, all of it checked rather than assumed:
+
+- **Parallax.** Equal depth, opposite sign (§4.24). Fitting the two depths that
+  do differ gives offsets in a ratio of 6 where the formula demands 0.625.
+- **`alignment`, padded UVs.** Both no-ops here (§4.24).
+- **Scripts.** ex3's only three are the clock text layers' own.
+- **`cropoffset`**, the one field in these models we do not read, and the only
+  per-layer quantity that flips sign between `layer_04` and `layer_05`. Scaling
+  the layer about the *uncropped* artwork's centre instead of the crop's —
+  `origin − (scale−1)·cropoffset` — predicts +28.8 and −28.5 against the
+  measured +30 and −23, which is tempting. It is still wrong: the same formula
+  puts `layer_tree` 16 px higher than it is, and that layer is a dense branch
+  silhouette measuring a clean +5 across the bottom of the frame.
+
+Which leaves a per-layer displacement with no attribute to hang it on. The
+cheapest thing that would settle it is a second capture of the same scene with
+the cursor parked somewhere known — it separates anything mouse-driven from
+anything static in one shot — and that needs the Windows machine, so this is
+**parked, not solved**. It is worth ~3 dB on ex3 and nothing elsewhere: no other
+scene in the corpus has a layer carrying both a non-unit `scale` and a
+`cropoffset`, which is the pair ex3's anomaly lives on.
+
+One unrelated thing the survey turned up: **`scene_example5`'s canvas is
+5824×3264**, aspect 1.7843, which is not the display's 16:9. Every other scene
+matches. Whatever Wallpaper Engine does to fit a mismatched canvas — letterbox,
+crop, or stretch — we do none of it, and that is the likelier story for ex5's
+own registration residual than anything ex3 shares.
 
 ---
 
