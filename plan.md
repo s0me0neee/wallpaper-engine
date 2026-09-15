@@ -1566,8 +1566,9 @@ all. The seven-scene table is unmoved (ex3 16.70 → 16.69, the rest identical),
 so this is checked in on a fixture test that builds a `.tex` byte by byte rather
 than on a picture.
 
-**Which turned up the real defect: `controlpointattract` ignores which control
-point it names.** The operator reads
+**Which turned up a defect — though not, it turned out, *the* one.
+`controlpointattract` ignores which control point it names.** §4.27 fixes this
+and finds that it was never why the birds were missing. The operator read
 
 ```rust
 // The only control point any preset attracts to sits at the system origin;
@@ -1586,15 +1587,74 @@ scenes override per instance:
 | ex4 | −154, 421 — off the left edge | 4185, 537 | 4190, −33 |
 
 The origin is off-canvas *on purpose*: the flock is supposed to be dragged
-across the frame. Attracting to the origin instead pins all thirty birds where
-they spawned, off-screen, for their whole 25-second life — which is why
-`SIMULATE_LAYERS=3` on ex3 and `SIMULATE_LAYERS=8` on ex4 both dump a frame with
-exactly one distinct pixel value. Two other empty particle layers checked at the
-same time are *correct*: ex3's `Snow storm` has `starttime: 15` and ex4's
-`Plane` is one particle that has not flown in yet at `t=10.026`.
+across the frame, and attracting to the origin instead holds it where it
+spawned — which is why `SIMULATE_LAYERS=3` on ex3 and `SIMULATE_LAYERS=8` on ex4
+both dump a frame with exactly one distinct pixel value. Two other empty
+particle layers checked at the same time are *correct*: ex3's `Snow storm` has
+`starttime: 15` and ex4's `Plane` is one particle that has not flown in yet at
+`t=10.026`.
 
 So the order is: control points first, birds second, sheet animation third —
 the sheet is already in place and waiting under the other two.
+
+---
+
+### 4.27 Why the birds were really missing
+
+Fixing §4.26's control points changed nothing: both birds layers still dumped a
+single pixel value, at `t` = 0.5, 2, 5, 10, 15 and 24 alike. A layer that is
+empty at *every* time is not a layer that is being steered wrongly.
+
+**A full system has to stop emitting, and ours never did.** `slot_particle`
+gives slot `n mod maxcount` to the newest emission congruent to it, so a slot is
+reused every `maxcount / rate` seconds no matter how long its occupant is meant
+to live. `birds` asks for 100 a second, scaled to 80 by the instance's
+`rate: 0.8`, into **30** slots holding particles for **25 s**:
+
+| | asked | slots allow | slot reused every | oldest bird |
+|---|---:|---:|---:|---:|
+| before | 80/s | — | 0.375 s | 0.375 s |
+| after | 80/s | 30 / 25 = 1.2/s | 25 s | ~25 s |
+
+At 0.375 s old a bird has moved about 13 units and is still inside its 64-unit
+emission sphere — which both scenes park off the canvas. The flock was never
+drawn at all, at any time, in either scene. The cap is
+`rate = min(asked, maxcount / lifetime)`, with the lifetime taken as the
+midpoint of what `lifetimerandom` can roll, since emission is a property of the
+system and runs before any particle is rolled.
+
+**And the birds fly.** ex3's layer dump goes from 1 distinct pixel value to 39,
+ex4's from 1 to 51: nine blobs each, 5–7 px across, spread along a path that
+leaves each scene's authored origin in the right direction — ex3 right-to-left
+from x 4063 under its mirrored `scale: -1`, ex4 left-to-right from x −154. The
+blobs measure aspect 1.25–1.75, which is the 128x120 cell and not the 4.25:1
+sheet, so this is also the first sight of §4.26's work.
+
+**The seven-scene table does not move at all.** The cap binds only where an
+emitter outruns its own slots, and in this corpus that is the birds alone — the
+other forty-odd systems are already slower than `maxcount / lifetime`. A fix
+that makes a missing layer appear and moves no other number is the shape you
+want; it also means PSNR was never going to find this.
+
+**One judgement call, recorded because the corpus does not settle it.** An
+instance's `controlpoint1`..`controlpoint7` could be local offsets replacing the
+preset's own, or scene coordinates. `linux-wallpaperengine` does not read the
+field at all, so there is no second opinion. The two users pull in opposite
+directions:
+
+- read as **scene coordinates**, ex3's points land 55 and 75 units from a system
+  origin at x 4063, well inside the halved thresholds, so the flock stays pinned
+  off-canvas — and ex3's authored values look like canvas positions (x 4119,
+  4091, against a 3840 canvas);
+- read as **local offsets**, both scenes' points sit ~4100 units out, past every
+  threshold, so the operators never fire and the birds fly on `movement` alone.
+
+Local is what is implemented, because it is the like-for-like reading — the
+override replaces `controlpoint.offset`, which is local — and because it is the
+one under which the flock is visible in both scenes. It is unsatisfying that it
+makes the authored points inert, so the alternative is worth revisiting with
+either a WE capture of ex3 that shows where its birds actually are, or a
+purpose-built scene with known control points.
 
 ---
 
