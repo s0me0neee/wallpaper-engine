@@ -2061,3 +2061,66 @@ survives the UI quitting — matching how WE itself behaves: quitting its
 control UI leaves the wallpaper running)? This changes the shape of §14.2's
 control-channel item and is worth deciding deliberately before writing code,
 not defaulting into one.
+
+**Decided: a separate background daemon**, for the reason the question already
+names — quitting the control UI must not take the wallpaper down with it, which
+is how Wallpaper Engine itself behaves. Nothing in §14.4 commits to it yet: the
+renderer is still a one-shot subcommand, and the daemon is the next piece.
+The front end will be scaffolded with **pnpm**.
+
+---
+
+### 14.4 The desktop window
+
+The first row of §14.2's table. `desktop` is `simulate` with a different window
+around it — same event loop, same `open_gl_window`, same frames — so the split
+is a `Presentation` (`desktop.rs`) threaded through, not a second renderer.
+What actually differs is five AppKit properties and an activation policy:
+
+| | why |
+|---|---|
+| level `kCGDesktopIconWindowLevel − 1` | above the desktop picture, below the icons. `kCGDesktopWindowLevel` itself is the Dock's own picture window's level, and ordering against it would be luck. |
+| `ignoresMouseEvents` | clicks, drags and rubber-band selections belong to the desktop under it. |
+| `CanJoinAllSpaces \| Stationary` | one wallpaper on every Space, and it does not slide when they do. |
+| `IgnoresCycle` | keeps it out of Cmd-Tab and Mission Control. |
+| `hasShadow: false` | a full-screen window at the bottom of the stack has nothing to cast onto. |
+| `ActivationPolicy::Accessory` | LSUIElement at runtime: no Dock icon, no menu bar. Set on the event-loop *builder*, because it is a property of the application and winit will not take it afterwards. |
+
+**It reports the level back rather than echoing what it asked for**, because
+AppKit silently clamps a level it will not honour and that failure would
+otherwise look exactly like success. On a 15-inch MacBook Air (M3) it prints
+`window level -2147483604 (icons sit at -2147483603)` — honoured exactly — with
+`scene_example2` at 55 fps (cpu 3 ms, upload 1 ms, gpu 3 ms).
+
+**And the frame in that same line found a defect.** It read `1710x1107`, which
+is right — that machine runs a scaled mode whose framebuffer is 3420x2214, so
+the screen is **aspect 1.545, not 16:9**. `fit_scale` took the tighter of the
+two ratios, as it has since §4.18, and rendered 3420x1924; `blit_to_screen`
+then centred that in a 2214-tall window. A **145-point black bar above and
+below the wallpaper** — correct for a window the user sized, and not a thing a
+desktop background may ever do.
+
+So the fit is now a choice, `pass::Fit`, and it has to be made in both places
+at once:
+
+| | window (`Contain`) | background (`Cover`) |
+|---|---|---|
+| scale | tighter ratio, 0.891 | looser ratio, 1.025 |
+| renders | 3420x1924 | capped at 1.0 → 3840x2160, the authored canvas |
+| on screen | 3420x1924 centred, bars | 3936x2214, overflowing ±258 px |
+
+Picking the fit at the blit alone would have been worse than the bar: the
+target would still be 3420x1924 and then magnified 1.15x to cover, so the
+wallpaper would be *blurrier* than the letterboxed one it replaced. Hence
+`render_resolution` takes the fit too.
+
+The `Cover` scale being above 1.0 is what it costs. `scaled_resolution` caps at
+1.0, so the background renders the full 4K canvas where the window rendered
+79 % of it, and `scene_example2` goes **55 fps → 47 fps** on the same machine
+(cpu and upload unmoved at 3 ms and 1 ms; it is all GPU). That is §4.23's
+measured trade paid in the other direction, and on this screen it is not
+optional — the alternative is a black bar.
+
+This is one window on the primary monitor. Multi-monitor, the control channel,
+live Video playback, persisted state, the library view and idle courtesy are
+all still §14.2's table.
