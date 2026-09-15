@@ -136,10 +136,19 @@ pub struct Preset {
     /// are `translucent`.
     #[serde(skip, default = "additive")]
     blend: model::Blend,
+    /// How fast the sprite sheet cycles, relative to the frame times the
+    /// texture itself declares. Explicitly `null` in ten corpus presets, so
+    /// this cannot be a plain `f32` with a serde default.
+    #[serde(default)]
+    sequencemultiplier: Option<f32>,
+    /// `"randomframe"` freezes each particle on a cell of its own; anything
+    /// else (including the corpus's explicit `null`) cycles with age.
+    #[serde(default)]
+    animationmode: Option<String>,
     /// The sprite each of this preset's particles is drawn with, resolved at
     /// collect time from the material's first texture slot.
     #[serde(skip)]
-    sprite: Option<Pixmap>,
+    sprite: Option<sprite::Sprite>,
 }
 
 fn additive() -> model::Blend {
@@ -939,26 +948,40 @@ pub struct DrawList {
     pub unsupported: Vec<String>,
 }
 
-/// The presets a draw list can name, in a fixed order.
+/// The images a draw list can name, in a fixed order.
 ///
 /// A `DrawItem` names its sprite by number so the list carries no borrow of
 /// the presets and can cross a thread boundary; the order has to be stable
 /// across frames because the GPU renderer uploads one texture per entry once
 /// and indexes it every frame. `HashMap`'s own iteration order is not.
+///
+/// A sheet's cells each get their own slot, which is what keeps frame
+/// selection out of the renderers entirely: picking a cell is picking a slot,
+/// and both the GPU and tiny-skia paths already know how to do that.
 pub struct SpriteTable {
-    keys: Vec<String>,
-    index: HashMap<String, usize>,
+    /// Slot to (preset key, cell within that preset's sheet).
+    slots: Vec<(String, usize)>,
+    /// Preset key to its first slot; cell `f` is at `base + f`.
+    base: HashMap<String, usize>,
 }
 
 pub fn sprite_table(presets: &HashMap<String, Preset>) -> SpriteTable {
     let mut keys: Vec<String> = presets.keys().cloned().collect();
     keys.sort();
-    let index = keys.iter().cloned().enumerate().map(|(slot, key)| (key, slot)).collect();
-    SpriteTable { keys, index }
+    let mut slots = Vec::with_capacity(keys.len());
+    let mut base = HashMap::with_capacity(keys.len());
+    for key in keys {
+        let Some(sprite) = presets.get(&key).and_then(|preset| preset.sprite.as_ref()) else {
+            continue;
+        };
+        base.insert(key.clone(), slots.len());
+        slots.extend((0..sprite.frames.len()).map(|cell| (key.clone(), cell)));
+    }
+    SpriteTable { slots, base }
 }
 
 pub fn sprite_count(table: &SpriteTable) -> usize {
-    table.keys.len()
+    table.slots.len()
 }
 
 /// The blend every preset in the system shares, or `None` when they differ.
@@ -980,7 +1003,33 @@ fn sprite_of<'a>(
     table: &SpriteTable,
     slot: usize,
 ) -> Option<&'a Pixmap> {
-    presets.get(table.keys.get(slot)?)?.sprite.as_ref()
+    let (key, cell) = table.slots.get(slot)?;
+    presets.get(key)?.sprite.as_ref()?.frames.get(*cell)
+}
+
+/// Which cell of the sheet a particle of this age is showing.
+///
+/// The frame times in the texture give the cycle length and
+/// `sequencemultiplier` scales it; `randomframe` instead freezes each particle
+/// on a cell of its own, which is what eight of the corpus's nine animated
+/// presets ask for. `n` is the particle's global emission index, so the choice
+/// is stable across frames without storing anything.
+fn sheet_cell(preset: &Preset, cells: usize, age: f32, salt: u64, n: u64) -> usize {
+    if cells <= 1 {
+        return 0;
+    }
+    if preset.animationmode.as_deref() == Some("randomframe") {
+        return seed(salt ^ 0x5EED_5EED, n).random_range(0..cells);
+    }
+    let speed = preset.sequencemultiplier.filter(|m| *m > 0.0).unwrap_or(1.0);
+    let seconds = preset.sprite.as_ref().map_or(0.0, |sprite| sprite.seconds);
+    if seconds <= 0.0 || !age.is_finite() || age < 0.0 {
+        return 0;
+    }
+    #[expect(clippy::cast_possible_truncation, clippy::cast_precision_loss, clippy::cast_sign_loss,
+             reason = "a fraction of a cycle times a cell count, both small and positive")]
+    let cell = ((age * speed / seconds).fract() * cells as f32) as usize;
+    cell.min(cells - 1)
 }
 
 /// The `slot`th sprite as straight-alpha RGBA, for a GL upload.
@@ -1281,10 +1330,12 @@ fn collect_preset(
     // `collect_presets` resolves a sprite for every preset it parses (falling
     // back to a stand-in itself), so a missing one means a hand-built preset
     // with nothing to draw.
-    let Some(sprite) = table.index.get(key).copied().filter(|_| preset.sprite.is_some()) else {
+    let Some(base) = table.base.get(key).copied() else {
         return;
     };
+    let cells = preset.sprite.as_ref().map_or(0, |sprite| sprite.frames.len());
     for (n, birth, live) in &alive {
+        let sprite = base + sheet_cell(preset, cells, time - birth, salt, *n);
         push_particle(out, sprite, place, renderer, live, preset.blend);
         if depth + 1 < MAX_DEPTH {
             for child in children.clone().filter(|child| child.r#type == "eventfollow") {
@@ -1691,5 +1742,43 @@ mod tests {
         assert!(early < mid, "{early} !< {mid}");
         assert!(late < mid, "{late} !< {mid}");
         assert!((mid - r.alpha).abs() < 1e-6);
+    }
+
+    /// A preset holding a sheet of `cells` blank cells lasting `seconds`.
+    fn sheeted(json: &str, cells: usize, seconds: f32) -> Preset {
+        let mut p = preset(json);
+        let frames = (0..cells)
+            .map(|_| Pixmap::new(4, 4).expect("a 4x4 pixmap always allocates"))
+            .collect();
+        p.sprite = Some(sprite::Sprite { frames, seconds });
+        p
+    }
+
+    #[test]
+    fn a_sheet_cycles_once_per_duration_over_sequencemultiplier() {
+        // `birds.json`'s own numbers: sixteen cells over a 1 s cycle at 30x.
+        let p = sheeted(r#"{"emitter":[{"name":"boxrandom","rate":1}],"sequencemultiplier":30}"#, 16, 1.0);
+        let cell = |age| sheet_cell(&p, 16, age, 0, 0);
+        assert_eq!(cell(0.0), 0);
+        // A thirtieth of a second is one whole cycle, so it lands back on 0,
+        // and half a cell into the cycle is cell 8.
+        assert_eq!(cell(1.0 / 30.0 / 2.0), 8);
+        assert!((0..16u8).map(|i| cell(f32::from(i) / 480.0)).eq(0..16));
+    }
+
+    #[test]
+    fn randomframe_freezes_each_particle_on_a_cell_of_its_own() {
+        let p = sheeted(r#"{"emitter":[{"name":"boxrandom","rate":1}],"animationmode":"randomframe"}"#, 5, 1.0);
+        // Same particle, different ages: the cell must not move.
+        assert_eq!(sheet_cell(&p, 5, 0.0, 9, 3), sheet_cell(&p, 5, 7.5, 9, 3));
+        // And a hundred particles must not all land on the same cell.
+        let cells: std::collections::HashSet<usize> = (0..100).map(|n| sheet_cell(&p, 5, 1.0, 9, n)).collect();
+        assert!(cells.len() >= 4, "only {} distinct cells", cells.len());
+    }
+
+    #[test]
+    fn a_still_sprite_stays_on_its_only_cell() {
+        let p = sheeted(r#"{"emitter":[{"name":"boxrandom","rate":1}],"sequencemultiplier":30}"#, 1, 0.0);
+        assert_eq!(sheet_cell(&p, 1, 4.25, 0, 0), 0);
     }
 }

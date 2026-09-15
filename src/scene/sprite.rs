@@ -51,53 +51,103 @@ const EMBEDDED: [(&str, &[u8]); 11] = [
     ("rain", include_bytes!("sprites/rain.png")),
 ];
 
+/// What one preset draws with: a single image, or the cells of a sheet.
+///
+/// A `.tex` flagged `IsGif` carries a frame table, and for a particle sprite
+/// that table is a grid rather than a gif (`tex::sheet`). Drawn whole, a sheet
+/// puts all sixteen of `birds_128x120x16`'s wing positions on every bird.
+#[derive(Debug)]
+pub struct Sprite {
+    pub frames: Vec<Pixmap>,
+    /// One full cycle of the sheet, in seconds; 0 when there is nothing to cycle.
+    pub seconds: f32,
+}
+
+fn still(pixmap: Pixmap) -> Sprite {
+    Sprite { frames: vec![pixmap], seconds: 0.0 }
+}
+
 /// Resolve one texture name to a sprite.
 ///
 /// Package first (workshop sprites live there), then the install if one was
 /// given, then our own stand-in. A texture that fails to decode falls through
 /// rather than failing the layer.
-pub fn resolve(archive: &mut Archive, assets: Option<&Path>, name: &str) -> Pixmap {
-    if let Some(pixmap) = from_package(archive, name) {
-        return pixmap;
+pub fn resolve(archive: &mut Archive, assets: Option<&Path>, name: &str) -> Sprite {
+    if let Some(sprite) = from_package(archive, name) {
+        return sprite;
     }
     if let Some(root) = assets
-        && let Some(pixmap) = from_assets(root, name)
+        && let Some(sprite) = from_assets(root, name)
     {
-        return pixmap;
+        return sprite;
     }
-    stand_in(name)
+    still(stand_in(name))
 }
 
-fn from_package(archive: &mut Archive, name: &str) -> Option<Pixmap> {
+fn from_package(archive: &mut Archive, name: &str) -> Option<Sprite> {
     let bytes = archive.read(&format!("materials/{name}.tex")).ok()?;
-    to_pixmap(&decode_tex(&bytes)?)
+    from_tex(&bytes)
 }
 
 /// Read `<root>/materials/<name>.tex`, or a plain image beside it — so a
 /// directory of PNGs stands in for an install just as well.
-fn from_assets(root: &Path, name: &str) -> Option<Pixmap> {
-    let base = root.join("materials").join(name);
-    if let Ok(bytes) = std::fs::read(base.with_extension("tex"))
-        && let Some(decoded) = decode_tex(&bytes)
+fn from_assets(root: &Path, name: &str) -> Option<Sprite> {
+    if let Ok(bytes) = std::fs::read(root.join("materials").join(name).with_extension("tex"))
+        && let Some(sprite) = from_tex(&bytes)
     {
-        return to_pixmap(&decoded);
+        return Some(sprite);
     }
+    let base = root.join("materials").join(name);
     for extension in ["png", "tga", "jpg"] {
         if let Ok(image) = image::open(base.with_extension(extension)) {
-            return to_pixmap(&image.to_rgba8());
+            return to_pixmap(&image.to_rgba8()).map(still);
         }
     }
     None
 }
 
-fn decode_tex(bytes: &[u8]) -> Option<image::RgbaImage> {
+fn from_tex(bytes: &[u8]) -> Option<Sprite> {
     let texture = tex::parse_bytes(bytes).ok()?;
     let mipmap = tex::largest_mipmap(&texture).ok()?;
-    tex::decode_rgba(&texture, mipmap).ok()
+    let image = tex::decode_rgba(&texture, mipmap).ok()?;
+    let Some((_cols, _rows, seconds)) = tex::sheet(&texture) else {
+        return to_pixmap(&image).map(still);
+    };
+    // Cut by each frame's own rect rather than by the grid: `birds_128x120x16`
+    // is 1024x241 for two 120-pixel rows, and the slack row is not a cell.
+    // The mask test is the *sheet's*, since a single cell can be accidentally
+    // opaque in a texture that is not a luminance mask at all.
+    let mask = is_coverage_mask(&image);
+    let frames: Vec<Pixmap> = texture
+        .frames
+        .iter()
+        .filter_map(|frame| {
+            let cell = cut(&image, frame)?;
+            remap(&cell, mask)
+        })
+        .collect();
+    (!frames.is_empty()).then_some(Sprite { frames, seconds })
+}
+
+#[expect(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "frame rects are texture pixel coordinates, bounds-checked against the sheet"
+)]
+fn cut(image: &image::RgbaImage, frame: &tex::Frame) -> Option<image::RgbaImage> {
+    let (x, y) = (frame.x.max(0.0) as u32, frame.y.max(0.0) as u32);
+    let (width, height) = (frame.width.max(0.0) as u32, frame.height.max(0.0) as u32);
+    if width == 0 || height == 0 || x + width > image.width() || y + height > image.height() {
+        return None;
+    }
+    Some(image::imageops::crop_imm(image, x, y, width, height).to_image())
 }
 
 fn to_pixmap(image: &image::RgbaImage) -> Option<Pixmap> {
-    let mask = is_coverage_mask(image);
+    remap(image, is_coverage_mask(image))
+}
+
+fn remap(image: &image::RgbaImage, mask: bool) -> Option<Pixmap> {
     let mut pixmap = Pixmap::new(image.width(), image.height())?;
     for (destination, source) in pixmap.pixels_mut().iter_mut().zip(image.pixels()) {
         let [r, g, b, a] = source.0;

@@ -37,6 +37,13 @@ impl<R: Read> Reader<R> {
         Ok(u32::from_le_bytes(buf))
     }
 
+    pub fn f32(&mut self) -> Result<f32> {
+        let mut buf = [0u8; 4];
+        self.inner.read_exact(&mut buf)?;
+        self.pos += 4;
+        Ok(f32::from_le_bytes(buf))
+    }
+
     pub fn bytes(&mut self, count: usize) -> Result<Vec<u8>> {
         let mut buf = vec![0u8; count];
         self.inner.read_exact(&mut buf)?;

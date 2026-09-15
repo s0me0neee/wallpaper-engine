@@ -26,6 +26,17 @@
 //!             int32 decompressed_size  |- containers v2+ only
 //!             int32 byte_count
 //!             bytes data
+//! "TEXS000n\0"                    sprite sheet; present iff flags has IsGif:
+//!     uint32 frame_count
+//!     uint32 sheet_width          \_ v3 only
+//!     uint32 sheet_height         /
+//!     repeat frame_count times:
+//!         uint32 frame_number
+//!         float  seconds
+//!         float  x, y             |- int32 in v1, and in a different order
+//!         float  width            |
+//!         float  unknown, unknown |
+//!         float  height           /
 //! ```
 //!
 //! `free_image_format` is the crux: when it is not -1 each mipmap payload is a
@@ -118,6 +129,15 @@ pub struct Mipmap {
     pub decompressed_size: usize,
 }
 
+/// One cell of an animated texture, in pixels of the whole sheet.
+pub struct Frame {
+    pub seconds: f32,
+    pub x: f32,
+    pub y: f32,
+    pub width: f32,
+    pub height: f32,
+}
+
 pub struct Tex {
     pub version: String,
     pub container_version: String,
@@ -130,7 +150,37 @@ pub struct Tex {
     pub dominant_color: u32,
     pub free_image_format: i32,
     pub images: Vec<Vec<Mipmap>>,
+    pub frames: Vec<Frame>,
     pub bytes_consumed: u64,
+}
+
+/// Columns, rows and cycle length, for a texture that really is a grid.
+///
+/// A GIF stores one full-size frame per entry, so its cell is the whole
+/// texture and the grid comes out 1x1 — which cannot hold its own frames.
+/// That mismatch is the test, and it is why this returns `None` rather than
+/// treating every animated texture as a sheet.
+pub fn sheet(tex: &Tex) -> Option<(u32, u32, f32)> {
+    let first = tex.frames.first()?;
+    if first.width <= 0.0 || first.height <= 0.0 || tex.image_width <= 0 || tex.image_height <= 0 {
+        return None;
+    }
+    #[expect(clippy::cast_precision_loss, reason = "texture sides, far below 2^24")]
+    let (sheet_w, sheet_h) = (tex.image_width as f32, tex.image_height as f32);
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "a texture side over a cell side, rounded: small and positive"
+    )]
+    let (cols, rows) = (
+        (sheet_w / first.width).round() as u32,
+        (sheet_h / first.height).round() as u32,
+    );
+    let count = u32::try_from(tex.frames.len()).ok()?;
+    if cols == 0 || rows == 0 || cols * rows < count {
+        return None;
+    }
+    Some((cols, rows, tex.frames.iter().map(|frame| frame.seconds).sum()))
 }
 
 impl Tex {
@@ -254,6 +304,12 @@ fn parse_from<R: Read + Seek>(source: R) -> Result<Tex> {
         images.push(mipmaps);
     }
 
+    let frames = if flags & 4 == 0 {
+        Vec::new()
+    } else {
+        parse_frames(&mut reader).context("reading the sprite sheet frame table")?
+    };
+
     Ok(Tex {
         version,
         container_version,
@@ -266,8 +322,48 @@ fn parse_from<R: Read + Seek>(source: R) -> Result<Tex> {
         dominant_color,
         free_image_format,
         images,
+        frames,
         bytes_consumed: reader.pos(),
     })
+}
+
+fn parse_frames<R: Read + Seek>(reader: &mut Reader<R>) -> Result<Vec<Frame>> {
+    let magic = reader.magic()?;
+    let version: i32 = match magic.strip_prefix("TEXS") {
+        Some(number) => number.parse().with_context(|| format!("parsing sheet version {magic:?}"))?,
+        None => bail!("expected TEXS sheet header, got {magic:?}"),
+    };
+
+    let frame_count = reader.u32()?;
+    if frame_count > 4096 {
+        bail!("implausible frame count {frame_count}");
+    }
+    // v3 states the cell size up front. It is redundant with the first frame's
+    // own width and height, which is what every reader actually uses.
+    if version >= 3 {
+        let (_cell_width, _cell_height) = (reader.u32()?, reader.u32()?);
+    }
+
+    let mut frames = Vec::with_capacity(frame_count as usize);
+    for _ in 0..frame_count {
+        let _frame_number = reader.u32()?;
+        let seconds = reader.f32()?;
+        // v1 stores the rect as integers, and puts height last after two words
+        // whose purpose is unknown; v2 and v3 keep that order in floats.
+        let (x, y, width, height) = if version <= 1 {
+            #[expect(clippy::cast_precision_loss, reason = "sheet pixel coordinates, far below 2^24")]
+            let value = |value: u32| value as f32;
+            let (x, y, width) = (value(reader.u32()?), value(reader.u32()?), value(reader.u32()?));
+            let (_unknown_a, _unknown_b) = (reader.u32()?, reader.u32()?);
+            (x, y, width, value(reader.u32()?))
+        } else {
+            let (x, y, width) = (reader.f32()?, reader.f32()?, reader.f32()?);
+            let (_unknown_a, _unknown_b) = (reader.f32()?, reader.f32()?);
+            (x, y, width, reader.f32()?)
+        };
+        frames.push(Frame { seconds, x, y, width, height });
+    }
+    Ok(frames)
 }
 
 /// Decompress a mipmap payload, returning it borrowed when already plain.
@@ -470,11 +566,25 @@ pub fn describe(path: &Path, tex: &Tex, total: u64) {
         }
     }
 
+    if !tex.frames.is_empty() {
+        let first = &tex.frames[0];
+        let grid = match sheet(tex) {
+            Some((cols, rows, seconds)) => format!("{cols}x{rows} grid, {seconds:.3}s cycle"),
+            None => "not a grid (one full-size frame each, as a gif stores them)".to_string(),
+        };
+        println!(
+            "  {} frame(s)  cell {}x{}  {grid}",
+            tex.frames.len(),
+            first.width,
+            first.height
+        );
+    }
+
     let trailing = total - tex.bytes_consumed;
     let note = if trailing == 0 {
         "exact".to_string()
     } else {
-        format!("{trailing} trailing bytes (sprite/gif data?)")
+        format!("{trailing} trailing bytes")
     };
     println!(
         "  consumed {} of {total} bytes: {note}",
@@ -635,5 +745,65 @@ mod tests {
             decompressed_size: 99,
         };
         assert!(mipmap_pixels(&mipmap).is_err());
+    }
+
+    /// A whole `.tex` with one 1x1 mipmap and an optional TEXS frame table,
+    /// which is the only way to exercise the frame table without shipping a
+    /// texture: every animated one in the corpus lives in `papers/`.
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "a hand-built fixture whose every number is a small positive constant"
+    )]
+    fn animated_tex(width: i32, height: i32, cells: &[(f32, f32, f32, f32)]) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"TEXV0005\0");
+        bytes.extend_from_slice(b"TEXI0001\0");
+        for value in [0, 4, width, height, width, height, 0] {
+            bytes.extend_from_slice(&i32::to_le_bytes(value));
+        }
+        bytes.extend_from_slice(b"TEXB0003\0");
+        for value in [1, -1, 1, 1, 1, 0, 0, 4] {
+            bytes.extend_from_slice(&i32::to_le_bytes(value));
+        }
+        bytes.extend_from_slice(&[0, 0, 0, 0]);
+
+        bytes.extend_from_slice(b"TEXS0003\0");
+        bytes.extend_from_slice(&u32::to_le_bytes(cells.len() as u32));
+        bytes.extend_from_slice(&u32::to_le_bytes(cells.first().map_or(0.0, |c| c.2) as u32));
+        bytes.extend_from_slice(&u32::to_le_bytes(cells.first().map_or(0.0, |c| c.3) as u32));
+        for (index, (x, y, w, h)) in cells.iter().enumerate() {
+            bytes.extend_from_slice(&u32::to_le_bytes(index as u32));
+            for value in [0.0625, *x, *y, *w, 0.0, 0.0, *h] {
+                bytes.extend_from_slice(&f32::to_le_bytes(value));
+            }
+        }
+        bytes
+    }
+
+    /// `birds_128x120x16`'s own shape: sixteen 128x120 cells in a 1024x241
+    /// texture, where the slack row is padding rather than a third row.
+    #[test]
+    fn a_frame_table_resolves_to_the_grid_it_describes() {
+        let cells: Vec<(f32, f32, f32, f32)> = (0..16u8)
+            .map(|i| (f32::from(i % 8) * 128.0, f32::from(i / 8) * 120.0, 128.0, 120.0))
+            .collect();
+        let tex = parse_bytes(&animated_tex(1024, 241, &cells)).expect("parses");
+        assert_eq!(tex.frames.len(), 16);
+        assert_eq!(tex.bytes_consumed, animated_tex(1024, 241, &cells).len() as u64);
+        let (cols, rows, seconds) = sheet(&tex).expect("a grid");
+        assert_eq!((cols, rows), (8, 2));
+        assert!((seconds - 1.0).abs() < 1e-5, "cycle {seconds}");
+    }
+
+    /// A gif stores one full-size frame per entry, so its "grid" is 1x1 and
+    /// cannot hold its own frames. Treating it as a sheet would slice every
+    /// frame down to the first one.
+    #[test]
+    fn a_gif_is_not_mistaken_for_a_grid() {
+        let cells = vec![(0.0, 0.0, 256.0, 256.0); 4];
+        let tex = parse_bytes(&animated_tex(256, 256, &cells)).expect("parses");
+        assert_eq!(tex.frames.len(), 4);
+        assert!(sheet(&tex).is_none());
     }
 }
