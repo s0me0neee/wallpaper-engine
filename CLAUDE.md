@@ -42,7 +42,14 @@ cargo run --release -- unpack  papers/scene_example2/scene.pkg -o /tmp/s2
 cargo run --release -- tex     /tmp/s2/materials -o /tmp/tex   # .tex -> PNG, incl. the effect masks
 cargo run --release -- shaders papers/scene_example2 -o /tmp/glsl  # preprocess only, no GPU needed
 cargo run --release -- simulate papers/scene_example2      # live window, egui parameter sliders
+cargo run --release -- desktop  papers/scene_example2      # same renderer, as the desktop background
 ```
+
+`desktop` is `simulate` in a window the window server treats differently (`desktop.rs`): borderless,
+one level below the desktop icons, click-through, on every Space, from a process with no Dock icon.
+macOS only — the other platforms need a different mechanism entirely and it says so rather than
+opening an ordinary window. It has no title bar and never becomes key, so Ctrl-C in its terminal is
+how it stops.
 
 `simulate` has a headless dump hook, which is the fastest way to verify a rendering change:
 

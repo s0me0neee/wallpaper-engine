@@ -28,7 +28,9 @@ glutin-winit = { version = "0.5", default-features = false }
 # below) and gives us the bundled egui_glow::winit::EguiGlow helper instead
 # of wiring egui's context/input/painter together by hand.
 egui = "0.36.1"
-egui_glow = { version = "0.36.1", default-features = false, features = ["winit"] }
+egui_glow = { version = "0.36.1", default-features = false, features = [
+	"winit",
+] }
 image = { version = "0.25.10", default-features = false, features = [
 	"png",
 	"jpeg",
@@ -78,9 +80,23 @@ fontdb = "0.24.0"
 # build the one never-shown NSWindow the headless GL context attaches to
 # (`render/gpu.rs`). Scoped to macOS so the crate does not drag AppKit onto
 # platforms where EGL's pbuffer does the same job with no window at all.
+# `desktop.rs` reuses the same bindings to sink the live window into the
+# desktop background.
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6"
-objc2-app-kit = { version = "0.3", features = ["NSWindow", "NSGraphics", "NSView", "NSResponder"] }
+objc2-app-kit = { version = "0.3", features = [
+	"NSWindow",
+	"NSGraphics",
+	"NSView",
+	"NSResponder",
+] }
+# Only for `kCGDesktopIconWindowLevel`: AppKit names every window level *except*
+# the two below the desktop picture, and those are CoreGraphics constants.
+# Already in the tree as an objc2-app-kit dependency, so this costs no build.
+objc2-core-graphics = { version = "0.3", default-features = false, features = [
+	"std",
+	"CGWindowLevel",
+] }
 objc2-foundation = "0.3"
 
 [lints.clippy]
@@ -92,3 +108,5 @@ exit = "deny"
 
 [profile.release]
 opt-level = 3
+lto = "fat"
+codegen-units = 1

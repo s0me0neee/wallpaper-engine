@@ -17,6 +17,7 @@
 //! yet; see plan.md. An `egui` overlay lets you drag any range-annotated shader
 //! parameter away from the wallpaper's own preset, live.
 
+use crate::desktop::{self, Presentation};
 use crate::export::Resolution;
 use crate::pkg::Archive;
 use crate::render::{bloom, capture, particles, pass};
@@ -43,22 +44,33 @@ use rayon::prelude::*;
 use std::time::{Duration, Instant};
 use winit::application::ApplicationHandler;
 use winit::event::WindowEvent;
-use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
+use winit::event_loop::{ActiveEventLoop, ControlFlow};
 use winit::keyboard::{Key, NamedKey};
+use winit::monitor::MonitorHandle;
 use winit::window::{Window, WindowId};
 
 /// Open a window and play `scene` in it until it is closed.
-pub fn run(archive: &mut Archive, scene: &Scene, assets: Option<&Path>, title: &str) -> Result<()> {
+///
+/// `presentation` chooses between the titled simulator window and the desktop
+/// background; everything below draws the same frames either way.
+pub fn run(
+    archive: &mut Archive,
+    scene: &Scene,
+    assets: Option<&Path>,
+    title: &str,
+    presentation: Presentation,
+) -> Result<()> {
     // The groundwork is deliberately *not* done here: which resolution to
     // decode at depends on the monitor, and only an `ActiveEventLoop` can name
     // one. So does the unsimulated report, which depends on which layer chains
     // compile — both happen in `open_window`.
-    let event_loop = EventLoop::new().context("opening a window event loop")?;
+    let event_loop = desktop::event_loop(presentation)?;
     let mut app = App {
         title: title.to_string(),
         archive,
         scene,
         assets: assets.map(Path::to_path_buf),
+        presentation,
         static_scene: None,
         headers: shim::headers(),
         start: Instant::now(),
@@ -72,6 +84,7 @@ struct App<'a> {
     archive: &'a mut Archive,
     scene: &'a Scene,
     assets: Option<PathBuf>,
+    presentation: Presentation,
     /// Built by `open_window`, once the monitor it will render for is known.
     static_scene: Option<compose::StaticScene<'a>>,
     headers: HashMap<String, String>,
@@ -383,9 +396,13 @@ struct State {
     /// The scene's own pixel dimensions — every layer and the composite match
     /// this, so the window letterboxes to it rather than stretching.
     content_size: (u32, u32),
+    /// How `content_size` meets a window of a different shape.
+    fit: pass::Fit,
     background: [f32; 4],
     layers: Vec<LiveLayer>,
-    egui: egui_glow::winit::EguiGlow,
+    /// `None` on the desktop background, which is click-through and so has
+    /// nothing to drive a slider with.
+    egui: Option<egui_glow::winit::EguiGlow>,
     /// One live value per tweakable across every chain, concatenated in layer
     /// order; each `LiveLayer::tweaks` indexes its own span.
     tweak_values: Vec<f32>,
@@ -420,24 +437,34 @@ fn rect_of(left: i64, top: i64, image: &RgbaImage) -> (i32, i32, i32, i32) {
 /// arm never fires, and capped at 1.0 — a small canvas on a big monitor is not
 /// worth upscaling before the blit already does it.
 ///
+/// `fit` has to match the one the blit will use, or the two disagree about
+/// which side is the binding one and the background renders a target it then
+/// has to magnify: a 16:9 canvas on the 3420x2214 screen of §14.4 renders at
+/// 3420x1924 under `Contain` and is blown back up to 3936x2214 to cover.
+///
 /// `SIMULATE_SCALE=<factor>` overrides it, which is how a render at one scale
 /// is compared against the same frame at another without moving machines.
-fn render_resolution(canvas: (u32, u32), monitor: Option<(u32, u32)>) -> Option<Resolution> {
+fn render_resolution(canvas: (u32, u32), monitor: Option<(u32, u32)>, fit: pass::Fit) -> Option<Resolution> {
     match std::env::var("SIMULATE_SCALE").ok().and_then(|value| value.parse::<f32>().ok()) {
         Some(scale) => scaled_resolution(canvas, scale),
-        None => scaled_resolution(canvas, fit_scale(canvas, monitor?)),
+        None => scaled_resolution(canvas, fit_scale(canvas, monitor?, fit)),
     }
 }
 
-/// The uniform scale that fits `canvas` inside `monitor` — the tighter of the
-/// two ratios, so the aspect ratio is preserved on a canvas that is not the
+/// The uniform scale that fits `canvas` to `monitor`: the tighter of the two
+/// ratios to keep all of it on screen, the looser to leave none of the screen
+/// uncovered. Either way the aspect ratio survives on a canvas that is not the
 /// display's (`scene_example5` is 5824x3264, which is not 16:9).
 #[expect(clippy::cast_precision_loss, reason = "display and canvas dimensions, nowhere near 2^24")]
-fn fit_scale((canvas_w, canvas_h): (u32, u32), (mon_w, mon_h): (u32, u32)) -> f32 {
+fn fit_scale((canvas_w, canvas_h): (u32, u32), (mon_w, mon_h): (u32, u32), fit: pass::Fit) -> f32 {
     if canvas_w == 0 || canvas_h == 0 {
         return 1.0;
     }
-    (mon_w as f32 / canvas_w as f32).min(mon_h as f32 / canvas_h as f32)
+    let (by_width, by_height) = (mon_w as f32 / canvas_w as f32, mon_h as f32 / canvas_h as f32);
+    match fit {
+        pass::Fit::Contain => by_width.min(by_height),
+        pass::Fit::Cover => by_width.max(by_height),
+    }
 }
 
 /// `canvas` at `scale`, or `None` when that is not a reduction worth making.
@@ -455,6 +482,101 @@ fn scaled_resolution(canvas: (u32, u32), scale: f32) -> Option<Resolution> {
     Some(Resolution { width: side(canvas.0), height: side(canvas.1) })
 }
 
+/// How a canvas that is not the screen's shape meets the screen.
+///
+/// A window may letterbox — the user chose its size, and black bars there are
+/// honest. A wallpaper may not: it has to reach every corner, so it overflows
+/// off two edges instead, which is what every wallpaper picker does with a
+/// mismatched image.
+fn screen_fit(presentation: Presentation) -> pass::Fit {
+    match presentation {
+        Presentation::Window => pass::Fit::Contain,
+        Presentation::Background => pass::Fit::Cover,
+    }
+}
+
+/// A window with a current GL 3.3 core context on it.
+struct Windowed {
+    window: Window,
+    surface: Surface<WindowSurface>,
+    context: PossiblyCurrentContext,
+    gl: Arc<glow::Context>,
+}
+
+/// Open the window `presentation` calls for and make a GL context current on
+/// it. `render_size` is the render target's size, which a simulator window matches
+/// exactly and a desktop background merely holds.
+fn open_gl_window(
+    event_loop: &ActiveEventLoop,
+    presentation: Presentation,
+    title: &str,
+    render_size: (u32, u32),
+    screen: Option<MonitorHandle>,
+) -> Result<Windowed> {
+    let attributes = Window::default_attributes().with_title(title.to_string());
+    let attributes = match presentation {
+        Presentation::Window => {
+            attributes.with_inner_size(winit::dpi::PhysicalSize::new(render_size.0, render_size.1))
+        }
+        // The background covers its whole screen and never moves; the render
+        // target inside it stays whatever `render_resolution` chose, and
+        // `blit_to_screen` letterboxes a canvas that is not the screen's shape.
+        Presentation::Background => {
+            let screen = screen.context("no monitor to put a wallpaper on")?;
+            attributes
+                .with_inner_size(screen.size())
+                .with_position(screen.position())
+                .with_decorations(false)
+                .with_resizable(false)
+        }
+    };
+
+    let template = ConfigTemplateBuilder::new().with_alpha_size(8);
+    let (window, config) = DisplayBuilder::new()
+        .with_window_attributes(Some(attributes))
+        .build(event_loop, template, |mut configs| {
+            configs.next().expect("the platform reports at least one GL config")
+        })
+        .map_err(|error| anyhow!("opening the window's GL display: {error}"))?;
+    let window = window.context("glutin-winit did not create a window")?;
+    if presentation == Presentation::Background {
+        // As early as possible: winit has already ordered the window front, so
+        // anything between here and the attach is an ordinary window sitting
+        // over whatever the user was looking at.
+        desktop::attach(&window)?;
+    }
+
+    let display = config.display();
+    let raw_window_handle = window.window_handle().ok().map(|handle| handle.as_raw());
+    let context_attributes = ContextAttributesBuilder::new()
+        .with_context_api(ContextApi::OpenGl(Some(Version::new(3, 3))))
+        .build(raw_window_handle);
+    // Safety: `config` and `raw_window_handle` both come from the window and
+    // display created just above, which outlive this call.
+    let not_current = unsafe { display.create_context(&config, &context_attributes) }
+        .context("creating a GL 3.3 core context")?;
+
+    let surface_attributes = window
+        .build_surface_attributes(SurfaceAttributesBuilder::<WindowSurface>::new())
+        .map_err(|error| anyhow!("building the window's surface attributes: {error}"))?;
+    // Safety: the surface attributes were just built from this same window.
+    let surface = unsafe { display.create_window_surface(&config, &surface_attributes) }
+        .context("attaching the GL context to the window")?;
+
+    let context = not_current.make_current(&surface).context("making the GL context current")?;
+    let one = NonZeroU32::new(1).context("1 is non-zero")?;
+    surface.set_swap_interval(&context, SwapInterval::Wait(one)).context("enabling vsync")?;
+
+    let gl = unsafe {
+        glow::Context::from_loader_function(|name| {
+            let name = CString::new(name).unwrap_or_default();
+            display.get_proc_address(&name).cast()
+        })
+    };
+
+    Ok(Windowed { window, surface, context, gl: Arc::new(gl) })
+}
+
 impl App<'_> {
     fn open_window(&mut self, event_loop: &ActiveEventLoop) -> Result<State> {
         let ortho = self
@@ -462,11 +584,13 @@ impl App<'_> {
             .general
             .orthographic
             .context("scene has no orthographic projection, so it is not a flat wallpaper")?;
-        let monitor = event_loop.primary_monitor().map(|monitor| {
-            let size = monitor.size();
+        let screen = event_loop.primary_monitor();
+        let monitor = screen.as_ref().map(|screen| {
+            let size = screen.size();
             (size.width, size.height)
         });
-        let resolution = render_resolution((ortho.width, ortho.height), monitor);
+        let fit = screen_fit(self.presentation);
+        let resolution = render_resolution((ortho.width, ortho.height), monitor, fit);
         if let Some(resolution) = resolution {
             println!("  rendering at {resolution} for a {}x{} canvas", ortho.width, ortho.height);
         }
@@ -478,47 +602,8 @@ impl App<'_> {
         let (hdr, scene_bloom, zoom) = (static_scene.hdr, static_scene.bloom, static_scene.zoom);
         let background = normalized_rgba(static_scene.background);
         self.static_scene = Some(static_scene);
-        let attributes = Window::default_attributes()
-            .with_title(self.title.clone())
-            .with_inner_size(winit::dpi::PhysicalSize::new(width, height));
-
-        let template = ConfigTemplateBuilder::new().with_alpha_size(8);
-        let (window, config) = DisplayBuilder::new()
-            .with_window_attributes(Some(attributes))
-            .build(event_loop, template, |mut configs| {
-                configs.next().expect("the platform reports at least one GL config")
-            })
-            .map_err(|error| anyhow!("opening the window's GL display: {error}"))?;
-        let window = window.context("glutin-winit did not create a window")?;
-
-        let display = config.display();
-        let raw_window_handle = window.window_handle().ok().map(|handle| handle.as_raw());
-        let context_attributes = ContextAttributesBuilder::new()
-            .with_context_api(ContextApi::OpenGl(Some(Version::new(3, 3))))
-            .build(raw_window_handle);
-        // Safety: `config` and `raw_window_handle` both come from the window
-        // and display created just above, which outlive this call.
-        let not_current = unsafe { display.create_context(&config, &context_attributes) }
-            .context("creating a GL 3.3 core context")?;
-
-        let surface_attributes = window
-            .build_surface_attributes(SurfaceAttributesBuilder::<WindowSurface>::new())
-            .map_err(|error| anyhow!("building the window's surface attributes: {error}"))?;
-        // Safety: the surface attributes were just built from this same window.
-        let surface = unsafe { display.create_window_surface(&config, &surface_attributes) }
-            .context("attaching the GL context to the window")?;
-
-        let context = not_current.make_current(&surface).context("making the GL context current")?;
-        let one = NonZeroU32::new(1).context("1 is non-zero")?;
-        surface.set_swap_interval(&context, SwapInterval::Wait(one)).context("enabling vsync")?;
-
-        let gl = unsafe {
-            glow::Context::from_loader_function(|name| {
-                let name = CString::new(name).unwrap_or_default();
-                display.get_proc_address(&name).cast()
-            })
-        };
-        let gl = Arc::new(gl);
+        let Windowed { window, surface, context, gl } =
+            open_gl_window(event_loop, self.presentation, &self.title, (width, height), screen)?;
 
         let display_quad = pass::build_display_quad(&gl)?;
         let blit = pass::compile_blit_program(&gl)?;
@@ -536,10 +621,11 @@ impl App<'_> {
             println!("  not simulated: {note}");
         }
         report_layer_roster(&layers);
-        report_tweakables(&layers);
+        report_tweakables(&layers, self.presentation);
         let panel = panel_labels(&layers);
 
-        let egui = egui_glow::winit::EguiGlow::new(event_loop, Arc::clone(&gl), None, None, true);
+        let egui = (self.presentation == Presentation::Window)
+            .then(|| egui_glow::winit::EguiGlow::new(event_loop, Arc::clone(&gl), None, None, true));
 
         window.request_redraw();
         Ok(State {
@@ -556,6 +642,7 @@ impl App<'_> {
             bloom,
             camera,
             content_size: (width, height),
+            fit,
             background,
             layers,
             egui,
@@ -1125,8 +1212,10 @@ fn redraw(app: &mut App, time: f32) -> Result<bool> {
     let size = state.window.inner_size();
     #[expect(clippy::cast_possible_wrap, reason = "window dimensions are nowhere near i32::MAX")]
     let window = (size.width as i32, size.height as i32);
-    pass::blit_to_screen(&state.gl, &state.blit, &state.display_quad, state.composite.texture, state.content_size, window);
-    state.egui.paint(&state.window);
+    pass::blit_to_screen(&state.gl, &state.blit, &state.display_quad, state.composite.texture, state.content_size, window, state.fit);
+    if let Some(egui) = &mut state.egui {
+        egui.paint(&state.window);
+    }
     state.surface.swap_buffers(&state.context).context("swapping buffers")?;
 
     report_fps(&mut state.frames_since);
@@ -1265,9 +1354,10 @@ fn report_fps(stats: &mut FrameStats) {
 
 /// Run the egui pass and copy the slider values back into `state.tweak_values`.
 fn run_panel(state: &mut State) {
+    let Some(egui) = &mut state.egui else { return };
     let panel = &state.panel;
     let mut values = state.tweak_values.clone();
-    state.egui.run(&state.window, |ctx| {
+    egui.run(&state.window, |ctx| {
         egui::Window::new("Effect Parameters")
             .default_open(false)
             .show(ctx, |ui| {
@@ -1318,10 +1408,13 @@ fn report_layer_roster(layers: &[LiveLayer]) {
     }
 }
 
-fn report_tweakables(layers: &[LiveLayer]) {
+fn report_tweakables(layers: &[LiveLayer], presentation: Presentation) {
     let total: usize = layers.iter().filter_map(|layer| layer.chain.as_ref()).map(|chain| chain.tweakables.len()).sum();
     if total == 0 {
         println!("  no tweakable parameters in this scene");
+    } else if presentation == Presentation::Background {
+        // Nothing to drag them with until §14's control channel exists.
+        println!("  {total} tweakable parameter(s), none adjustable on the background");
     } else {
         println!("  {total} tweakable parameter(s) — drag them in the Effect Parameters panel");
     }
@@ -1351,8 +1444,10 @@ impl ApplicationHandler for App<'_> {
         if self.state.is_none() {
             return;
         }
-        if let Some(state) = &mut self.state {
-            let _ = state.egui.on_window_event(&state.window, &event);
+        if let Some(state) = &mut self.state
+            && let Some(egui) = &mut state.egui
+        {
+            let _ = egui.on_window_event(&state.window, &event);
         }
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
@@ -1393,19 +1488,22 @@ impl ApplicationHandler for App<'_> {
     }
 
     fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
-        if let Some(state) = &mut self.state {
-            state.egui.destroy();
+        if let Some(state) = &mut self.state
+            && let Some(egui) = &mut state.egui
+        {
+            egui.destroy();
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{fit_scale, scaled_resolution};
+    use super::{Presentation, fit_scale, scaled_resolution, screen_fit};
+    use crate::render::pass::Fit;
 
     #[test]
     fn a_4k_canvas_on_a_1080p_display_renders_at_the_display() {
-        let scale = fit_scale((3840, 2160), (1920, 1080));
+        let scale = fit_scale((3840, 2160), (1920, 1080), Fit::Contain);
         assert!((scale - 0.5).abs() < 1e-6, "{scale}");
         let resolution = scaled_resolution((3840, 2160), scale).expect("a reduction");
         assert_eq!((resolution.width, resolution.height), (1920, 1080));
@@ -1415,17 +1513,36 @@ mod tests {
     /// it by width alone would push it off the bottom of the display.
     #[test]
     fn a_canvas_that_is_not_the_display_aspect_fits_by_its_tighter_side() {
-        let scale = fit_scale((5824, 3264), (1920, 1080));
+        let scale = fit_scale((5824, 3264), (1920, 1080), Fit::Contain);
         assert!((scale - 1920.0 / 5824.0).abs() < 1e-6, "{scale}");
         let resolution = scaled_resolution((5824, 3264), scale).expect("a reduction");
         assert_eq!(resolution.width, 1920);
         assert!(resolution.height <= 1080, "{resolution}");
     }
 
+    /// The background's opposite: on the 3420x2214 screen §14.4 was measured
+    /// on, `Contain` renders 3420x1924 and leaves a bar, so the wallpaper takes
+    /// the looser ratio — here above 1.0, which `scaled_resolution` then caps
+    /// back to the full authored canvas rather than upscaling before the blit.
+    #[test]
+    fn a_background_scales_to_cover_the_screen_rather_than_fit_inside_it() {
+        let screen = (3420, 2214);
+        assert!(fit_scale((3840, 2160), screen, Fit::Contain) < 1.0);
+        assert!(fit_scale((3840, 2160), screen, Fit::Cover) > 1.0);
+        assert!(scaled_resolution((3840, 2160), fit_scale((3840, 2160), screen, Fit::Cover)).is_none());
+    }
+
+    #[test]
+    fn only_the_background_covers() {
+        assert!(screen_fit(Presentation::Window) == Fit::Contain);
+        assert!(screen_fit(Presentation::Background) == Fit::Cover);
+    }
+
     #[test]
     fn a_canvas_the_display_can_already_show_is_left_alone() {
-        assert!(scaled_resolution((1920, 1080), fit_scale((1920, 1080), (3840, 2160))).is_none());
-        assert!(scaled_resolution((1920, 1080), fit_scale((1920, 1080), (1920, 1080))).is_none());
+        let contain = |canvas, monitor| fit_scale(canvas, monitor, Fit::Contain);
+        assert!(scaled_resolution((1920, 1080), contain((1920, 1080), (3840, 2160))).is_none());
+        assert!(scaled_resolution((1920, 1080), contain((1920, 1080), (1920, 1080))).is_none());
     }
 
     #[test]

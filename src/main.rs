@@ -6,6 +6,7 @@
 //! rendering and are not built yet. `unpack` and `tex` remain as the debugging
 //! tools the container work was built with.
 
+mod desktop;
 mod export;
 mod paths;
 mod pkg;
@@ -19,6 +20,7 @@ mod tex;
 
 use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand};
+use desktop::Presentation;
 use export::{Options, Resolution};
 use project::{Kind, Project};
 use scene::model;
@@ -47,6 +49,8 @@ enum Command {
     Shaders(ShadersArgs),
     /// Open a live window playing a scene's effect chain in real time.
     Simulate(SimulateArgs),
+    /// Play a scene as the desktop background until interrupted.
+    Desktop(SimulateArgs),
 }
 
 #[derive(Args)]
@@ -577,8 +581,8 @@ fn run_export(args: &ExportArgs) -> Result<()> {
     }
 }
 
-/// Open a live window playing a scene wallpaper's effect chain in real time.
-fn run_simulate(args: &SimulateArgs) -> Result<()> {
+/// Play a scene wallpaper live: in a window, or as the desktop background.
+fn run_simulate(args: &SimulateArgs, presentation: Presentation) -> Result<()> {
     let project = project::load(&args.wallpaper)?;
     if project.kind != Kind::Scene {
         bail!("only Scene wallpapers can be simulated (this one is {})", project.kind);
@@ -597,7 +601,12 @@ fn run_simulate(args: &SimulateArgs) -> Result<()> {
     if let Some(root) = &assets {
         println!("  stock assets from {}", root.display());
     }
-    simulate::run(&mut archive, &scene, assets.as_deref(), title)
+    if presentation == Presentation::Background {
+        // It has no title bar, takes no clicks and never becomes the key
+        // window, so the terminal that launched it is the only way to stop it.
+        println!("  playing as the desktop background — Ctrl-C to stop");
+    }
+    simulate::run(&mut archive, &scene, assets.as_deref(), title, presentation)
 }
 
 fn main() -> Result<()> {
@@ -607,7 +616,8 @@ fn main() -> Result<()> {
         Command::Unpack(args) => run_unpack(&args),
         Command::Tex(args) => run_tex(&args),
         Command::Shaders(args) => run_shaders(&args),
-        Command::Simulate(args) => run_simulate(&args),
+        Command::Simulate(args) => run_simulate(&args, Presentation::Window),
+        Command::Desktop(args) => run_simulate(&args, Presentation::Background),
     }
 }
 

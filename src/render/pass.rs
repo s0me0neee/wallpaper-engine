@@ -435,24 +435,40 @@ pub fn compile_blit_program(gl: &glow::Context) -> Result<BlitProgram> {
     Ok(BlitProgram { program: compile_program(gl, BLIT_VERTEX, BLIT_FRAGMENT)? })
 }
 
+/// What to do when the content and the window it is drawn into disagree about
+/// aspect ratio. Never stretches, either way.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Fit {
+    /// All of the content, with black bars — a window the user resized.
+    Contain,
+    /// All of the window, overflowing off two edges — a desktop background,
+    /// where a black bar is not an option.
+    Cover,
+}
+
 /// The sub-rectangle of a `window`-sized viewport that shows `content` at its
-/// own aspect ratio, centered, letterboxed instead of stretched — `(x, y,
-/// width, height)` in the framebuffer's own bottom-left-origin coordinates.
-fn letterbox(content: (u32, u32), window: (i32, i32)) -> (i32, i32, i32, i32) {
+/// own aspect ratio, centered — `(x, y, width, height)` in the framebuffer's
+/// own bottom-left-origin coordinates. Under `Cover` the rectangle is larger
+/// than the window and its offsets go negative, which the viewport takes: GL
+/// clips whatever falls outside.
+fn fit_rect(content: (u32, u32), window: (i32, i32), fit: Fit) -> (i32, i32, i32, i32) {
     #[expect(clippy::cast_precision_loss, reason = "wallpaper/window dimensions are nowhere near f32's 2^24 exact range")]
     let (content_w, content_h, window_w, window_h) =
         (content.0 as f32, content.1 as f32, window.0 as f32, window.1 as f32);
-    let scale = (window_w / content_w).min(window_h / content_h);
-    #[expect(clippy::cast_possible_truncation, reason = "scaling a window-sized rect down; always fits back in i32")]
+    let (by_width, by_height) = (window_w / content_w, window_h / content_h);
+    let scale = match fit {
+        Fit::Contain => by_width.min(by_height),
+        Fit::Cover => by_width.max(by_height),
+    };
+    #[expect(clippy::cast_possible_truncation, reason = "scaling a window-sized rect; always fits back in i32")]
     let (width, height) = ((content_w * scale) as i32, (content_h * scale) as i32);
-    (((window.0 - width) / 2).max(0), ((window.1 - height) / 2).max(0), width, height)
+    ((window.0 - width) / 2, (window.1 - height) / 2, width, height)
 }
 
-/// Draw `texture` to the window (framebuffer 0), letterboxed within
-/// `window`'s dimensions to preserve `content`'s own aspect ratio — the
-/// bars are cleared to black rather than stretching the image to fill an
-/// arbitrarily-resized window. `quad` should be `build_display_quad`'s, not
-/// `build_quad`'s — see the difference between the two.
+/// Draw `texture` to the window (framebuffer 0), `fit` within `window`'s
+/// dimensions so `content`'s own aspect ratio survives — never stretched to
+/// fill an arbitrarily-shaped window. `quad` should be `build_display_quad`'s,
+/// not `build_quad`'s — see the difference between the two.
 pub fn blit_to_screen(
     gl: &glow::Context,
     blit: &BlitProgram,
@@ -460,8 +476,9 @@ pub fn blit_to_screen(
     texture: glow::Texture,
     content: (u32, u32),
     window: (i32, i32),
+    fit: Fit,
 ) {
-    let (x, y, width, height) = letterbox(content, window);
+    let (x, y, width, height) = fit_rect(content, window, fit);
     unsafe {
         gl.bind_framebuffer(glow::FRAMEBUFFER, None);
         gl.viewport(0, 0, window.0, window.1);
@@ -914,23 +931,37 @@ mod tests {
     use super::*;
 
     #[test]
-    fn letterbox_pillarboxes_when_the_window_is_relatively_taller() {
-        let (x, y, width, height) = letterbox((1600, 900), (900, 900));
+    fn contain_pillarboxes_when_the_window_is_relatively_taller() {
+        let (x, y, width, height) = fit_rect((1600, 900), (900, 900), Fit::Contain);
         assert_eq!((width, height), (900, 506), "scaled to fit the narrower dimension");
         assert_eq!(x, 0, "full width used, no horizontal bars");
         assert_eq!(y, 197, "vertical bars split evenly above and below");
     }
 
     #[test]
-    fn letterbox_letterboxes_when_the_window_is_relatively_wider() {
-        let (x, y, width, height) = letterbox((1600, 900), (1600, 1600));
+    fn contain_letterboxes_when_the_window_is_relatively_wider() {
+        let (x, y, width, height) = fit_rect((1600, 900), (1600, 1600), Fit::Contain);
         assert_eq!((width, height), (1600, 900), "scaled to fit the shorter dimension");
         assert_eq!(x, 0, "full width used, no horizontal bars");
         assert_eq!(y, 350, "vertical bars split evenly above and below");
     }
 
     #[test]
-    fn letterbox_fills_the_window_exactly_when_aspect_ratios_match() {
-        assert_eq!(letterbox((1920, 1080), (1920, 1080)), (0, 0, 1920, 1080));
+    fn either_fit_fills_the_window_exactly_when_aspect_ratios_match() {
+        assert_eq!(fit_rect((1920, 1080), (1920, 1080), Fit::Contain), (0, 0, 1920, 1080));
+        assert_eq!(fit_rect((1920, 1080), (1920, 1080), Fit::Cover), (0, 0, 1920, 1080));
+    }
+
+    /// The desktop-background case: a 16:9 canvas on the 3420x2214 screen
+    /// §14.4 was measured on. Contain would leave a 145-point black bar above
+    /// and below; Cover overflows sideways instead and covers every pixel.
+    #[test]
+    fn cover_overflows_rather_than_leaving_a_bar() {
+        let window = (3420, 2214);
+        let (x, y, width, height) = fit_rect((3840, 2160), window, Fit::Cover);
+        assert_eq!((width, height), (3936, 2214), "scaled to fit the *taller* dimension");
+        assert_eq!(y, 0, "no bar above or below — that is the whole point");
+        assert_eq!(x, -258, "the overflow is split evenly off the left and right edges");
+        assert!(x + width >= window.0, "the right edge of the window is covered");
     }
 }
