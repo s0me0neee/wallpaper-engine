@@ -89,6 +89,7 @@ pub fn parse_scene(bytes: &[u8]) -> Result<Scene, serde_json::Error> {
     let mut document: Value = serde_json::from_slice(bytes)?;
     hoist_alpha_tracks(&mut document);
     hoist_text_scripts(&mut document);
+    gather_control_points(&mut document);
     strip_driven_values(&mut document);
     Scene::deserialize(document)
 }
@@ -183,6 +184,29 @@ fn hoist_alpha_tracks(node: &mut Value) {
             .cloned();
         if let Some(track) = track {
             map.insert(HOISTED_TRACK.to_string(), track);
+        }
+    }
+}
+
+/// Fold `instanceoverride`'s `controlpoint1`..`controlpoint7` into one array.
+///
+/// serde has no way to gather numbered sibling keys into a field, and the
+/// alternative — eight named `Option<Vec3>`s — puts the numbering in the struct
+/// where nothing else can use it. Rewriting the JSON is how the other driven
+/// fields are already handled.
+fn gather_control_points(node: &mut Value) {
+    let Some(objects) = node.get_mut("objects").and_then(Value::as_array_mut) else {
+        return;
+    };
+    for object in objects {
+        let Some(map) = object.get_mut("instanceoverride").and_then(Value::as_object_mut) else {
+            continue;
+        };
+        let points: Vec<Value> = (0..CONTROL_POINTS)
+            .map(|id| map.get(&format!("controlpoint{id}")).cloned().unwrap_or(Value::Null))
+            .collect();
+        if points.iter().any(|point| !point.is_null()) {
+            map.insert("controlpoints".to_string(), Value::Array(points));
         }
     }
 }
@@ -442,7 +466,17 @@ pub struct InstanceOverride {
     /// A normalised RGB that replaces whatever colour the preset would pick.
     #[serde(default)]
     pub colorn: Option<Vec3>,
+    /// Control point offsets this instance overrides, by the point's own id,
+    /// as gathered by `gather_control_points`. Local to the system, like the
+    /// preset's own `controlpoint.offset` they replace — see plan.md §4.27 for
+    /// why, since the two corpus users do not settle it on their own.
+    #[serde(default)]
+    pub controlpoints: [Option<Vec3>; CONTROL_POINTS],
 }
+
+/// How many control points a particle system has. Wallpaper Engine's editor
+/// exposes eight, and every preset in the corpus declares all eight.
+pub const CONTROL_POINTS: usize = 8;
 
 impl Default for InstanceOverride {
     fn default() -> Self {
@@ -454,6 +488,7 @@ impl Default for InstanceOverride {
             alpha: 1.0,
             brightness: 1.0,
             colorn: None,
+            controlpoints: [None; CONTROL_POINTS],
         }
     }
 }

@@ -121,6 +121,9 @@ pub struct Preset {
     renderer: Vec<Renderer>,
     #[serde(default)]
     children: Option<Vec<Child>>,
+    /// The system's own control points, which an instance can override.
+    #[serde(default)]
+    controlpoint: Vec<ControlPoint>,
     #[serde(default)]
     material: String,
     #[serde(default = "one")]
@@ -160,6 +163,22 @@ struct Child {
     name: String,
     #[serde(default)]
     r#type: String,
+}
+
+/// A named point the operators can steer particles toward.
+///
+/// `offset` is local to the system. `flags` bit 0 links the point to the
+/// cursor and bit 1 makes the offset a scene coordinate instead; every point
+/// in the corpus has `flags: 0`, so neither is implemented — a set flag is
+/// reported through `unsupported` rather than guessed at.
+#[derive(Debug, Deserialize)]
+struct ControlPoint {
+    #[serde(default)]
+    id: usize,
+    #[serde(default)]
+    offset: model::Vec3,
+    #[serde(default)]
+    flags: i64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -374,6 +393,13 @@ enum Operator {
         phasemax: f32,
     },
     ControlPointAttract {
+        /// Which control point to pull toward. Every one of the corpus's seven
+        /// control-point operators names a point other than 0, so defaulting
+        /// this to "the system origin" pins the particles where they spawned.
+        #[serde(default)]
+        controlpoint: usize,
+        #[serde(default)]
+        origin: model::Vec3,
         #[serde(default)]
         scale: f32,
         #[serde(default = "one")]
@@ -717,15 +743,55 @@ struct Integrated {
     trail: Vec<Vec2>,
 }
 
+/// Where each of the system's control points sits, in its own local space.
+///
+/// An instance override replaces the point outright and is given in scene
+/// coordinates, so `compose` converts it to local before it gets here; the
+/// preset's own offsets are already local.
+type ControlPoints = [Option<Vec2>; model::CONTROL_POINTS];
+
+const NO_CONTROL_POINTS: ControlPoints = [None; model::CONTROL_POINTS];
+
+fn control_points(preset: &Preset, place: &Placement) -> ControlPoints {
+    let mut points = NO_CONTROL_POINTS;
+    for point in &preset.controlpoint {
+        if point.id < model::CONTROL_POINTS && point.flags == 0 {
+            points[point.id] = Some(Vec2::new(point.offset.x, point.offset.y));
+        }
+    }
+    for (id, over) in place.overrides.controlpoints.iter().enumerate() {
+        if let Some(offset) = over {
+            points[id] = Some(Vec2::new(offset.x, offset.y));
+        }
+    }
+    points
+}
+
 /// Integrate a particle to `age` seconds, then apply the display-only
 /// operators (fades, oscillators, size ramp) as closed-form functions of age.
-fn simulate(preset: &Preset, r: &Rolled, flow: &Perlin, speed: f32, age: f32, max_steps: u32) -> Live {
-    let path = integrate(preset, r, flow, speed, age, max_steps);
+fn simulate(
+    preset: &Preset,
+    r: &Rolled,
+    flow: &Perlin,
+    points: &ControlPoints,
+    speed: f32,
+    age: f32,
+    max_steps: u32,
+) -> Live {
+    let path = integrate(preset, r, flow, points, speed, age, max_steps);
     display(preset, r, age, path)
 }
 
 /// The stepped half: forces on velocity, velocity on position, torque on roll.
-fn integrate(preset: &Preset, r: &Rolled, flow: &Perlin, speed: f32, age: f32, max_steps: u32) -> Integrated {
+fn integrate(
+    preset: &Preset,
+    r: &Rolled,
+    flow: &Perlin,
+    points: &ControlPoints,
+    speed: f32,
+    age: f32,
+    max_steps: u32,
+) -> Integrated {
     let steps = ((age * SIM_HZ).ceil() as u32).clamp(1, max_steps.max(1));
     let dt = age / steps as f32;
 
@@ -758,13 +824,17 @@ fn integrate(preset: &Preset, r: &Rolled, flow: &Perlin, speed: f32, age: f32, m
                     let force = flow_at(flow, pos * *scale + Vec2::splat(r.turb_phase));
                     vel += force * xy(*mask) * (r.turb_speed * speed) * dt;
                 }
-                Operator::ControlPointAttract { scale, threshold } => {
-                    // The only control point any preset attracts to sits at the
-                    // system origin; `scale` is negative to push particles out.
-                    let to_cp = -pos;
-                    let dist = to_cp.length();
-                    if dist < *threshold && dist > 1.0 {
-                        vel += to_cp / dist * (*scale * speed) * dt / dist.max(4.0);
+                Operator::ControlPointAttract { controlpoint, origin, scale, threshold } => {
+                    // A constant pull toward the point, not an inverse-square
+                    // one, and `threshold` is a *diameter*: both match
+                    // linux-wallpaperengine's reading (plan.md §4.27).
+                    // `scale` is negative to push particles out instead.
+                    if let Some(center) = points.get(*controlpoint).copied().flatten() {
+                        let to_cp = center + xy(*origin) - pos;
+                        let dist = to_cp.length();
+                        if dist > 0.001 && dist < threshold * 0.5 {
+                            vel += to_cp / dist * (*scale * speed) * dt;
+                        }
                     }
                 }
                 Operator::Vortex { distanceinner, distanceouter, speedinner, speedouter } => {
@@ -881,11 +951,42 @@ fn emission(preset: &Preset, emitter: &Emitter, over: &InstanceOverride, startti
         Emitter::Unknown => 0.0,
     };
     let count = over.count.max(0.0);
+    let maxcount = ((preset.maxcount * count).round() as u32).max(1);
+    let asked = (base_rate * over.rate.max(0.0) * count).max(1e-4);
     Emission {
-        rate: (base_rate * over.rate.max(0.0) * count).max(1e-4),
-        maxcount: ((preset.maxcount * count).round() as u32).max(1),
+        // A full system stops emitting, so a slot cannot be reused before its
+        // occupant dies: the steady-state rate is capped at `maxcount /
+        // lifetime` however fast the emitter asks to run. `birds` asks for 80 a
+        // second into 30 slots that hold their particles for 25 s, and without
+        // the cap every bird is recycled at 0.375 s old — still inside the
+        // 64-unit emission sphere, which sits off the canvas (plan.md §4.27).
+        rate: asked.min(maxcount_f32(maxcount) / nominal_lifetime(preset)),
+        maxcount,
         starttime,
     }
+}
+
+#[expect(clippy::cast_precision_loss, reason = "a particle count, orders below 2^24")]
+fn maxcount_f32(maxcount: u32) -> f32 {
+    maxcount as f32
+}
+
+/// The lifetime a slot has to allow for, as the midpoint of what the preset's
+/// `lifetimerandom` can roll. Emission is a property of the system, and runs
+/// before any particular particle is rolled.
+fn nominal_lifetime(preset: &Preset) -> f32 {
+    preset
+        .initializer
+        .iter()
+        .find_map(|init| match init {
+            Initializer::LifeTimeRandom { min, max, .. } => {
+                let (low, high) = bounds(*min, *max, 1.0);
+                Some(f32::midpoint(low, high))
+            }
+            _ => None,
+        })
+        .unwrap_or(3.0)
+        .max(0.01)
 }
 
 /// The particle occupying `slot` at `time`, as `(global index, birth time)` —
@@ -1316,14 +1417,16 @@ fn collect_preset(
     // particles age — so integrate every alive slot in parallel, then emit the
     // shapes and hang `eventfollow` children serially, which is what fixes
     // their draw order.
+    let points = control_points(preset, place);
     let alive: Vec<(u64, f32, Live)> = (0..em.maxcount)
         .into_par_iter()
         .filter_map(|slot| {
             let (n, birth) = slot_particle(&em, slot, time)?;
             let age = time - birth;
             let rolled = roll(preset, emitter, &flow, seed(salt, n));
-            (age < rolled.lifetime)
-                .then(|| (n, birth, simulate(preset, &rolled, &flow, speed, age, place.max_sim_steps)))
+            (age < rolled.lifetime).then(|| {
+                (n, birth, simulate(preset, &rolled, &flow, &points, speed, age, place.max_sim_steps))
+            })
         })
         .collect();
 
@@ -1692,6 +1795,73 @@ mod tests {
         assert!(n >= 40);
     }
 
+    /// A full system stops emitting, so the steady-state rate is whatever
+    /// `maxcount / lifetime` allows however fast the emitter asks to run.
+    /// Without the cap a slot recycles every `maxcount / rate` seconds, which
+    /// for `birds` is 0.375 s — no bird ever leaves its emission sphere.
+    #[test]
+    fn a_full_system_emits_no_faster_than_its_slots_free_up() {
+        let birds = preset(
+            r#"{"emitter":[{"name":"sphererandom","rate":100,"distancemax":64}],
+                "initializer":[{"name":"lifetimerandom","min":25,"max":25}],
+                "maxcount":30}"#,
+        );
+        let over = InstanceOverride { rate: 0.8, ..InstanceOverride::default() };
+        let em = emission(&birds, &birds.emitter[0], &over, 0.0);
+        // Asked for 80 a second; 30 slots holding 25 s each allow 1.2.
+        assert!((em.rate - 1.2).abs() < 1e-4, "rate {}", em.rate);
+        assert_eq!(em.maxcount, 30);
+        // So the flock spans nearly a whole lifetime in age, rather than the
+        // 0.375 s that 30 slots at 80 a second would give.
+        let oldest = (0..em.maxcount)
+            .filter_map(|slot| slot_particle(&em, slot, 30.0))
+            .map(|(_, birth)| 30.0 - birth)
+            .fold(0.0_f32, f32::max);
+        assert!(oldest > 20.0, "oldest particle is only {oldest}s old");
+    }
+
+    /// An emitter that is slower than its slots free up is left alone.
+    #[test]
+    fn a_system_that_is_never_full_keeps_its_asked_rate() {
+        let p = preset(
+            r#"{"emitter":[{"name":"boxrandom","rate":2}],
+                "initializer":[{"name":"lifetimerandom","min":1,"max":3}],
+                "maxcount":100}"#,
+        );
+        let em = emission(&p, &p.emitter[0], &InstanceOverride::default(), 0.0);
+        assert!((em.rate - 2.0).abs() < 1e-4, "rate {}", em.rate);
+    }
+
+    #[test]
+    fn an_instance_override_replaces_the_preset_s_own_control_point() {
+        let p = preset(
+            r#"{"emitter":[{"name":"boxrandom","rate":1}],
+                "controlpoint":[{"id":0,"offset":"0 0 0","flags":0},
+                                {"id":1,"offset":"1500 0 0","flags":0}],
+                "maxcount":4}"#,
+        );
+        let mut place = test_placement();
+        place.overrides.controlpoints[1] = Some(model::Vec3 { x: 4118.0, y: 170.0, z: 0.0 });
+        let points = control_points(&p, &place);
+        assert_eq!(points[0], Some(Vec2::new(0.0, 0.0)));
+        assert_eq!(points[1], Some(Vec2::new(4118.0, 170.0)), "the override wins");
+        assert_eq!(points[2], None, "a point the preset never declared stays absent");
+    }
+
+    fn test_placement() -> Placement {
+        Placement {
+            origin_px: Vec2::ZERO,
+            scale: Vec2::ONE,
+            px_per_unit: 1.0,
+            canvas_px: (16, 16),
+            tint: Vec3::ONE,
+            alpha: 1.0,
+            overrides: InstanceOverride::default(),
+            max_sim_steps: MAX_STEPS,
+            roll: (1.0, 0.0),
+        }
+    }
+
     #[test]
     fn a_particle_past_its_lifetime_leaves_its_slot_empty() {
         let json = r#"{"emitter":[{"name":"boxrandom","rate":1}],
@@ -1720,8 +1890,9 @@ mod tests {
                 "maxcount":16}"#,
         );
         let flow = Perlin::new(7);
-        let a = simulate(&p, &roll(&p, &p.emitter[0], &flow, seed(3, 4)), &flow, 1.0, 2.5, MAX_STEPS);
-        let b = simulate(&p, &roll(&p, &p.emitter[0], &flow, seed(3, 4)), &flow, 1.0, 2.5, MAX_STEPS);
+        let cps = &NO_CONTROL_POINTS;
+        let a = simulate(&p, &roll(&p, &p.emitter[0], &flow, seed(3, 4)), &flow, cps, 1.0, 2.5, MAX_STEPS);
+        let b = simulate(&p, &roll(&p, &p.emitter[0], &flow, seed(3, 4)), &flow, cps, 1.0, 2.5, MAX_STEPS);
         assert_eq!(a.pos, b.pos);
         assert_eq!(a.alpha, b.alpha);
     }
@@ -1736,9 +1907,10 @@ mod tests {
         );
         let flow = Perlin::new(0);
         let r = roll(&p, &p.emitter[0], &flow, seed(0, 0));
-        let early = simulate(&p, &r, &flow, 1.0, 0.5, MAX_STEPS).alpha; // half way through fade-in
-        let mid = simulate(&p, &r, &flow, 1.0, 5.0, MAX_STEPS).alpha; // fully faded in, not yet out
-        let late = simulate(&p, &r, &flow, 1.0, 9.0, MAX_STEPS).alpha; // half way through fade-out
+        let cps = &NO_CONTROL_POINTS;
+        let early = simulate(&p, &r, &flow, cps, 1.0, 0.5, MAX_STEPS).alpha; // half way through fade-in
+        let mid = simulate(&p, &r, &flow, cps, 1.0, 5.0, MAX_STEPS).alpha; // fully faded in, not yet out
+        let late = simulate(&p, &r, &flow, cps, 1.0, 9.0, MAX_STEPS).alpha; // half way through fade-out
         assert!(early < mid, "{early} !< {mid}");
         assert!(late < mid, "{late} !< {mid}");
         assert!((mid - r.alpha).abs() < 1e-6);
