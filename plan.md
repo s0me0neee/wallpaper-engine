@@ -1528,6 +1528,76 @@ own registration residual than anything ex3 shares.
 
 ---
 
+### 4.26 Sprite sheets, and the reason the corpus cannot show them
+
+§4.19 listed particle spritesheets as a gap and §4.24 recovered the whole spec
+from `linux-wallpaperengine`. Building it turned out to be easy and *verifying*
+it turned out to be the interesting part.
+
+**The data was already in the file.** A `.tex` whose flags carry `IsGif` has a
+`TEXS` chunk after its mipmaps — the bytes the `tex` subcommand used to shrug
+off as `trailing bytes (sprite/gif data?)`. It is a frame table: a count, then
+per frame a duration and a rect. `birds_128x120x16` has sixteen 128x120 rects
+in a 1024x241 texture at 0.0625 s each, so eight columns, two rows, a one-second
+cycle, and a slack row that is padding rather than a third row. Two details are
+worth keeping:
+
+- **The grid is also the test.** Deriving `cols = round(width / cell_width)`
+  from the first frame gives 1x1 for a real gif, which cannot hold its own
+  frames — so `cols * rows >= frames` is what separates a sheet from a gif, and
+  without it every animated texture would be sliced down to its first frame.
+- **Cut by each frame's rect, not by the grid**, or the 241st row leaks into
+  the bottom row of cells.
+
+Each cell becomes its own `SpriteTable` slot. That is the whole reason no
+renderer changed: a `DrawItem` already names a slot, so choosing a cell is
+choosing a slot, and both the GPU path and tiny-skia got the feature for free.
+Cell choice follows the frame times scaled by `sequencemultiplier`, except under
+`animationmode: "randomframe"` — eight of the corpus's nine animated presets —
+where each particle freezes on a cell drawn from its own emission index, stable
+across frames with nothing stored.
+
+**And then it changes nothing you can see, for two separate reasons.** The
+corpus has exactly two sheets. One is the pair in the `2446129945` pack (ex6,
+ex8), whose slot-0 texture is named `particles 256x1280 blank` and is: rendering
+ex8 at `t=20`, when its `Rain2` system is fully populated, moves the frame by
+**98.6 dB** — nothing. The other is the birds, and the birds are not drawn at
+all. The seven-scene table is unmoved (ex3 16.70 → 16.69, the rest identical),
+so this is checked in on a fixture test that builds a `.tex` byte by byte rather
+than on a picture.
+
+**Which turned up the real defect: `controlpointattract` ignores which control
+point it names.** The operator reads
+
+```rust
+// The only control point any preset attracts to sits at the system origin;
+// `scale` is negative to push particles out.
+let to_cp = -pos;
+```
+
+and that comment is wrong for **all seven** control-point operators in the
+corpus — every one names a point other than 0, across `birds`, `dust_motes_0`
+and `fireflies`. `birds.json` attracts to points 1 and 2, whose offsets both
+scenes override per instance:
+
+| scene | system origin | `controlpoint1` | `controlpoint2` |
+|---|---:|---:|---:|
+| ex3 | 4063, 629 — off the right edge | 4119, 170 | 4091, 698 |
+| ex4 | −154, 421 — off the left edge | 4185, 537 | 4190, −33 |
+
+The origin is off-canvas *on purpose*: the flock is supposed to be dragged
+across the frame. Attracting to the origin instead pins all thirty birds where
+they spawned, off-screen, for their whole 25-second life — which is why
+`SIMULATE_LAYERS=3` on ex3 and `SIMULATE_LAYERS=8` on ex4 both dump a frame with
+exactly one distinct pixel value. Two other empty particle layers checked at the
+same time are *correct*: ex3's `Snow storm` has `starttime: 15` and ex4's
+`Plane` is one particle that has not flown in yet at `t=10.026`.
+
+So the order is: control points first, birds second, sheet animation third —
+the sheet is already in place and waiting under the other two.
+
+---
+
 ## 5. The `common.h` problem
 
 ### 5.1 What is missing
