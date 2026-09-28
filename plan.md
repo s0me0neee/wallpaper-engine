@@ -1767,8 +1767,27 @@ really showing is the next item: a 0.5 px Gaussian over *our* finished frame
 gains +0.51 on ex2, +0.44 on ex4, +0.46 on ex5 and +0.08 on ex8. **The captures
 are uniformly softer than our frames**, and any change that softens one layer
 by a sub-pixel amount scores for that reason alone. Where the softness comes
-from is open. The first suspect is that we downscale layer textures with
-Lanczos3 where WE samples a mipmapped texture on the GPU.
+from was open, and the first suspect was right about part of it: we resized
+layer textures with Lanczos3, where WE samples a mipmapped texture linearly on
+the GPU. A triangle filter, which widens with the downscale much as trilinear
+sampling does, improves every scene at 1080p and costs none:
+
+| scene | 1080p Lanczos3 | 1080p Triangle | canvas Triangle |
+|---|---:|---:|---:|
+| ex1 | 25.59 | 25.81 | 25.22 |
+| ex2 | 30.31 | 30.52 | 30.70 |
+| ex3 | 16.95 | 17.10 | 16.76 |
+| ex4 | 29.57 | 29.98 | 28.78 |
+| ex5 | 28.77 | 28.98 | 29.39 |
+| ex6 | 15.61 | 15.62 | 15.62 |
+| ex8 | 21.66 | 21.67 | 21.60 |
+
+A Gaussian lands within 0.07 dB of Triangle everywhere, so the result is limited
+by softness in general rather than by one exact kernel, and Triangle is the one
+with a reason behind it. It recovers about half of the +0.45 dB that blurring
+the whole frame buys, so there is softness left elsewhere. Puppets are the next
+place to look: `puppet::rasterize` samples the full-resolution texture
+bilinearly with no mips, which aliases at any downscale.
 
 ---
 

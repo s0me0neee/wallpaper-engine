@@ -697,7 +697,8 @@ fn scaled_tinted(object: &Object, texture: RgbaImage, pixel_width: u32, pixel_he
     let mut image = if texture.width() == pixel_width && texture.height() == pixel_height {
         texture
     } else {
-        imageops::resize(&texture, pixel_width, pixel_height, imageops::FilterType::Lanczos3)
+        // Triangle, not Lanczos: WE samples a mipmapped texture linearly, and its frames are that soft.
+        imageops::resize(&texture, pixel_width, pixel_height, imageops::FilterType::Triangle)
     };
     apply_tint(&mut image, object.color, object.brightness, object.alpha);
     image
