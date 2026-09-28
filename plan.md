@@ -1718,6 +1718,60 @@ the aspect convention plus the squash, not anything shared with ex3.
 
 ---
 
+### 4.29 Effect buffers are sized by the layer, not the screen
+
+§4.22's convention measures at `SIMULATE_SCALE=1`, the authored canvas, so that
+a number does not depend on the machine. But the captures were rendered by
+Wallpaper Engine at **1080p**, and since §4.18 our live renderer draws at the
+display's size too, so the canvas convention never exercised the path a user
+actually runs. Re-scoring every scene at the capture's own resolution
+(`scale = 1080 / canvas height`) moves six of seven by at most ±0.6 dB, which is
+resampling. **ex8 drops 1.8 dB** (21.69 → 19.90), with luminance moving the
+same way on MAIN alone: 75.8 at scale 1, 71.0 at 0.5, 66.2 at 0.25.
+
+The cause is a workshop `lens_flare_sun` on MAIN, whose fragment shader builds
+its own coordinate frame in pixels:
+
+```glsl
+vec2 uv = v_TexCoord.xy / g_Texture0Resolution.y / u_Scale * 100 - 0.5;
+```
+
+and we filled `g_Texture0Resolution` with the size of the target the chain
+actually renders into, which follows the display. So the flare was twice the
+size at 1080p that it was at 4K. `linux-wallpaperengine` (§4.24) settles what the
+value should be: `CImage` allocates a layer's ping-pong effect buffers at the
+layer's authored **`size`**, independent of the screen and of the object's
+`scale`, and the pass reports that. A chain now keeps rendering at our size but
+*reports* WE's. Each prepared layer carries `texel_scale = 1 / (object scale ×
+render scale)`, WE texels per pixel of ours, and every layer-derived texture in
+the chain (slot 0, the pass's binds, `_rt_imageLayerComposite`) reports its
+size multiplied by it. Mask and noise files report their own size, as before.
+
+| scene | canvas before | canvas after | 1080p before | 1080p after |
+|---|---:|---:|---:|---:|
+| ex8 Matte Clouds | 21.69 | 21.59 | 19.90 | **21.66** |
+| ex4 Into the night | 28.78 | 28.78 | 30.03 | 29.57 |
+| others | — | ±0.01 | — | ±0.02 |
+
+ex8 is now the same at both resolutions, which was the point. Its 0.1 dB at
+canvas resolution is layer 30, scaled 3.06x, whose `blurprecise` now spreads by
+WE's texels of its 1920x1080 buffer instead of ours of the 5877-wide rect.
+
+**ex4's −0.46 dB at 1080p is not a counter-example**, though it looked like one.
+All of it is layer 9, `Blur`, a composition layer running `blurprecise` at
+`scale 0.4`: dropping it makes old and new agree to 0.03 dB. Reporting screen
+texels for composition layers instead (their input is `_rt_FullFrameBuffer`,
+which is screen-sized) recovers ex4 but costs ex8 0.6 dB through its POST
+layer's edge-glow, so that rule is contradicted by the corpus. What ex4 is
+really showing is the next item: a 0.5 px Gaussian over *our* finished frame
+gains +0.51 on ex2, +0.44 on ex4, +0.46 on ex5 and +0.08 on ex8. **The captures
+are uniformly softer than our frames**, and any change that softens one layer
+by a sub-pixel amount scores for that reason alone. Where the softness comes
+from is open. The first suspect is that we downscale layer textures with
+Lanczos3 where WE samples a mipmapped texture on the GPU.
+
+---
+
 ## 5. The `common.h` problem
 
 ### 5.1 What is missing

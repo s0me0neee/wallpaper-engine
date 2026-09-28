@@ -188,7 +188,9 @@ evidence.
   the padding into the layer rect squashed ex4 and ex5 by up to 1.5 % (plan.md §4.28). Embedded
   png/jpg payloads carry their own size and were never affected.
 - **`g_TextureNResolution` is `(w, h, w, h)`.** The two halves differ only for atlas-packed
-  textures, which nothing here produces.
+  textures, which nothing here produces. For a texture derived from the layer it is WE's size, not
+  ours: WE sizes effect buffers from the layer's authored `size`, and some shaders build coordinates
+  from it, so a chain rendered at display size reports `size × texel_scale` (plan.md §4.29).
 
 ### Verification
 

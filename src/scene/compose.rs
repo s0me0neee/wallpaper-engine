@@ -50,6 +50,8 @@ pub struct PreparedLayer<'a> {
     /// its real input is whatever the frame already holds under `rect`, which
     /// only a compositor that keeps the frame on the GPU can supply.
     pub composition: bool,
+    /// See `StaticImage::texel_scale`.
+    pub texel_scale: (f32, f32),
 }
 
 /// A scene resolved as far as a plain flatten can take it: the output canvas
@@ -108,6 +110,10 @@ pub struct StaticImage<'a> {
     pub warp_error: Option<String>,
     /// See `PreparedLayer::composition`.
     pub composition: bool,
+    /// Wallpaper Engine's effect texels per pixel of `image`. WE sizes a layer's
+    /// effect buffers from its authored `size`, not the screen, and some shaders
+    /// build coordinates from `g_TextureNResolution`, so a chain reports that size.
+    pub texel_scale: (f32, f32),
     /// Roll about the layer's own centre, in radians — `Anchor::roll`.
     pub roll: f32,
 }
@@ -125,6 +131,8 @@ pub struct StaticPuppet<'a> {
     pub rect_px: (f32, f32),
     pub rect_left: f32,
     pub rect_top: f32,
+    /// See `StaticImage::texel_scale`.
+    pub texel_scale: (f32, f32),
     pub blend: Blend,
     /// Roll about the layer's own centre, in radians — `Anchor::roll`.
     pub roll: f32,
@@ -217,6 +225,16 @@ fn to_pixels(canvas: &Canvas, world_x: f32, world_y: f32) -> (f32, f32) {
     #[expect(clippy::cast_precision_loss, reason = "image dimensions, nowhere near 2^24")]
     let height = canvas.ortho.height as f32;
     (world_x * canvas.scale - canvas.offset.0, (height - world_y) * canvas.scale - canvas.offset.1)
+}
+
+/// `StaticImage::texel_scale` for a layer drawn at `scale` times its authored
+/// size: one authored texel covers `scale * canvas.scale` output pixels.
+fn texel_scale(canvas: &Canvas, scale: (f32, f32)) -> (f32, f32) {
+    let per_axis = |scale: f32| {
+        let inverse = 1.0 / (scale * canvas.scale).abs();
+        if inverse.is_finite() && inverse > 0.0 { inverse } else { 1.0 }
+    };
+    (per_axis(scale.0), per_axis(scale.1))
 }
 
 /// An object's base texture plus the two things the material tells us about
@@ -467,6 +485,7 @@ fn static_composition<'a>(
         blend: Blend::Over,
         warp_error: None,
         composition: true,
+        texel_scale: texel_scale(canvas, if fullscreen { (1.0, 1.0) } else { (anchor.scale.x, anchor.scale.y) }),
         roll: anchor.roll,
     })
 }
@@ -504,6 +523,7 @@ fn static_text<'a>(
         blend: Blend::Over,
         warp_error: None,
         composition: false,
+        texel_scale: texel_scale(canvas, (anchor.scale.x, anchor.scale.y)),
         roll: anchor.roll,
     })
 }
@@ -555,6 +575,7 @@ fn static_solid<'a>(
         blend: Blend::Over,
         warp_error: None,
         composition: false,
+        texel_scale: texel_scale(canvas, (anchor.scale.x, anchor.scale.y)),
         roll: anchor.roll,
     })
 }
@@ -729,6 +750,7 @@ fn static_image_or_puppet<'a>(
                     rect_px: (extent_x * canvas.scale, extent_y * canvas.scale),
                     rect_left,
                     rect_top,
+                    texel_scale: texel_scale(canvas, (anchor.scale.x, anchor.scale.y)),
                     blend,
                     roll: anchor.roll,
                 })));
@@ -747,6 +769,7 @@ fn static_image_or_puppet<'a>(
         blend,
         warp_error,
         composition: false,
+        texel_scale: texel_scale(canvas, (anchor.scale.x, anchor.scale.y)),
         roll: anchor.roll,
     })))
 }
@@ -930,6 +953,7 @@ pub fn animate<'a>(archive: &mut Archive, static_scene: &StaticScene<'a>, time: 
                 warped: false,
                 warp_error: image.warp_error.clone(),
                 composition: image.composition,
+                texel_scale: image.texel_scale,
             },
             StaticItem::Puppet(puppet) => {
                 let (image, left, top) = warp_frame(puppet, time);
@@ -942,6 +966,7 @@ pub fn animate<'a>(archive: &mut Archive, static_scene: &StaticScene<'a>, time: 
                     warped: true,
                     warp_error: None,
                     composition: false,
+                    texel_scale: puppet.texel_scale,
                 }
             }
             StaticItem::Particle(particle) => {
@@ -958,6 +983,7 @@ pub fn animate<'a>(archive: &mut Archive, static_scene: &StaticScene<'a>, time: 
                             warped: false,
                             warp_error: None,
                             composition: false,
+                            texel_scale: (1.0, 1.0),
                         }
                     }
                     Err(error) => {

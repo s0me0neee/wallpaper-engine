@@ -759,7 +759,7 @@ impl App<'_> {
             // `image` is the layer's t=0 pixels, which a chain compiles against
             // and a texture ring is sized from. A GPU particle layer has
             // neither, so it carries only the size its backdrop would need.
-            let (image, size, rect, blend, kind, object) = match item {
+            let (image, size, rect, blend, kind, object, texel_scale) = match item {
                 StaticItem::Image(layer) => {
                     if let Some(error) = &layer.warp_error {
                         swap_note(
@@ -781,7 +781,7 @@ impl App<'_> {
                         rect_of(layer.left, layer.top, &layer.image),
                         layer.blend,
                         kind,
-                        layer.object,
+                        layer.object, layer.texel_scale,
                     )
                 }
                 StaticItem::Puppet(puppet) => {
@@ -791,7 +791,7 @@ impl App<'_> {
                     let (image, left, top) = compose::warp_frame(puppet, 0.0);
                     let rect = rect_of(left, top, &image);
                     let size = image.dimensions();
-                    (Some(image), size, rect, puppet.blend, LiveKind::Puppet(index), puppet.object)
+                    (Some(image), size, rect, puppet.blend, LiveKind::Puppet(index), puppet.object, puppet.texel_scale)
                 }
                 // Effects are what decides the path: a chain wants a
                 // straight-alpha texture of a fixed size, which is not what the
@@ -803,12 +803,12 @@ impl App<'_> {
                     let layered =
                         layer_blend_mode(system.object, item) != 0 || system.object.alphatrack.is_some();
                     let kind = gpu_particle(gl, archive, assets, system, gpu_scale, layered)?;
-                    (None, (static_scene.width, static_scene.height), full_rect, system.blend, kind, system.object)
+                    (None, (static_scene.width, static_scene.height), full_rect, system.blend, kind, system.object, (1.0, 1.0))
                 }
                 StaticItem::Particle(system) => {
                     let (image, kind) = live_particle(archive, assets, system, sim_scale)?;
                     let size = image.dimensions();
-                    (Some(image), size, full_rect, system.blend, kind, system.object)
+                    (Some(image), size, full_rect, system.blend, kind, system.object, (1.0, 1.0))
                 }
             };
 
@@ -818,7 +818,7 @@ impl App<'_> {
                     archive,
                     headers,
                     object,
-                    image,
+                    render::ChainBase { image, texel_scale },
                     target_format(static_scene.hdr),
                     &mut omissions,
                 )
@@ -864,7 +864,7 @@ fn compile_chain(
     archive: &mut Archive,
     headers: &HashMap<String, String>,
     object: &model::Object,
-    image: &RgbaImage,
+    base: render::ChainBase,
     format: pass::Format,
     omissions: &mut Vec<String>,
 ) -> Option<EffectChain> {
@@ -872,7 +872,7 @@ fn compile_chain(
     if effects.is_empty() {
         return None;
     }
-    match render::prepare_effect_chain(gl, archive, &effects, image, headers, format) {
+    match render::prepare_effect_chain(gl, archive, &effects, base, headers, format) {
         Ok(chain) => {
             let name = model::label(object);
             omissions.extend(chain.skipped.iter().map(|note| format!("{name}: {note}")));

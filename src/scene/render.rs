@@ -179,7 +179,8 @@ fn run_layer_chain(
     time: f32,
 ) -> Result<(RgbaImage, Vec<String>)> {
     let effects: Vec<&Effect> = model::visible_effects(layer.object).collect();
-    let chain = prepare_effect_chain(&gpu.gl, archive, &effects, &layer.image, headers, pass::Format::Ldr)
+    let base = ChainBase { image: &layer.image, texel_scale: layer.texel_scale };
+    let chain = prepare_effect_chain(&gpu.gl, archive, &effects, base, headers, pass::Format::Ldr)
         .context("preparing the effect chain")?;
     let target = chain.render(&gpu.gl, time, &[]).context("running the effect chain")?;
     let image = capture::read_rgba(&gpu.gl, target.framebuffer, target.width, target.height)?;
@@ -341,20 +342,27 @@ impl EffectChain {
     }
 }
 
+/// The image a chain starts from, and `StaticImage::texel_scale` for it.
+#[derive(Clone, Copy)]
+pub struct ChainBase<'a> {
+    pub image: &'a RgbaImage,
+    pub texel_scale: (f32, f32),
+}
+
 /// Compile every visible effect's every pass over `base`, in order, without
 /// drawing a frame yet.
 pub fn prepare_effect_chain(
     gl: &glow::Context,
     archive: &mut Archive,
     effects: &[&Effect],
-    base: &RgbaImage,
+    base: ChainBase,
     headers: &HashMap<String, String>,
     format: pass::Format,
 ) -> Result<EffectChain> {
-    let (width, height) = (base.width(), base.height());
+    let (width, height) = base.image.dimensions();
     let quad = pass::build_quad(gl)?;
 
-    let base_texture = pass::upload_texture(gl, base)?;
+    let base_texture = pass::upload_texture(gl, base.image)?;
     let mut current = base_texture;
     let mut current_size = (width, height);
     let mut passes = Vec::new();
@@ -438,7 +446,7 @@ pub fn prepare_effect_chain(
                     &effect_pass.textures,
                     &bound_slots(&definition_pass.bind, effect_input, &named),
                     (current, current_size),
-                    (width, height),
+                    base,
                 )?;
 
                 let mut floats = uniform_floats(&vertex_declarations, &effect_pass.constantshadervalues);
@@ -532,7 +540,8 @@ fn bound_slots(
 /// Returns the bound textures alongside the `g_TextureNResolution` uniform
 /// each one implies — `(width, height, width, height)`, since nothing here
 /// packs textures into an atlas, the one case Wallpaper Engine uses the two
-/// halves of that vector to tell apart.
+/// halves of that vector to tell apart. A texture derived from the layer
+/// reports its size in WE's texels (`texel_scale`); a file reports its own.
 /// Bound textures, and the `g_TextureNResolution` floats they imply.
 type BoundTextures = (Vec<(String, PassTexture)>, Vec<(String, Vec<f32>)>);
 
@@ -543,8 +552,9 @@ fn resolve_textures(
     textures: &[Option<String>],
     bound_slots: &HashMap<usize, (glow::Texture, (u32, u32))>,
     current: (glow::Texture, (u32, u32)),
-    layer_size: (u32, u32),
+    base: ChainBase,
 ) -> Result<BoundTextures> {
+    let texel_scale = base.texel_scale;
     let mut bound = Vec::new();
     let mut resolutions = Vec::new();
 
@@ -554,21 +564,21 @@ fn resolve_textures(
         };
 
         let name = textures.get(slot).and_then(Option::as_deref);
-        let (texture, size) = if let Some(&(texture, size)) = bound_slots.get(&slot) {
-            (PassTexture::Fixed(texture), size)
+        let (texture, size, scale) = if let Some(&(texture, size)) = bound_slots.get(&slot) {
+            (PassTexture::Fixed(texture), size, texel_scale)
         } else if slot == 0 {
-            (PassTexture::Fixed(current.0), current.1)
+            (PassTexture::Fixed(current.0), current.1, texel_scale)
         } else if name.is_some_and(is_layer_composite_target) {
-            (PassTexture::LayerBase, layer_size)
+            (PassTexture::LayerBase, base.image.dimensions(), texel_scale)
         } else {
             let (texture, size) =
                 resolve_slot_texture(gl, archive, name.filter(|name| !is_render_target(name)), uniform.default.as_ref())?;
-            (PassTexture::Fixed(texture), size)
+            (PassTexture::Fixed(texture), size, (1.0, 1.0))
         };
 
         bound.push((uniform.name.clone(), texture));
         #[expect(clippy::cast_precision_loss, reason = "texture dimensions, nowhere near f32's 2^24 exact range")]
-        let (w, h) = (size.0 as f32, size.1 as f32);
+        let (w, h) = ((size.0 as f32 * scale.0).round(), (size.1 as f32 * scale.1).round());
         resolutions.push((format!("{}Resolution", uniform.name), vec![w, h, w, h]));
     }
 
