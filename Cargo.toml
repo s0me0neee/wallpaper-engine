@@ -99,6 +99,23 @@ objc2-core-graphics = { version = "0.3", default-features = false, features = [
 ] }
 objc2-foundation = "0.3"
 
+# The Linux windowing systems `glutin-winit`/`winit` leave out above, where
+# only CGL was needed. Both Wayland and X11, since the desktop and the headless
+# EGL path have to work under either.
+[target.'cfg(all(unix, not(target_os = "macos")))'.dependencies]
+winit = { version = "0.30", default-features = false, features = [
+	"rwh_06",
+	"x11",
+	"wayland",
+	"wayland-dlopen",
+] }
+glutin-winit = { version = "0.5", default-features = false, features = [
+	"egl",
+	"glx",
+	"x11",
+	"wayland",
+] }
+
 [lints.clippy]
 pedantic = { level = "deny", priority = -1 }
 unwrap_used = "deny"

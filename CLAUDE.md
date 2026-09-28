@@ -20,7 +20,7 @@ than loosening the crate lint level. Follow that.
 default settings — `cargo fmt` would reflow ~3200 lines. Match the surrounding style (wide lines,
 up to ~120 chars) by hand.
 
-Build needs the ffmpeg development libraries (`brew install ffmpeg`); `ffmpeg-next`'s major version
+Build needs the ffmpeg development libraries (`brew install ffmpeg`, or the distro's `ffmpeg` package on Linux); `ffmpeg-next`'s major version
 tracks ffmpeg's own, so 9.x means ffmpeg 9.
 
 Rendering is plain GL 3.3 core throughout — no Metal, no compute, nothing above 3.3 (see
@@ -29,8 +29,9 @@ portable. Only the *context* is per-platform, and only for the headless `export`
 (`render/gpu.rs`): CGL rejects surfaceless and pbuffer surfaces, so macOS anchors to a never-shown
 one-pixel `NSWindow`, while everything else takes an EGL pbuffer, with the AppKit crates scoped to
 macOS in `Cargo.toml`. `simulate` takes its context from a real window via `glutin-winit` and is
-portable already. **The non-macOS backend has not been compiled on Linux** — it is written against
-glutin 0.32's API but only macOS has been built and run here.
+portable already. Both have been built and run on Linux too (Hyprland/Wayland, Mesa on Iris Xe): the
+EGL pbuffer `export` and a `simulate` dump work unchanged once winit/glutin-winit get their Linux
+windowing features, which `Cargo.toml` enables for non-macOS Unix only.
 
 ### Debugging subcommands
 

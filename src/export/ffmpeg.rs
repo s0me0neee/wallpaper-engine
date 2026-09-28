@@ -98,8 +98,7 @@ pub fn probe(path: &Path) -> Result<MediaInfo> {
         .unwrap_or(0.0);
 
     let codec = ffmpeg::decoder::find(stream.parameters().id())
-        .map(|codec| codec.name().to_string())
-        .unwrap_or_default();
+        .map_or_default(|codec| codec.name().to_string());
 
     Ok(MediaInfo {
         width: decoder.width(),
@@ -110,8 +109,7 @@ pub fn probe(path: &Path) -> Result<MediaInfo> {
         pixel_format: decoder
             .format()
             .descriptor()
-            .map(|descriptor| descriptor.name().to_string())
-            .unwrap_or_default(),
+            .map_or_default(|descriptor| descriptor.name().to_string()),
         has_audio: ictx.streams().best(Type::Audio).is_some(),
     })
 }
