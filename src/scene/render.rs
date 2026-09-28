@@ -299,6 +299,8 @@ impl EffectChain {
             // We do not track a real pointer yet (plan.md §14); the centre is
             // the neutral stand-in, and is where a flare belongs by default.
             floats.push(("g_PointerPosition".to_string(), vec![0.5, 0.5]));
+            // Camera parallax's smoothed cursor, at rest in the centre (`depthparallax` reads it).
+            floats.push(("g_ParallaxPosition".to_string(), vec![0.5, 0.5]));
             for (tweakable, &value) in self.tweakables.iter().zip(overrides) {
                 if tweakable.pass_index == pass_index
                     && let Some(entry) = floats.iter_mut().find(|(name, _)| *name == tweakable.uniform_name)

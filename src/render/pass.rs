@@ -367,6 +367,8 @@ pub struct DrawCall<'a> {
 
 /// Bind everything a `DrawCall` names, draw the quad, and leave the GL state
 /// as this function found it (program 0, framebuffer 0).
+const IDENTITY: [f32; 16] = [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0];
+
 pub fn draw(gl: &glow::Context, call: &DrawCall) -> Result<()> {
     #[expect(clippy::cast_possible_wrap, reason = "wallpaper canvases are nowhere near i32::MAX")]
     let (width, height) = (call.target.width as i32, call.target.height as i32);
@@ -379,6 +381,20 @@ pub fn draw(gl: &glow::Context, call: &DrawCall) -> Result<()> {
     }
 
     set_uniform_matrix4(gl, call.program.handle, "g_ModelViewProjectionMatrix", call.mvp);
+    // An effect pass draws in its own texture space, so WE's effect projections are the
+    // identity here; left unset they are zero, and `depthparallax` normalises a zero vector
+    // taken from one into NaN texture coordinates, blanking the layer.
+    if *call.mvp == IDENTITY {
+        for name in [
+            "g_ModelViewProjectionMatrixInverse",
+            "g_EffectTextureProjectionMatrix",
+            "g_EffectTextureProjectionMatrixInverse",
+            "g_EffectModelViewProjectionMatrix",
+            "g_EffectModelViewProjectionMatrixInverse",
+        ] {
+            set_uniform_matrix4(gl, call.program.handle, name, &IDENTITY);
+        }
+    }
     for (name, values) in call.floats {
         // Both stages' declarations reach here, and where they disagree only
         // the linked width can be uploaded.
