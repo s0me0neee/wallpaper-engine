@@ -536,19 +536,23 @@ fn static_text<'a>(
 /// rectangle. So the layer is its own rect filled with the object's tint, and
 /// the ordinary image path — effect chain included — takes it from there.
 /// `scene_example6` uses four: two black bars, and two that are the backdrop an
-/// audio-bars effect draws over.
+/// audio-bars effect draws over. Newer scenes package a model of their own with
+/// `"solidlayer": true`, whose engine material draws `util/white` tinted the same way.
 fn static_solid<'a>(
-    archive: &Archive,
+    archive: &mut Archive,
     canvas: &Canvas,
     object: &'a Object,
     anchor: &Anchor,
 ) -> Option<StaticImage<'a>> {
     let path = object.image.as_deref()?;
-    if archive.contains(path) {
-        return None;
-    }
-    let name = path.rsplit('/').next().unwrap_or(path);
-    if !matches!(name, "solidlayer.json" | "solidlayer_depthtest.json") {
+    let solid = if archive.contains(path) {
+        let bytes = archive.read(path).ok()?;
+        serde_json::from_slice::<Model>(&bytes).is_ok_and(|model| model.solidlayer)
+    } else {
+        let name = path.rsplit('/').next().unwrap_or(path);
+        matches!(name, "solidlayer.json" | "solidlayer_depthtest.json")
+    };
+    if !solid {
         return None;
     }
 
@@ -913,8 +917,11 @@ pub fn prepare_static<'a>(
         if !is_image(object) {
             continue;
         }
-        if let Some(item) = static_image_or_puppet(archive, &canvas, object, anchor)? {
-            items.push(item);
+        // One layer that will not load costs that layer, not the wallpaper.
+        match static_image_or_puppet(archive, &canvas, object, anchor) {
+            Ok(Some(item)) => items.push(item),
+            Ok(None) => {}
+            Err(error) => omissions.push(format!("{}: layer skipped ({error:#})", model::label(object))),
         }
     }
 

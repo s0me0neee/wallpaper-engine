@@ -703,6 +703,10 @@ pub struct Model {
     /// Path to a binary `*_puppet.mdl` when the layer is a warp puppet.
     #[serde(default)]
     pub puppet: Option<String>,
+    /// A packaged model standing in for a solid-colour layer, whose material
+    /// (`materials/util/solidlayer_instance*.json`) ships with the program.
+    #[serde(default)]
+    pub solidlayer: bool,
 }
 
 /// `materials/*.json`.
