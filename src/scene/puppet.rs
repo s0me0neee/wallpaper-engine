@@ -553,6 +553,22 @@ pub fn uv_fit(puppet: &Puppet) -> (f32, f32, f32, f32) {
     (u_slope, u_intercept, v_slope, v_intercept)
 }
 
+/// The map from a vertex's model position to its place in the layer's rest
+/// rectangle, as fractions of it, `(u, v)` as functions of `(x, y)`.
+///
+/// Wallpaper Engine draws a puppet vertex at `origin + position · scale`, so the
+/// model position over the layer's `size` is the placement, whatever the UVs say.
+/// The two agree when the mesh is authored centred on its texture, as every
+/// corpus puppet is; `scene_example6`'s girl is not (her mesh spans x 130..594
+/// of a 1100-wide layer), and the UV fit drew her 1.19x too narrow and ~370 px
+/// left of where WE puts her. With no `size` the UV fit is all there is.
+pub fn rect_map(puppet: &Puppet, size: Option<(f32, f32)>) -> (f32, f32, f32, f32) {
+    match size {
+        Some((width, height)) if width > 0.0 && height > 0.0 => (1.0 / width, 0.5, -1.0 / height, 0.5),
+        _ => uv_fit(puppet),
+    }
+}
+
 /// Rasterize the deformed mesh into an `out_w × out_h` RGBA image, sampling
 /// `texture` bilinearly through each triangle's UVs and compositing triangles
 /// front-to-back with straight "over" alpha. `place` maps a deformed vertex
@@ -733,6 +749,25 @@ mod tests {
             assert!(skin.b.abs() < 1e-4 && skin.c.abs() < 1e-4);
             assert!(skin.tx.abs() < 1e-3 && skin.ty.abs() < 1e-3);
         }
+    }
+
+    #[test]
+    fn a_vertex_is_placed_by_its_model_position_not_its_uv() {
+        // scene_example6's girl: a mesh off-centre on its texture, so the UV fit and the
+        // layer's own frame disagree. WE draws at origin + position; the UVs only sample.
+        let vertex = |x: f32, u: f32| Vertex { x, y: 0.0, u, v: 0.5, bones: [0; 4], weights: [1.0, 0.0, 0.0, 0.0] };
+        let puppet = Puppet {
+            vertices: vec![vertex(130.0, 0.31), vertex(594.0, 0.67)],
+            triangles: vec![],
+            bones: vec![],
+            animations: vec![],
+        };
+        let (u_slope, u_intercept, _, v_intercept) = rect_map(&puppet, Some((1100.0, 1350.0)));
+        assert!((u_slope * 594.0 + u_intercept - (0.5 + 594.0 / 1100.0)).abs() < 1e-6);
+        assert!((v_intercept - 0.5).abs() < 1e-6);
+        // No size: the fit is all there is, and it reproduces the UVs.
+        let (u_slope, u_intercept, _, _) = rect_map(&puppet, None);
+        assert!((u_slope * 594.0 + u_intercept - 0.67).abs() < 1e-4);
     }
 
     #[test]

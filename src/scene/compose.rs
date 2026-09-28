@@ -832,7 +832,8 @@ fn load_puppet_mesh(archive: &mut Archive, puppet_path: &str) -> Result<puppet::
 pub fn warp_frame(item: &StaticPuppet, time: f32) -> (RgbaImage, i64, i64) {
     let skins = puppet::skin_transforms(&item.puppet, item.animation, time, item.rate);
     let positions = puppet::deform(&item.puppet, &skins);
-    let (u_slope, u_intercept, v_slope, v_intercept) = puppet::uv_fit(&item.puppet);
+    let (u_slope, u_intercept, v_slope, v_intercept) =
+        puppet::rect_map(&item.puppet, item.object.size.map(|size| (size.x, size.y)));
 
     let rect_px = item.rect_px;
     #[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss, reason = "layer extents are at most a few thousand px")]
@@ -841,8 +842,7 @@ pub fn warp_frame(item: &StaticPuppet, time: f32) -> (RgbaImage, i64, i64) {
         ((rect_px.1 * (1.0 + 2.0 * WARP_PAD)).ceil() as u32).clamp(1, 16384),
     );
 
-    // A deformed vertex lands in the same texture rectangle a flat layer would
-    // place it in (via the mesh's own vertex->UV fit), offset by the pad.
+    // A deformed vertex lands at its model position in the rest rectangle, offset by the pad.
     let place = |x: f32, y: f32| -> (f32, f32) {
         let u = u_slope * x + u_intercept;
         let v = v_slope * y + v_intercept;
