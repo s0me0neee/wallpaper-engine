@@ -214,8 +214,7 @@ fn gather_control_points(node: &mut Value) {
 fn strip_driven_values(node: &mut Value) {
     match node {
         Value::Object(map) => {
-            // An explicit `null` means "not set" to Wallpaper Engine; dropping it lets the field's default apply.
-            map.retain(|_, value| !value.is_null());
+            // A driver can itself be null (`"user": null`) and still marks the `value` beside it.
             if DRIVER_KEYS.iter().any(|key| map.contains_key(*key))
                 && let Some(mut value) = map.remove("value")
             {
@@ -223,6 +222,8 @@ fn strip_driven_values(node: &mut Value) {
                 *node = value;
                 return;
             }
+            // An explicit `null` means "not set" to Wallpaper Engine; dropping it lets the field's default apply.
+            map.retain(|_, value| !value.is_null());
             for (key, value) in map.iter_mut() {
                 // `hoist_alpha_tracks` put a keyframe track here precisely so
                 // it would survive; every control point in it carries `frame`,
@@ -853,6 +854,16 @@ mod tests {
         let scene = parse_scene(br#"{"general":{"bloomstrength":null,"clearenabled":null},"objects":[]}"#).unwrap();
         assert_eq!(scene.general.bloomstrength, 2.0);
         assert!(scene.general.clearenabled);
+    }
+
+    /// Workshop item 3307673833 (Magic-Hat) binds a particle's colour with `"user": null`.
+    #[test]
+    fn a_null_driver_still_unwraps_its_value() {
+        let scene = parse_scene(
+            br#"{"objects":[{"image":"models/a.json","color":{"user":null,"value":"0.5 0.25 1.0"}}]}"#,
+        )
+        .unwrap();
+        assert_eq!(scene.objects[0].color, Vec3 { x: 0.5, y: 0.25, z: 1.0 });
     }
 
     #[test]
