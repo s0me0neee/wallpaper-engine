@@ -414,24 +414,53 @@ fn write_png(
     Ok(())
 }
 
-/// Decode a mipmap to 8-bit RGBA, whatever it was stored as.
+/// Decode a mipmap to 8-bit RGBA, whatever it was stored as, cropped to the
+/// image it holds.
 ///
 /// `save_mipmap` deliberately writes each format in its narrowest PNG colour
 /// type and hands embedded files through untouched, which is right for
 /// inspection. Compositing needs the opposite: one uniform buffer, so a mask
 /// and a photo can be blended by the same code.
+///
+/// Raw and block-compressed payloads are stored at the padded `texture` size
+/// with the image in the top-left corner, and every consumer maps the layer
+/// rect (and puppet UVs) onto the image alone, so the padding is cut here.
 pub fn decode_rgba(tex: &Tex, mipmap: &Mipmap) -> Result<image::RgbaImage> {
-    let payload = mipmap_pixels(mipmap)?;
-    let width = u32::try_from(mipmap.width).context("texture too wide")?;
-    let height = u32::try_from(mipmap.height).context("texture too tall")?;
-
     // An embedded file carries its own dimensions, and they are authoritative:
     // the mipmap header describes the texture slot, not the encoded image.
     if tex.embedded_ext().is_some() {
-        let decoded = image::load_from_memory(&payload)
+        let decoded = image::load_from_memory(&mipmap_pixels(mipmap)?)
             .context("decoding the image embedded in the texture")?;
         return Ok(decoded.into_rgba8());
     }
+
+    let padded = decode_padded(tex, mipmap)?;
+    let (width, height) = visible_size(tex, mipmap);
+    if (width, height) == padded.dimensions() {
+        return Ok(padded);
+    }
+    Ok(image::imageops::crop_imm(&padded, 0, 0, width, height).to_image())
+}
+
+/// The image's extent within this mipmap: `image_*` scaled from mip 0 to this
+/// level, rounded up so a mip never loses its last partial pixel.
+fn visible_size(tex: &Tex, mipmap: &Mipmap) -> (u32, u32) {
+    let scaled = |image: i32, texture: i32, level: usize| -> usize {
+        match (usize::try_from(image), usize::try_from(texture)) {
+            (Ok(image), Ok(texture)) if image > 0 && texture >= image => (image * level).div_ceil(texture).clamp(1, level),
+            _ => level,
+        }
+    };
+    let width = scaled(tex.image_width, tex.texture_width, mipmap.width);
+    let height = scaled(tex.image_height, tex.texture_height, mipmap.height);
+    (u32::try_from(width).unwrap_or(u32::MAX), u32::try_from(height).unwrap_or(u32::MAX))
+}
+
+/// A raw or block-compressed mipmap at its full stored size, padding included.
+fn decode_padded(tex: &Tex, mipmap: &Mipmap) -> Result<image::RgbaImage> {
+    let payload = mipmap_pixels(mipmap)?;
+    let width = u32::try_from(mipmap.width).context("texture too wide")?;
+    let height = u32::try_from(mipmap.height).context("texture too tall")?;
 
     if let Some(block_format) = tex.format.block_format() {
         let needed = block_format.compressed_size(mipmap.width, mipmap.height);
@@ -779,6 +808,50 @@ mod tests {
             }
         }
         bytes
+    }
+
+    fn padded_raw(texture: (i32, i32), image: (i32, i32), mip: (usize, usize)) -> (Tex, Mipmap) {
+        let data: Vec<u8> = (0..mip.0 * mip.1).flat_map(|i| [u8::try_from(i % 256).unwrap_or(0), 0, 0, 255]).collect();
+        let tex = Tex {
+            version: String::new(),
+            container_version: String::new(),
+            format: Format::Rgba8888,
+            flags: 0,
+            texture_width: texture.0,
+            texture_height: texture.1,
+            image_width: image.0,
+            image_height: image.1,
+            dominant_color: 0,
+            free_image_format: -1,
+            images: Vec::new(),
+            frames: Vec::new(),
+            bytes_consumed: 0,
+        };
+        let mipmap = Mipmap { width: mip.0, height: mip.1, decompressed_size: data.len(), data, lz4_compressed: false };
+        (tex, mipmap)
+    }
+
+    /// `scene_example4`'s `bg` is DXT5 stored 3840x2176 for a 3840x2160 image;
+    /// stretching the padding into the layer rect squashed it 0.74 % upward.
+    #[test]
+    fn a_padded_texture_decodes_to_its_image_alone() {
+        let (tex, mipmap) = padded_raw((8, 4), (6, 3), (8, 4));
+        let image = decode_rgba(&tex, &mipmap).expect("decodes");
+        assert_eq!(image.dimensions(), (6, 3));
+        // Row 1 starts at stored pixel 8, not 6: the crop keeps the stride.
+        assert_eq!(image.get_pixel(0, 1).0[0], 8);
+    }
+
+    #[test]
+    fn a_smaller_mip_crops_to_the_image_scaled_down_and_rounded_up() {
+        let (tex, mipmap) = padded_raw((8, 4), (6, 3), (4, 2));
+        assert_eq!(decode_rgba(&tex, &mipmap).expect("decodes").dimensions(), (3, 2));
+    }
+
+    #[test]
+    fn an_unpadded_texture_is_untouched() {
+        let (tex, mipmap) = padded_raw((4, 4), (4, 4), (4, 4));
+        assert_eq!(decode_rgba(&tex, &mipmap).expect("decodes").dimensions(), (4, 4));
     }
 
     /// `birds_128x120x16`'s own shape: sixteen 128x120 cells in a 1024x241

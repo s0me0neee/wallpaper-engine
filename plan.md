@@ -1430,9 +1430,9 @@ the latter.
   Ours never sees the padding: every ex3 layer is an *embedded* png or jpg whose
   mip0 is the real size (`layer_01` is `image 3840x2160  texture 4096x4096`, and
   the decoded mipmap is 3840x2160), so `texture_width` describes the GPU slot
-  lwe allocates, not the pixels `decode_rgba` hands back. The correction is a
-  no-op for us by construction. Worth re-checking only if a raw or
-  block-compressed `.tex` ever decodes to the padded size.
+  lwe allocates, not the pixels `decode_rgba` hands back. ~~The correction is a
+  no-op for us by construction.~~ True of ex3 only: raw and DXT textures *do*
+  decode to the padded size, and ex4/5/6 are full of them — §4.28.
 
 **It also gives two numbers for the particle size question (§4.20).** Their size
 initializer is `(min + t·(max−min)) · sizeOverride / 2.0` and their no-
@@ -1655,6 +1655,66 @@ one under which the flock is visible in both scenes. It is unsatisfying that it
 makes the authored points inert, so the alternative is worth revisiting with
 either a WE capture of ex3 that shows where its birds actually are, or a
 purpose-built scene with known control points.
+
+---
+
+### 4.28 Padded textures, and the measurement that found them
+
+The first work on Linux (Hyprland, Mesa on Iris Xe). The §4.19 captures came
+across from the Mac, and re-dumping the corpus here reproduces §4.22's table to
+within 0.04 dB on every scene, so the two machines render the same frames. The
+PSNR there is over **RGB**, not luma — only the luminance column is 709 luma.
+
+**§4.25's block matcher, turned into a fit.** Instead of reading a field of
+integer shifts, `fitwarp.py` fits the scale `(sx, sy)` about the frame centre
+plus a translation that best moves our frame onto the capture. ex2, the control,
+fits to identity. Three scenes do not:
+
+| scene | fit | PSNR gain |
+|---|---|---:|
+| ex4 | `sx 1.0000, sy 1.0075`, ty +4 | +4.4 |
+| ex5 | `sx 1.0150, sy 1.0097`, t (+4.5, +3.25) | +4.5 |
+
+ex4's is a vertical-only stretch, zero at the top edge and +8 px at the
+bottom, and 2176/2160 = 1.0074. `tex --info` then shows `bg` and `layer_01` are
+DXT5 stored **3840x2176 for a 3840x2160 image**: the block padding is 16 rows
+at the bottom, and `decode_rgba` handed back all 2176 of them, so the layer
+rect squeezed padding and art together. ex5's character body is raw RGBA stored
+3456x3264 for 3406x3250, and 3456/3406 = 1.0147 is its fitted `sx`. Across the
+corpus, every padded *embedded* png/jpg (ex2, ex3, ex8) was already right, since
+the embedded file carries its own size, while ex4, ex5 and ex6 carry padded raw
+or DXT payloads — ex6 thirteen of them, including its 2000x1080 background
+stored at 2016x1088.
+
+**The fix is a crop in `decode_rgba`** to `image_width x image_height`, which is
+the top-left of the stored texture, scaled per mip level. Puppets needed
+checking first, because a mesh brings its own UVs: if they were in padded
+texture space, cropping would break every puppet on a raw texture. They are in
+image space. ex6's `cat2` has max u = 0.9724771 = 106/**109**, the image width
+and not the 112 texture width, and `伞` has 0.94902 = 875/922. So the puppets
+were sampling a padded texture at image-space UVs, the same squash, and the crop
+fixes them too.
+
+| scene | before | after | refit |
+|---|---:|---:|---|
+| ex4 Into the night | 24.33 | **28.78** | identity |
+| ex5 听星·伊蕾娜 | 20.37 | **29.39** | identity |
+| ex6 Rainy Day | 14.78 | 15.63 | identity |
+| ex1, ex2, ex3, ex8 | — | unchanged to 0.01 | — |
+
+**ex5's figure is under a corrected convention.** With the texture fixed, the
+refit still found `sx 1.0037, sy 1.0002`, and 0.33088/0.32967 is exactly that:
+the ratio between *covering* the 5824x3264 canvas onto 1920x1080 (scale by the
+looser side, crop the other) and the non-uniform stretch the comparison had
+been applying. So Wallpaper Engine covers a canvas that is not the display's
+shape, which is what `desktop` already does (§14.6), and the stretch was an
+error in the measurement, not in the renderer. The comparison now covers, which
+is identical for every 16:9 scene. ex5 was 20.10 under the stretch; 20.37 is its
+baseline under cover, and that is the column above.
+
+This settles §4.22's ex4 and ex5 entries. ex4's "one layer ~12 canvas px too
+low" was the bottom of a squashed layer, and ex5's registration residual was
+the aspect convention plus the squash, not anything shared with ex3.
 
 ---
 

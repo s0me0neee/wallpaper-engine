@@ -183,6 +183,10 @@ evidence.
   accumulated world position lands on the centroid of the vertices it weights. Clip frame 0 is the
   bind pose, so `t=0` must skin to an exact identity. The scale channel is not decorative — eye-blink
   clips squash `scale_y` to ~0 and barely touch translation or rotation.
+- **A raw or DXT `.tex` is stored padded** (`texture 3840x2176` for `image 3840x2160`), with the
+  image in the top-left. `decode_rgba` crops to the image; puppet UVs are in image space too. Stretching
+  the padding into the layer rect squashed ex4 and ex5 by up to 1.5 % (plan.md §4.28). Embedded
+  png/jpg payloads carry their own size and were never affected.
 - **`g_TextureNResolution` is `(w, h, w, h)`.** The two halves differ only for atlas-packed
   textures, which nothing here produces.
 
