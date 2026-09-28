@@ -135,6 +135,8 @@ pub struct StaticPuppet<'a> {
     pub rect_top: f32,
     /// See `StaticImage::texel_scale`.
     pub texel_scale: (f32, f32),
+    /// Where the layer sits, for `mirror` to flip each fresh raster by.
+    pub mirror: Anchor,
     pub blend: Blend,
     /// Roll about the layer's own centre, in radians — `Anchor::roll`.
     pub roll: f32,
@@ -333,7 +335,22 @@ pub fn apply_tint(layer: &mut RgbaImage, color: Vec3, brightness: f32, alpha: f3
     }
 }
 
-/// The layer's extent in scene units, from `size` when given.
+/// Flip `image` along each axis the object's accumulated scale is negative on.
+///
+/// A negative scale mirrors in Wallpaper Engine, and 32 wallpapers in a real
+/// Workshop library mirror 101 layers that way, often through a parent group
+/// (`组件镜像`, "component mirror"). The extent is taken as a magnitude and the
+/// content flipped here, which is scale-then-rotate as the compositor's roll expects.
+fn mirror(image: &mut RgbaImage, anchor: &Anchor) {
+    if anchor.scale.x < 0.0 {
+        imageops::flip_horizontal_in_place(image);
+    }
+    if anchor.scale.y < 0.0 {
+        imageops::flip_vertical_in_place(image);
+    }
+}
+
+/// The layer's extent in scene units, from `size` when given; a magnitude, see `mirror`.
 fn extent(object: &Object, anchor: &Anchor, texture: &RgbaImage) -> (f32, f32) {
     // Texture dimensions, nowhere near f32's 2^24 exact-integer range.
     #[expect(clippy::cast_precision_loss, reason = "image dimensions, nowhere near 2^24")]
@@ -342,7 +359,7 @@ fn extent(object: &Object, anchor: &Anchor, texture: &RgbaImage) -> (f32, f32) {
         // `autosize` models omit the size and take it from the texture.
         _ => (texture.width() as f32, texture.height() as f32),
     };
-    (width * anchor.scale.x, height * anchor.scale.y)
+    ((width * anchor.scale.x).abs(), (height * anchor.scale.y).abs())
 }
 
 /// Where an object actually sits, once its parent chain has been applied.
@@ -461,8 +478,9 @@ fn static_composition<'a>(
     #[expect(clippy::cast_precision_loss, reason = "canvas dimensions, nowhere near 2^24")]
     let full = (canvas.ortho.width as f32, canvas.ortho.height as f32);
     let (extent_x, extent_y) = match object.size {
+        // A magnitude and no flip: the content is the frame beneath, sampled in screen space.
         Some(size) if !fullscreen && size.x > 0.0 && size.y > 0.0 => {
-            (size.x * anchor.scale.x, size.y * anchor.scale.y)
+            ((size.x * anchor.scale.x).abs(), (size.y * anchor.scale.y).abs())
         }
         _ => full,
     };
@@ -515,7 +533,7 @@ fn static_text<'a>(
     anchor: &Anchor,
 ) -> Result<StaticImage<'a>, String> {
     let size = object.size.ok_or_else(|| "text layer has no size".to_string())?;
-    let (extent_x, extent_y) = (size.x * anchor.scale.x, size.y * anchor.scale.y);
+    let (extent_x, extent_y) = ((size.x * anchor.scale.x).abs(), (size.y * anchor.scale.y).abs());
     if extent_x <= 0.0 || extent_y <= 0.0 {
         return Err("text layer has an empty box".into());
     }
@@ -526,7 +544,8 @@ fn static_text<'a>(
         anchor.origin.y + extent_y / 2.0,
     );
     let (width, height) = to_pixel_size(extent_x * canvas.scale, extent_y * canvas.scale);
-    let rendered = text::render(archive, assets, object, (width, height))?;
+    let mut rendered = text::render(archive, assets, object, (width, height))?;
+    mirror(&mut rendered.image, anchor);
     Ok(StaticImage {
         object,
         image: rendered.image,
@@ -573,7 +592,7 @@ fn static_solid<'a>(
     if size.x <= 0.0 || size.y <= 0.0 {
         return None;
     }
-    let (extent_x, extent_y) = (size.x * anchor.scale.x, size.y * anchor.scale.y);
+    let (extent_x, extent_y) = ((size.x * anchor.scale.x).abs(), (size.y * anchor.scale.y).abs());
     let (rect_left, rect_top) = to_pixels(
         canvas,
         anchor.origin.x - extent_x / 2.0,
@@ -770,6 +789,7 @@ fn static_image_or_puppet<'a>(
                     rect_left,
                     rect_top,
                     texel_scale: texel_scale(canvas, (anchor.scale.x, anchor.scale.y)),
+                    mirror: *anchor,
                     blend,
                     roll: anchor.roll,
                 })));
@@ -779,7 +799,8 @@ fn static_image_or_puppet<'a>(
     }
 
     let (pixel_width, pixel_height) = to_pixel_size(extent_x * canvas.scale, extent_y * canvas.scale);
-    let image = scaled_tinted(object, texture, pixel_width, pixel_height);
+    let mut image = scaled_tinted(object, texture, pixel_width, pixel_height);
+    mirror(&mut image, anchor);
     Ok(Some(StaticItem::Image(StaticImage {
         object,
         image,
@@ -829,6 +850,7 @@ pub fn warp_frame(item: &StaticPuppet, time: f32) -> (RgbaImage, i64, i64) {
     };
 
     let mut image = puppet::rasterize(&item.puppet, &positions, &item.texture, out_w, out_h, place);
+    mirror(&mut image, &item.mirror);
     apply_tint(&mut image, item.object.color, item.object.brightness, item.object.alpha);
 
     let left = round_to_i64(item.rect_left - WARP_PAD * rect_px.0);
