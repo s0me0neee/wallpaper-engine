@@ -12,7 +12,7 @@ use super::model::{
     self, Blend, Material, Model, Object, Orthographic, Scene, Vec3, base_blend, base_texture,
     is_image, is_particle, is_sound, is_text,
 };
-use super::{particle, puppet, text};
+use super::{particle, puppet, text, video};
 use crate::{export::Resolution, pkg::Archive, render::bloom, tex};
 use anyhow::{Context, Result, bail};
 use glam::{Vec2, Vec3 as GVec3};
@@ -114,6 +114,8 @@ pub struct StaticImage<'a> {
     /// effect buffers from its authored `size`, not the screen, and some shaders
     /// build coordinates from `g_TextureNResolution`, so a chain reports that size.
     pub texel_scale: (f32, f32),
+    /// The mp4 of a video texture, which the live simulator plays in place of `image`.
+    pub video: Option<Vec<u8>>,
     /// Roll about the layer's own centre, in radians — `Anchor::roll`.
     pub roll: f32,
 }
@@ -244,6 +246,8 @@ struct LayerTexture {
     image: RgbaImage,
     puppet: Option<String>,
     blend: Blend,
+    /// The mp4 behind a video texture, whose first frame is `image`.
+    video: Option<Vec<u8>>,
 }
 
 /// Resolve an object's texture through the model and material indirection.
@@ -270,11 +274,18 @@ fn layer_texture(archive: &mut Archive, object: &Object) -> Result<Option<LayerT
         .with_context(|| format!("reading the texture of {:?}", object.name))?;
 
     let texture = tex::parse_bytes(&bytes).with_context(|| format!("parsing {texture_path}"))?;
+    if tex::is_video(&texture) {
+        let mp4 = tex::video_bytes(&texture).with_context(|| format!("reading the video in {texture_path}"))?;
+        let size = (texture.image_width.unsigned_abs().max(1), texture.image_height.unsigned_abs().max(1));
+        let mut playing = video::open(mp4.clone(), size).with_context(|| format!("opening the video in {texture_path}"))?;
+        let first = video::frame_at(&mut playing, 0.0)?.with_context(|| format!("{texture_path} has no first frame"))?;
+        return Ok(Some(LayerTexture { image: first, puppet: model.puppet, blend: base_blend(&material), video: Some(mp4) }));
+    }
     let mipmap = tex::largest_mipmap(&texture)?;
     let decoded = tex::decode_rgba(&texture, mipmap)
         .with_context(|| format!("decoding {texture_path}"))?;
 
-    Ok(Some(LayerTexture { image: decoded, puppet: model.puppet, blend: base_blend(&material) }))
+    Ok(Some(LayerTexture { image: decoded, puppet: model.puppet, blend: base_blend(&material), video: None }))
 }
 
 /// Scale a channel by a `0.0..=1.0` factor and round back to a byte.
@@ -299,7 +310,7 @@ fn scale_channel(value: u8, factor: f32) -> u8 {
 /// comparison against `1.0` is exact on purpose: these are serde defaults, not
 /// the result of arithmetic, so "equals the default" is the right question,
 /// not "is close to".
-fn apply_tint(layer: &mut RgbaImage, color: Vec3, brightness: f32, alpha: f32) {
+pub fn apply_tint(layer: &mut RgbaImage, color: Vec3, brightness: f32, alpha: f32) {
     #[expect(clippy::float_cmp, reason = "checking against an untouched serde default, not a computed value")]
     let neutral = color == Vec3::splat(1.0) && brightness == 1.0 && alpha == 1.0;
     if neutral {
@@ -486,6 +497,7 @@ fn static_composition<'a>(
         warp_error: None,
         composition: true,
         texel_scale: texel_scale(canvas, if fullscreen { (1.0, 1.0) } else { (anchor.scale.x, anchor.scale.y) }),
+        video: None,
         roll: anchor.roll,
     })
 }
@@ -524,6 +536,7 @@ fn static_text<'a>(
         warp_error: None,
         composition: false,
         texel_scale: texel_scale(canvas, (anchor.scale.x, anchor.scale.y)),
+        video: None,
         roll: anchor.roll,
     })
 }
@@ -580,6 +593,7 @@ fn static_solid<'a>(
         warp_error: None,
         composition: false,
         texel_scale: texel_scale(canvas, (anchor.scale.x, anchor.scale.y)),
+        video: None,
         roll: anchor.roll,
     })
 }
@@ -725,7 +739,7 @@ fn static_image_or_puppet<'a>(
     object: &'a Object,
     anchor: &Anchor,
 ) -> Result<Option<StaticItem<'a>>> {
-    let Some(LayerTexture { image: texture, puppet: puppet_path, blend }) =
+    let Some(LayerTexture { image: texture, puppet: puppet_path, blend, video }) =
         layer_texture(archive, object)?
     else {
         return Ok(None);
@@ -775,6 +789,7 @@ fn static_image_or_puppet<'a>(
         warp_error,
         composition: false,
         texel_scale: texel_scale(canvas, (anchor.scale.x, anchor.scale.y)),
+        video,
         roll: anchor.roll,
     })))
 }

@@ -23,7 +23,7 @@ use crate::pkg::Archive;
 use crate::render::{bloom, capture, particles, pass};
 use crate::scene::compose::{self, StaticItem};
 use crate::scene::model::{self, Blend, Scene};
-use crate::scene::particle;
+use crate::scene::{particle, video};
 use crate::scene::render::{self, EffectChain};
 use crate::shader::shim;
 use anyhow::{Context, Result, anyhow};
@@ -104,6 +104,9 @@ struct App<'a> {
 enum LiveKind {
     /// A plain image layer: texture uploaded once, never changes.
     Image,
+    /// A video texture, decoded on the scene clock and re-uploaded when its
+    /// frame changes, then tinted the way `compose` tints a still layer.
+    Video { video: Box<video::VideoTexture>, tint: (model::Vec3, f32, f32) },
     /// A puppet-warp layer: `static_scene.items[usize]` is re-skinned each frame.
     Puppet(usize),
     /// A composition layer: its input is the frame as composited so far,
@@ -768,13 +771,7 @@ impl App<'_> {
                             format!("{}: puppet warp skipped ({error})", model::label(layer.object)),
                         );
                     }
-                    let kind = if layer.composition {
-                        let region = pass::Target::new(gl, layer.image.width(), layer.image.height())
-                            .with_context(|| format!("allocating {}'s region", model::label(layer.object)))?;
-                        LiveKind::Composition { region }
-                    } else {
-                        LiveKind::Image
-                    };
+                    let kind = image_kind(gl, layer)?;
                     (
                         Some(layer.image.clone()),
                         layer.image.dimensions(),
@@ -853,6 +850,20 @@ impl App<'_> {
 
         Ok(Built { layers, tweak_values, omissions, particle_scale: gpu_scale })
     }
+}
+
+/// What a static image layer needs per frame: nothing, the frame beneath it, or its video.
+fn image_kind(gl: &glow::Context, layer: &compose::StaticImage) -> Result<LiveKind> {
+    let label = model::label(layer.object);
+    if layer.composition {
+        let region = pass::Target::new(gl, layer.image.width(), layer.image.height())
+            .with_context(|| format!("allocating {label}'s region"))?;
+        return Ok(LiveKind::Composition { region });
+    }
+    let Some(mp4) = &layer.video else { return Ok(LiveKind::Image) };
+    let video = video::open(mp4.clone(), layer.image.dimensions()).with_context(|| format!("opening {label}'s video"))?;
+    let tint = (layer.object.color, layer.object.brightness, layer.object.alpha);
+    Ok(LiveKind::Video { video: Box::new(video), tint })
 }
 
 /// Compile one layer's effect chain, recording whatever it could not build.
@@ -1239,7 +1250,7 @@ fn redraw(app: &mut App, time: f32) -> Result<bool> {
                 let base = match &layer.kind {
                     LiveKind::Image => None,
                     LiveKind::Composition { region } => Some(region.texture),
-                    LiveKind::Puppet(_) | LiveKind::Particle { .. } | LiveKind::ParticleGpu { .. } => {
+                    LiveKind::Puppet(_) | LiveKind::Video { .. } | LiveKind::Particle { .. } | LiveKind::ParticleGpu { .. } => {
                         Some(textures.current())
                     }
                 };
@@ -1330,6 +1341,13 @@ fn refresh_layers(
             // A composition layer's input is produced on the GPU during the
             // composite pass below, not here.
             LiveKind::Image | LiveKind::Composition { .. } => Ok(None),
+            LiveKind::Video { video, tint: (color, brightness, alpha) } => {
+                let frame = video::frame_at(video, time).with_context(|| format!("playing {}'s video", layer.name))?;
+                Ok(frame.map(|mut image| {
+                    compose::apply_tint(&mut image, *color, *brightness, *alpha);
+                    Refreshed::Image(image, layer.rect)
+                }))
+            }
             LiveKind::Puppet(index) => {
                 let StaticItem::Puppet(puppet) = &static_scene.items[*index] else {
                     unreachable!("a Puppet LiveKind always points at a Puppet item")
@@ -1502,6 +1520,7 @@ fn report_layer_roster(layers: &[LiveLayer]) {
     for (index, layer) in layers.iter().enumerate() {
         let kind = match layer.kind {
             LiveKind::Image => "image",
+            LiveKind::Video { .. } => "video",
             LiveKind::Composition { .. } => "composition",
             LiveKind::Puppet(_) => "puppet",
             LiveKind::Particle { .. } => "particle",

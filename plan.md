@@ -1791,6 +1791,40 @@ bilinearly with no mips, which aliases at any downscale.
 
 ---
 
+### 4.30 The whole library, and the wallpapers that did not open at all
+
+Seven captures measure seven scenes. The other kind of evidence is breadth: this
+machine's Workshop folder holds 87 scene wallpapers, and dumping each once at
+quarter scale shows which never render. **13 of 87 did not open at all**, which
+is the largest possible distance from Wallpaper Engine, and they came down to
+four causes:
+
+| cause | wallpapers | now |
+|---|---:|---|
+| a packaged solid-layer model, `{"solidlayer": true}` over the engine's `materials/util/solidlayer_instance*.json` | 7 | drawn |
+| a **video texture**: `.tex` flag 32, whose payload is an mp4 | 3 | played |
+| an image layer's load error aborting the whole scene | (all of the above) | layer skipped instead |
+| `null` where a number is expected in scene JSON | 1 | open |
+| a perspective (3D) scene | 1 | out of scope |
+
+**Video textures** (`scene/video.rs`) are read from memory through libav
+(`StreamIo`, no temp file), converted by a `scale,format=rgba` filter graph at
+the layer's own size, and looped against `g_Time`. The live simulator decodes on
+the frame clock and re-uploads only when the video's frame changes. A still
+takes the first frame. On an exported 8.1 s clip, `t = 16.2` lands on pts 0
+exactly, and every frame is handed out once. `tex` now writes a video texture
+out as `.mp4`.
+
+The same survey lists what still breaks *inside* scenes that open. Most of it
+is effect chains failing to compile. `Simple_Audio_Bars` assigns to the
+read-only varying `v_TexCoord`, another workshop shader relies on an implicit
+float-to-int conversion, one uses a `[` the GLSL front end rejects, and
+`blur_combine` includes `common_composite.h`, which the shim does not provide.
+Each of these drops a whole layer's effects, and they are the next thing to
+work through.
+
+---
+
 ## 5. The `common.h` problem
 
 ### 5.1 What is missing

@@ -11,6 +11,7 @@ pub mod render;
 pub mod script;
 pub mod sprite;
 pub mod text;
+pub mod video;
 
 use anyhow::{Context, Result};
 use model::Scene;

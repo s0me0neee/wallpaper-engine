@@ -200,6 +200,9 @@ impl Tex {
         if self.flags & 4 != 0 {
             names.push("IsGif");
         }
+        if is_video(self) {
+            names.push("Video");
+        }
         if names.is_empty() {
             "none".to_string()
         } else {
@@ -366,6 +369,16 @@ fn parse_frames<R: Read + Seek>(reader: &mut Reader<R>) -> Result<Vec<Frame>> {
     Ok(frames)
 }
 
+/// Flag 32: the payload is an mp4, not pixels (`scene::video`).
+pub fn is_video(tex: &Tex) -> bool {
+    tex.flags & 32 != 0
+}
+
+/// A video texture's mp4, which is the whole of its single mipmap.
+pub fn video_bytes(tex: &Tex) -> Result<Vec<u8>> {
+    Ok(mipmap_pixels(largest_mipmap(tex)?)?.into_owned())
+}
+
 /// Decompress a mipmap payload, returning it borrowed when already plain.
 ///
 /// These are raw LZ4 blocks with no length prefix, so the size has to come
@@ -434,6 +447,9 @@ pub fn decode_rgba(tex: &Tex, mipmap: &Mipmap) -> Result<image::RgbaImage> {
         return Ok(decoded.into_rgba8());
     }
 
+    if is_video(tex) {
+        bail!("a video texture has no pixels of its own; scene::video decodes it");
+    }
     let padded = decode_padded(tex, mipmap)?;
     let (width, height) = visible_size(tex, mipmap);
     if (width, height) == padded.dimensions() {
@@ -519,8 +535,8 @@ pub fn largest_mipmap(tex: &Tex) -> Result<&Mipmap> {
 pub fn save_mipmap(tex: &Tex, mipmap: &Mipmap, stem: &Path) -> Result<PathBuf> {
     let payload = mipmap_pixels(mipmap)?;
 
-    // Already an encoded image file: pass it straight through untouched.
-    if let Some(ext) = tex.embedded_ext() {
+    // Already an encoded image file (or a video): pass it straight through untouched.
+    if let Some(ext) = tex.embedded_ext().or_else(|| is_video(tex).then_some("mp4")) {
         let target = stem.with_extension(ext);
         std::fs::write(&target, payload.as_ref())?;
         return Ok(target);
