@@ -214,6 +214,8 @@ fn gather_control_points(node: &mut Value) {
 fn strip_driven_values(node: &mut Value) {
     match node {
         Value::Object(map) => {
+            // An explicit `null` means "not set" to Wallpaper Engine; dropping it lets the field's default apply.
+            map.retain(|_, value| !value.is_null());
             if DRIVER_KEYS.iter().any(|key| map.contains_key(*key))
                 && let Some(mut value) = map.remove("value")
             {
@@ -843,6 +845,14 @@ mod tests {
         assert!(!scene.objects[0].visible);
         assert_eq!(scene.objects[1].alpha, 0.25);
         assert_eq!(scene.objects[1].color, Vec3 { x: 0.5, y: 0.25, z: 1.0 });
+    }
+
+    /// Workshop item 1195626192 writes `"bloomstrength": null`, which failed the whole scene.
+    #[test]
+    fn a_null_field_takes_its_default() {
+        let scene = parse_scene(br#"{"general":{"bloomstrength":null,"clearenabled":null},"objects":[]}"#).unwrap();
+        assert_eq!(scene.general.bloomstrength, 2.0);
+        assert!(scene.general.clearenabled);
     }
 
     #[test]
