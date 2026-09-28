@@ -315,10 +315,7 @@ impl EffectChain {
                 .map(|(name, texture)| {
                     let texture = match *texture {
                         PassTexture::LayerBase => base.unwrap_or(self.base),
-                        PassTexture::Fixed(handle) => match (pass_index, base) {
-                            (0, Some(base)) if name == "g_Texture0" => base,
-                            _ => handle,
-                        },
+                        PassTexture::Fixed(handle) => handle,
                     };
                     (name.as_str(), texture)
                 })
@@ -441,7 +438,7 @@ pub fn prepare_effect_chain(
                 let program = pass::compile_program(gl, &vertex_glsl, &fragment_glsl)
                     .with_context(|| format!("compiling {stem}"))?;
 
-                let (textures, resolutions) = resolve_textures(
+                let (mut textures, resolutions) = resolve_textures(
                     gl,
                     archive,
                     &fragment_declarations,
@@ -450,6 +447,7 @@ pub fn prepare_effect_chain(
                     (current, current_size),
                     base,
                 )?;
+                follow_layer_base(&mut textures, base_texture);
 
                 let mut floats = uniform_floats(&vertex_declarations, &effect_pass.constantshadervalues);
                 floats.extend(uniform_floats(&fragment_declarations, &effect_pass.constantshadervalues));
@@ -587,6 +585,16 @@ fn resolve_textures(
     Ok((bound, resolutions))
 }
 
+/// However a slot reached the chain's own upload of the layer image — slot 0 of the first pass, or
+/// a `previous` bind like `godrays_combine`'s — it has to follow a puppet's per-frame re-feed.
+fn follow_layer_base(textures: &mut [(String, PassTexture)], base_texture: glow::Texture) {
+    for (_, texture) in textures {
+        if matches!(texture, PassTexture::Fixed(handle) if *handle == base_texture) {
+            *texture = PassTexture::LayerBase;
+        }
+    }
+}
+
 /// A `_rt_*` name is one of Wallpaper Engine's runtime render targets, not a
 /// file in the package — reading it as one is what used to drop a whole
 /// layer's chain.
@@ -661,6 +669,20 @@ fn uniform_ints(declarations: &Declarations, material: &serde_json::Map<String, 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_previous_bind_to_the_layer_image_follows_the_refeed() {
+        let base = glow::NativeTexture(std::num::NonZeroU32::MIN);
+        let other = glow::NativeTexture(std::num::NonZeroU32::MAX);
+        // godrays_combine: slot 0 is the blurred rays, slot 1 the `previous` bind to the layer image
+        let mut textures = vec![
+            ("g_Texture0".to_string(), PassTexture::Fixed(other)),
+            ("g_Texture1".to_string(), PassTexture::Fixed(base)),
+        ];
+        follow_layer_base(&mut textures, base);
+        assert!(matches!(textures[0].1, PassTexture::Fixed(handle) if handle == other));
+        assert!(matches!(textures[1].1, PassTexture::LayerBase));
+    }
 
     #[test]
     fn builtin_noise_matches_only_the_known_names() {
