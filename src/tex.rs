@@ -502,11 +502,13 @@ fn decode_padded(tex: &Tex, mipmap: &Mipmap) -> Result<image::RgbaImage> {
             .as_ref()
             .get(..pixels)
             .map(|data| data.iter().flat_map(|&v| [v, v, v, 255]).collect()),
+        // Two independent channels, as a D3D R8G8 texture samples: every RG88 in a
+        // 124-texture library is a shake/waterflow flow map, read as `.rg`.
         Format::Rg88 => payload.as_ref().get(..pixels * 2).map(|data| {
             data.as_chunks::<2>()
                 .0
                 .iter()
-                .flat_map(|&[grey, alpha]| [grey, grey, grey, alpha])
+                .flat_map(|&[red, green]| [red, green, 0, 255])
                 .collect()
         }),
         other => bail!("unsupported pixel format {}", other.label()),
@@ -856,6 +858,18 @@ mod tests {
         assert_eq!(image.dimensions(), (6, 3));
         // Row 1 starts at stored pixel 8, not 6: the crop keeps the stride.
         assert_eq!(image.get_pixel(0, 1).0[0], 8);
+    }
+
+    /// `shake` reads its flow map as `.rg`; grey+alpha put red in both, losing vertical flow.
+    #[test]
+    fn rg88_keeps_its_two_channels_apart() {
+        let (mut tex, _) = padded_raw((2, 1), (2, 1), (2, 1));
+        tex.format = Format::Rg88;
+        let data = vec![10, 200, 127, 127];
+        let mipmap = Mipmap { width: 2, height: 1, decompressed_size: data.len(), data, lz4_compressed: false };
+        let image = decode_rgba(&tex, &mipmap).expect("decodes");
+        assert_eq!(image.get_pixel(0, 0).0, [10, 200, 0, 255]);
+        assert_eq!(image.get_pixel(1, 0).0, [127, 127, 0, 255]);
     }
 
     #[test]
