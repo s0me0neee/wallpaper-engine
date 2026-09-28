@@ -1876,6 +1876,85 @@ non-puppet objects in a single wallpaper, and a tail of HLSL-isms, namely
 
 ---
 
+### 4.32 Native Wallpaper Engine under Proton, as a moving reference
+
+§4.12 and §4.19 measured against single frames from a Windows box. Wallpaper
+Engine also runs under Proton on this Linux machine, which turns the reference
+into lossless video at any size, on demand, for any Workshop item.
+
+**Getting it to run.** Three things, each a hard failure until found:
+`launcher.exe` must run once, because it installs `distribution/` into the
+install root, and run from `distribution/` directly WE cannot find `assets/`
+(flat grey, or a V8 `ToLocalChecked` crash in `scenescript64` on a scripted
+scene); the first-run welcome dialog is CEF and CEF crashes under Wine, so
+`config.json` needs `hasshownwelcomedialog: true`; and Proton 11, not 9. The
+UI never has to open: `wallpaper64.exe -control openWallpaper -file …
+-playInWindow` is the whole interface. `tools/we_capture.py` does the rest: a
+headless Hyprland output at the canvas's own size (≤4K, aspect kept), a named
+workspace declared before the output exists so it never claims a numbered one,
+`wf-recorder` lossless, and `hyprctl reload` on exit. `tools/we_compare.py`
+renders `simulate` frames on a `g_Time` grid with WE's stock assets
+(`WE_ASSETS`), aligns them, and writes tile PSNR, a map of tiles that animate in
+one renderer only, and the worst tiles side by side.
+
+**Timing.** WE's `g_Time` starts ~40 ms before its first presented frame, and a
+heavy 4K scene draws at ~30 fps into the 60 Hz capture, so each frame is scored
+against the best capture frame within ±100 ms. Pinned that way the best offset
+is flat across a clip: no animation-speed mismatch in any scene measured.
+
+**Parallax needs the cursor.** Wine reads the pointer from XWayland, which only
+updates it while the pointer is over an X window. The capture tool parks the
+real cursor on WE's window centre for 0.15 s on parallax scenes and WE keeps
+that position. This is the second capture §4.25 asked for: with the cursor
+centred ex3's vertical offsets vanish (they were mouse-driven), and the
+horizontal ones stay — left buildings +21 px, centre −48, right buildings −87 at
+4K, steady from t = 1 s on. The per-layer displacement is static and real.
+
+**Fixed by it**, each measured on these captures:
+
+| fix | evidence |
+|---|---|
+| a puppet chain's `previous` bind followed the prepare-time rest pose | ex2 pendant 20–22 → 31 dB median |
+| RG88 decoded as grey+alpha; WE samples `(R, G, 0, 1)` | ex2 shake: WE-only motion tiles 21 → 7; 124-texture survey, all flow maps |
+| puppet vertices placed by UV fit instead of model position | ex6 15.8 → 20.3 dB, 3450697231 11.5 → 15.3 |
+
+**Where the corpus sits** (mean PSNR over 10 s at the capture's size, stock
+assets): ex2 33.6, ex1 32.1, ex5 30.3, ex4 29.5, ex8 22.9, ex6 20.3, ex3 16.0.
+Fourteen library scenes: 3258032485 51.0 (a match), 2978198116 30.6,
+3302432630 26.4, 3018516781 25.3, 3497595750 25.0, 3203778110 23.7,
+2487042463 23.7, 2932157836 23.4, 3028090166 21.1, 2772653062 20.3,
+3113287126 20.1, 3055600522 16.1, 3450697231 15.3, 3233141951 12.1.
+
+**Open, in order of payoff:**
+
+1. **User properties.** The loader (`model.rs`, `strip_driven_values`) bakes every `{"user": …, "value": …}` to
+   the value in `scene.json` and never reads `project.json`. The library
+   disproves "the two agree": 29 of 87 scenes disagree on 816 bound values —
+   colours, bar counts, and visibility (3450697231's media widget is off in
+   `project.json` and drawn here). Resolve from `general.properties`, coercing a
+   scalar onto a vec uniform and a combo `condition` onto a bool.
+2. **Puppet effects run in texture space, before the warp.** A puppet with
+   effects has its chain run over our CPU-warped, padded image, so masks miss
+   (ex2's irises lose the purple `shine`/`godrays`). Dropping the pad fixed the
+   masks but clipped ex2's pendant, which WE does not clip. WE's order must be:
+   chain over the flat texture, then draw the skinned mesh sampling its result —
+   a GPU mesh pass, since `puppet::rasterize` is CPU-only.
+3. **Camera shake** (§4.19) is now measurable: ex8's WE frame moves vertically
+   −10..+24 px, not at all horizontally. Camera parallax is still unimplemented
+   too; the comparisons only hold because the cursor is parked at rest.
+4. **ex3's two building layers** (§4.25), now confirmed static.
+5. **Large WE-only motion** still unexplained in 3055600522 (twirl ×21),
+   2772653062, 3028090166 (waterflow ×4) and 3233141951 — the next scenes to
+   open with `motion.png`.
+6. `util/noise`-driven sparkle only matches with WE's own texture; our
+   generated stand-in differs in phase by construction.
+
+Next: capture and compare the remaining ~66 library scenes (`we_capture.py`
+takes ~30 s each, `we_compare.py --times 0:10:1` ~2 min), then take the list
+above from the top.
+
+---
+
 ## 5. The `common.h` problem
 
 ### 5.1 What is missing

@@ -174,7 +174,11 @@ evidence.
   `_rt_imageLayerComposite_<id>_<slot>` is the layer's pre-effect image, which a `godrays`/`shine`
   `*_combine` pass blends its rays back over; it binds to the chain's base image and is kept
   symbolic (`PassTexture::LayerBase`) because puppet and particle layers re-upload that image every
-  frame. Unknown `_rt_*` names fall back to the shader's annotation default rather than failing.
+  frame — as does any slot that resolves to it another way, such as the combine pass's `previous`
+  bind. Unknown `_rt_*` names fall back to the shader's annotation default rather than failing.
+- **RG88 is two channels, not grey and alpha.** WE samples it as `(R, G, 0, 1)`; every RG88 in a
+  124-texture library survey is a `shake`/`waterflow` flow map read as `.rg`, and decoding it as
+  luminance-alpha collapsed every flow onto the diagonal.
 - **Combo defaults must be merged across both stages.** A combo's `[COMBO]` default is typically
   declared only in the fragment shader but governs the vertex shader too; defaulting it
   independently per stage makes the program fail to link.
@@ -204,6 +208,15 @@ all used before:
   should be still is measurable as a PSNR delta;
 - decode the effect masks with the `tex` subcommand to see what area an effect was *meant* to touch;
 - watch the `simulate` startup report for chains that stopped compiling.
+
+The strongest reference is native Wallpaper Engine itself, run under Proton on Linux (plan.md
+§4.32). `tools/we_capture.py <ids or dirs>` records each scene as lossless video on a headless
+Hyprland output, at the canvas's own size (≤4K), and puts the compositor back afterwards;
+`tools/we_compare.py <wallpaper> <clip>` renders our frames on a `g_Time` grid with WE's stock assets
+(`WE_ASSETS`), aligns them to the clip, and writes per-tile PSNR, a map of tiles that animate in one
+renderer and not the other, and the worst tiles side by side. Captures and reports live under
+`papers/_we_captures/`. WE's `g_Time` starts ~40 ms before its first presented frame; what remains
+of a match after that is the capture's own frame jitter.
 
 The two `#[ignore]`d tests in `render/capture.rs` need AppKit's real process main thread, which
 `cargo test`'s harness never provides (it runs every test on a spawned worker), so
