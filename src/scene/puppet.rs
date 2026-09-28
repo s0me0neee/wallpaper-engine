@@ -39,6 +39,8 @@ type PerBone<T> = SmallVec<[T; 16]>;
 /// `pos(12) + 4 bone indices(16) + 4 weights(16) + uv(8)`, the layout the
 /// vertex-format word's low half calls 9.
 const VERTEX_SIZE: usize = 52;
+/// The bone indices and weights, present when the format word's high half has `0x0180`.
+const SKIN_SIZE: usize = 32;
 
 /// Format 15 inserts a normal, a tangent and a handedness sign between the
 /// position and the bone indices: `pos(12) + normal(12) + tangent(12) +
@@ -53,7 +55,7 @@ const BONE_MATRIX_SIZE: usize = 64; // 4x4 f32 bind matrix, unused (bind pose ==
 const MAX_VERTICES: usize = 1 << 17;
 const MAX_BONES: usize = 256;
 const MAX_FRAMES: usize = 8192;
-const MAX_ANIMATIONS: usize = 64;
+const MAX_ANIMATIONS: usize = 256;
 
 #[derive(Clone, Copy)]
 pub struct Vertex {
@@ -137,32 +139,22 @@ pub fn parse(bytes: &[u8]) -> Result<Puppet> {
 
     let mut magic = [0u8; 8];
     cursor.read_exact(&mut magic)?;
-    let lit = match &magic {
-        b"MDLV0013" => false,
-        b"MDLV0023" => true,
-        other => bail!("not a puppet model ({})", String::from_utf8_lossy(other)),
-    };
+    if &magic[..4] != b"MDLV" {
+        bail!("not a puppet model ({})", String::from_utf8_lossy(&magic));
+    }
     read_cstring(&mut cursor)?; // model name, empty throughout the corpus
     cursor.read_u32::<LittleEndian>()?;
     cursor.read_u32::<LittleEndian>()?;
     cursor.read_u32::<LittleEndian>()?;
     read_cstring(&mut cursor)?; // material path, resolved via the model JSON instead
 
-    // The newer container repeats the vertex format immediately before the
-    // buffer, behind 28 bytes that are zero in every corpus model. Only the
-    // low half of the word carries the attribute mask: one model writes it as
-    // `0x0000000f` where the rest write `0x0180000f`.
-    let vertex_size = if lit {
-        skip(&mut cursor, LIT_VERTEX_PREFIX)?;
-        match cursor.read_u32::<LittleEndian>()? & 0xffff {
-            15 => VERTEX_SIZE_LIT,
-            9 => VERTEX_SIZE,
-            other => bail!("unknown puppet vertex format ({other})"),
-        }
-    } else {
-        cursor.read_u32::<LittleEndian>()?;
-        VERTEX_SIZE
-    };
+    // The vertex format comes next, behind a run of zero bytes whose length is
+    // all that separates the container versions: none in `MDLV0013`, four in
+    // `MDLV0016`, twenty-eight in `MDLV0021`/`0023`. Only the low half of the
+    // word carries the attribute mask: one model writes it as `0x0000000f`
+    // where the rest write `0x0180000f`.
+    let layout = vertex_layout(magic, &mut cursor)?;
+    let vertex_size = layout.stride;
 
     let vertex_bytes = cursor.read_u32::<LittleEndian>()? as usize;
     if !vertex_bytes.is_multiple_of(vertex_size) || vertex_bytes / vertex_size > MAX_VERTICES {
@@ -173,16 +165,19 @@ pub fn parse(bytes: &[u8]) -> Result<Puppet> {
         let x = cursor.read_f32::<LittleEndian>()?;
         let y = cursor.read_f32::<LittleEndian>()?;
         cursor.read_f32::<LittleEndian>()?; // z, always 0 for these 2D puppets
-        if vertex_size == VERTEX_SIZE_LIT {
+        if layout.lit {
             skip(&mut cursor, LIT_VERTEX_PREFIX)?; // normal, tangent, handedness
         }
+        // An unskinned vertex rides the first bone rigidly.
         let mut bones = [0i32; 4];
-        let mut weights = [0f32; 4];
-        for bone in &mut bones {
-            *bone = cursor.read_i32::<LittleEndian>()?;
-        }
-        for weight in &mut weights {
-            *weight = cursor.read_f32::<LittleEndian>()?;
+        let mut weights = [1.0, 0.0, 0.0, 0.0];
+        if layout.skinned {
+            for bone in &mut bones {
+                *bone = cursor.read_i32::<LittleEndian>()?;
+            }
+            for weight in &mut weights {
+                *weight = cursor.read_f32::<LittleEndian>()?;
+            }
         }
         let u = cursor.read_f32::<LittleEndian>()?;
         let v = cursor.read_f32::<LittleEndian>()?;
@@ -246,6 +241,42 @@ pub fn parse(bytes: &[u8]) -> Result<Puppet> {
     };
 
     Ok(Puppet { vertices, triangles, bones, animations })
+}
+
+/// How one vertex is laid out, from the container's format word.
+struct VertexLayout {
+    stride: usize,
+    /// Normal, tangent and handedness sit between position and skin.
+    lit: bool,
+    /// Bone indices and weights are present.
+    skinned: bool,
+}
+
+/// Read the vertex format, which sits behind a version-dependent run of words:
+/// none in `MDLV0013`, one in `0016`, seven from `0017` on (a flag word and a
+/// bounding box), measured across 113 models in a real Workshop library. `MDLV0013` writes the word itself as zero and
+/// means a skinned unlit vertex. The low half is the attribute mask (9 unlit,
+/// 15 lit) and `0x0180` in the high half adds the skin; unskinned models are
+/// in the corpus, and their block sizes divide by 20 and 48 exactly.
+fn vertex_layout(magic: [u8; 8], cursor: &mut Cursor<&[u8]>) -> Result<VertexLayout> {
+    let version: u32 = std::str::from_utf8(&magic[4..]).ok().and_then(|digits| digits.parse().ok()).unwrap_or(0);
+    let prefix_words = match version {
+        ..=13 => 0,
+        14..=16 => 1,
+        _ => 7,
+    };
+    skip(cursor, 4 * prefix_words)?;
+    let format = cursor.read_u32::<LittleEndian>()?;
+    if format == 0 && version <= 13 {
+        return Ok(VertexLayout { stride: VERTEX_SIZE, lit: false, skinned: true });
+    }
+    let skinned = format >> 16 & 0x0180 == 0x0180;
+    let (lit, base) = match format & 0xffff {
+        9 => (false, VERTEX_SIZE - SKIN_SIZE),
+        15 => (true, VERTEX_SIZE_LIT - SKIN_SIZE),
+        other => bail!("unknown puppet vertex format ({other})"),
+    };
+    Ok(VertexLayout { stride: base + if skinned { SKIN_SIZE } else { 0 }, lit, skinned })
 }
 
 fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
@@ -623,6 +654,44 @@ fn blend_over(dst: &mut Rgba<u8>, src: [f32; 4]) {
 mod tests {
     use super::*;
 
+    /// The container up to and including the format word, for `version` with
+    /// `prefix` words ahead of it.
+    fn header(version: [u8; 8], prefix: usize, format: u32) -> Vec<u8> {
+        let mut bytes = version.to_vec();
+        bytes.push(0); // model name
+        bytes.extend_from_slice(&[0; 12]);
+        bytes.extend_from_slice(b"materials/a.json\0");
+        bytes.extend(std::iter::repeat_n(0xAB, 4 * prefix)); // not zeros: 0021+ keep a bounding box here
+        bytes.extend_from_slice(&format.to_le_bytes());
+        bytes
+    }
+
+    fn layout_of(bytes: &[u8]) -> VertexLayout {
+        let mut cursor = Cursor::new(bytes);
+        let mut magic = [0u8; 8];
+        cursor.read_exact(&mut magic).expect("magic");
+        read_cstring(&mut cursor).expect("name");
+        skip(&mut cursor, 12).expect("header words");
+        read_cstring(&mut cursor).expect("material");
+        vertex_layout(magic, &mut cursor).expect("a layout")
+    }
+
+    #[test]
+    fn the_format_word_sits_behind_a_version_dependent_prefix() {
+        assert_eq!(layout_of(&header(*b"MDLV0013", 0, 0)).stride, 52, "0013 writes zero and means skinned unlit");
+        assert_eq!(layout_of(&header(*b"MDLV0016", 1, 0x0180_0009)).stride, 52);
+        assert_eq!(layout_of(&header(*b"MDLV0019", 7, 0x0180_000f)).stride, 80);
+        assert_eq!(layout_of(&header(*b"MDLV0023", 7, 0x0180_000f)).stride, 80);
+    }
+
+    #[test]
+    fn a_format_without_the_skin_bit_has_no_bones_or_weights() {
+        let unlit = layout_of(&header(*b"MDLV0016", 1, 0x9));
+        assert_eq!((unlit.stride, unlit.skinned), (20, false), "position and uv only");
+        let lit = layout_of(&header(*b"MDLV0021", 7, 0xf));
+        assert_eq!((lit.stride, lit.lit, lit.skinned), (48, true, false));
+    }
+
     #[test]
     fn affine_inverse_round_trips() {
         let m = affine_mul(
@@ -693,3 +762,4 @@ mod tests {
         assert!((intercept + 7.0).abs() < 1e-3);
     }
 }
+
