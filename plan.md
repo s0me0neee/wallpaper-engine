@@ -1825,6 +1825,57 @@ work through.
 
 ---
 
+### 4.31 What broke inside the scenes that open
+
+§4.30's survey also lists what each opening scene still loses: layers whose
+effect chain will not compile and puppets that fall back to a flat texture.
+Four fixes, each found by grouping those reasons across the 87 scenes. The
+captured corpus is unchanged by all four, because none of its seven scenes hit
+them. That is also why the library, not the corpus, was the place to look.
+
+| fix | measured on the library |
+|---|---|
+| writable shader inputs | dropped effect chains 105 → 61 |
+| `common_composite.h` in the shim | 10 `blur_combine` chains compile |
+| identity effect matrices, resting parallax | 11 `depthparallax` wallpapers stop blanking |
+| every MDLV version | puppets parsed 82 → 103 of 113 |
+
+**Writable inputs.** HLSL treats a shader's inputs as locals, and workshop
+shaders assign to `v_TexCoord` or pass it as an `inout` argument. GLSL rejects
+both. The input keeps its name, since the linker matches stages by it, and
+every use is renamed to a global copied from it at the top of `main`, through
+a macro defined beside the declaration so that an input inside `#if` is copied
+exactly when it exists.
+
+**Header annotations bind.** `blur_combine` includes `common_composite.h`, whose
+uniforms are annotated in the *header* (`g_CompositeColor`, default white).
+Annotations were parsed from a pass's own source only, so that colour would
+have been GL's zero and every such blur black. The parse now follows
+`#include`s into the shim.
+
+**Effect matrices.** `depthparallax` normalises a direction taken from
+`g_EffectTextureProjectionMatrixInverse`. Unset, that matrix is zero, the
+direction is NaN, and so is every coordinate in the pass. The layer comes out
+as a flat wash; in Syndra (3302432630) the character was simply missing.
+An effect pass draws in its own texture space, so these matrices are the
+identity. With the cursor at rest (`g_ParallaxPosition` = centre) the effect
+is then exactly the identity too, as it is in Wallpaper Engine.
+
+**MDLV versions.** The containers differ only in how many words sit between
+the material path and the vertex format word: none in 0013 (which writes the
+word as zero), one in 0016, seven from 0017 on, where they are a flag and a
+bounding box. The word's high half `0x0180` means skinned; unskinned vertices
+are 20 bytes unlit and 48 lit. Every model that parses skins to its exact rest
+mesh at t = 0, and characters that were flat textures (2B in 3018516781, the
+sword dragon in 3233141951) now move and still match their previews.
+
+What the survey still lists, largest first: 44 text layers (a script that
+produces nothing, an empty box, a placeholder value), 50 keyframe-animated
+non-puppet objects in a single wallpaper, and a tail of HLSL-isms, namely
+`rotateVec2` on a `vec4`, `mix(vec4, vec3, float)`, float-to-int, `log10`.
+
+---
+
 ## 5. The `common.h` problem
 
 ### 5.1 What is missing
