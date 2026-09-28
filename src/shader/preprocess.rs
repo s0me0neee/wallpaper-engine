@@ -16,7 +16,7 @@ use anyhow::{Context, Result};
 use glsl_include::Context as Includer;
 use regex::Regex;
 use std::{
-    collections::{BTreeMap, HashMap, HashSet},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     fmt::Write as _,
     sync::{Mutex, OnceLock, PoisonError},
 };
@@ -195,6 +195,53 @@ fn reconcile_varyings(body: &str, produced: &BTreeMap<String, String>) -> String
     body
 }
 
+/// Give every `keyword` input (`varying` in a fragment shader, `attribute` in a
+/// vertex shader) a writable copy.
+///
+/// HLSL treats a shader's inputs as ordinary locals, and workshop shaders write
+/// to them (`v_TexCoord.y = 1.0 - v_TexCoord.y`) or pass them as `inout`
+/// arguments. GLSL makes them read-only and rejects the program, which drops
+/// the layer's whole effect chain; 52 chains across a real Workshop library
+/// failed on exactly this. The input keeps its name, since the linker matches
+/// stages by it, and every use reads a global copied from it at the top of
+/// `main`. The copy is a macro declared beside the input, so an input inside an
+/// `#if` is copied exactly when it exists.
+fn writable_inputs(body: &str, keyword: &str) -> String {
+    #[expect(clippy::unwrap_used, reason = "a fixed pattern around a literal keyword")]
+    let declaration = Regex::new(&format!(r"(?m)^[ \t]*{keyword}\s+(\w+)\s+([A-Za-z_]\w*)\s*;[^\n]*$")).unwrap();
+    let names: BTreeSet<String> = declaration.captures_iter(body).map(|caps| caps[2].to_string()).collect();
+    #[expect(clippy::unwrap_used, reason = "a fixed literal pattern")]
+    let main = Regex::new(r"void\s+main\s*\(\s*(?:void)?\s*\)\s*\{").unwrap();
+    if names.is_empty() || !main.is_match(body) {
+        return body.to_string();
+    }
+
+    let mut out = body.to_string();
+    for name in &names {
+        out = replace_word(&out, name, &format!("we_mut_{name}"));
+    }
+    #[expect(clippy::unwrap_used, reason = "a fixed pattern around a literal keyword")]
+    let renamed = Regex::new(&format!(r"(?m)^[ \t]*{keyword}\s+(\w+)\s+we_mut_([A-Za-z_]\w*)\s*;[^\n]*$")).unwrap();
+    out = renamed
+        .replace_all(&out, |caps: &regex::Captures| {
+            let (kind, name) = (&caps[1], &caps[2]);
+            format!(
+                "{keyword} {kind} {name};\n{kind} we_mut_{name};\n#ifndef WE_COPY_{name}\n#define WE_COPY_{name} we_mut_{name} = {name};\n#endif"
+            )
+        })
+        .into_owned();
+
+    let mut copies = String::new();
+    for name in &names {
+        // Infallible: writing into a String never fails.
+        let _ = write!(copies, "\n#ifdef WE_COPY_{name}\nWE_COPY_{name}\n#endif");
+    }
+    match main.find(&out) {
+        Some(found) => format!("{}{copies}\n{}", &out[..found.end()], &out[found.end()..]),
+        None => out,
+    }
+}
+
 /// Every macro name the shim headers define, function-like ones included.
 fn shim_macros(headers: &HashMap<String, String>) -> HashSet<String> {
     headers
@@ -234,7 +281,11 @@ fn assemble(body: &str, stage: Stage, combos: &BTreeMap<String, i64>) -> String 
         Stage::Fragment => "in",
     };
 
-    let mut body = replace_word(body, "attribute", "in");
+    let body = match stage {
+        Stage::Vertex => writable_inputs(body, "attribute"),
+        Stage::Fragment => writable_inputs(body, "varying"),
+    };
+    let mut body = replace_word(&body, "attribute", "in");
     body = replace_word(&body, "varying", varying);
 
     // The combo defines lead the body rather than the output, because a combo
@@ -297,6 +348,26 @@ mod tests {
             .iter()
             .map(|(name, value)| (name.to_string(), *value))
             .collect()
+    }
+
+    #[test]
+    fn a_fragment_input_is_read_through_a_writable_copy() {
+        let source = "varying vec2 v_TexCoord; // {\"hidden\":true}\nvoid main() {\n\tv_TexCoord.y = 1.0 - v_TexCoord.y;\n}\n";
+        let out = assemble(source, Stage::Fragment, &BTreeMap::new());
+        assert!(out.contains("in vec2 v_TexCoord;"), "the input keeps its name for the linker:\n{out}");
+        assert!(out.contains("vec2 we_mut_v_TexCoord;"));
+        assert!(out.contains("we_mut_v_TexCoord.y = 1.0 - we_mut_v_TexCoord.y;"));
+        let copy = out.find("WE_COPY_v_TexCoord\n#endif").expect("copied in main");
+        assert!(copy > out.find("void main()").expect("main"), "the copy runs inside main");
+    }
+
+    #[test]
+    fn a_conditional_input_is_copied_only_when_declared() {
+        let source = "#if MASK\nvarying vec2 v_Mask;\n#endif\nvoid main() {}\n";
+        let out = assemble(source, Stage::Fragment, &BTreeMap::new());
+        let define = out.find("#define WE_COPY_v_Mask").expect("defined");
+        assert!(define < out.find("#endif").expect("the #if closes"), "the copy macro sits inside the #if");
+        assert!(out.contains("#ifdef WE_COPY_v_Mask\nWE_COPY_v_Mask\n#endif"));
     }
 
     #[test]
