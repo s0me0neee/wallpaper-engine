@@ -33,6 +33,7 @@ pub fn headers() -> HashMap<String, String> {
         ("common_fragment.h", include_str!("glsl/common_fragment.glsl")),
         ("common_blending.h", include_str!("glsl/common_blending.glsl")),
         ("common_blur.h", include_str!("glsl/common_blur.glsl")),
+        ("common_composite.h", include_str!("glsl/common_composite.glsl")),
         (
             "common_perspective.h",
             include_str!("glsl/common_perspective.glsl"),
@@ -41,6 +42,34 @@ pub fn headers() -> HashMap<String, String> {
     .into_iter()
     .map(|(name, text)| (name.to_string(), text.to_string()))
     .collect()
+}
+
+/// `source` followed by every header it includes, transitively, for annotation
+/// parsing: a header can declare annotated uniforms (`common_composite.h`'s
+/// `g_CompositeColor`, default white) that a pass must still bind.
+pub fn with_includes(source: &str, headers: &HashMap<String, String>) -> String {
+    let mut out = source.to_string();
+    let mut seen = std::collections::HashSet::new();
+    let mut pending: Vec<String> = included_names(source);
+    while let Some(name) = pending.pop() {
+        if !seen.insert(name.clone()) {
+            continue;
+        }
+        if let Some(text) = headers.get(&name) {
+            pending.extend(included_names(text));
+            out.push('\n');
+            out.push_str(text);
+        }
+    }
+    out
+}
+
+fn included_names(source: &str) -> Vec<String> {
+    source
+        .lines()
+        .filter_map(|line| line.trim_start().strip_prefix("#include")?.trim().strip_prefix('"')?.split('"').next())
+        .map(str::to_string)
+        .collect()
 }
 
 /// Replace shim headers with the real ones from a Wallpaper Engine install.
@@ -84,6 +113,16 @@ mod tests {
     use super::*;
     use crate::shader::preprocess::{Stage, build};
     use std::collections::BTreeMap;
+
+    /// `blur_combine` includes `common_composite.h`, whose `g_CompositeColor`
+    /// defaults to white; unbound it is GL's zero and the blur comes out black.
+    #[test]
+    fn a_header_uniform_carries_its_annotated_default() {
+        let source = "#include \"common_composite.h\"\nvoid main() {}\n";
+        let declared = crate::shader::annotations::parse(&with_includes(source, &headers()));
+        let color = declared.uniforms.iter().find(|uniform| uniform.name == "g_CompositeColor").expect("declared");
+        assert_eq!(color.default, Some(serde_json::Value::from("1 1 1")));
+    }
 
     fn expand(source: &str, stage: Stage) -> String {
         build(source, stage, &headers(), &BTreeMap::new()).unwrap()

@@ -404,8 +404,8 @@ pub fn prepare_effect_chain(
                 let fragment_source = String::from_utf8(archive.read(&format!("{stem}.frag"))?)
                     .with_context(|| format!("{stem}.frag is not valid UTF-8"))?;
 
-                let vertex_declarations = annotations::parse(&vertex_source);
-                let fragment_declarations = annotations::parse(&fragment_source);
+                let vertex_declarations = annotations::parse(&shim::with_includes(&vertex_source, headers));
+                let fragment_declarations = annotations::parse(&shim::with_includes(&fragment_source, headers));
 
                 // A combo's `[COMBO]` default is usually declared in one stage
                 // (typically the fragment) but governs both. `godrays_downsample2`
