@@ -125,7 +125,8 @@ pub fn render_frame(
 ) -> Result<Composite> {
     #[expect(clippy::cast_possible_truncation, reason = "a wallpaper's timestamp is always a few seconds at most")]
     let time = time as f32;
-    let mut layered = compose::prepare(archive, scene, assets, resolution, time)?;
+    // A still is the whole canvas: nothing here has a screen to be cropped to.
+    let mut layered = compose::prepare(archive, scene, assets, resolution, compose::Framing::Whole, time)?;
 
     let effected: Vec<usize> = layered
         .layers

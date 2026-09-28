@@ -59,6 +59,8 @@ pub fn run(
     assets: Option<&Path>,
     title: &str,
     presentation: Presentation,
+    fps: Option<f32>,
+    scale: Option<f32>,
 ) -> Result<()> {
     // The groundwork is deliberately *not* done here: which resolution to
     // decode at depends on the monitor, and only an `ActiveEventLoop` can name
@@ -71,6 +73,8 @@ pub fn run(
         scene,
         assets: assets.map(Path::to_path_buf),
         presentation,
+        fps,
+        scale,
         static_scene: None,
         headers: shim::headers(),
         start: Instant::now(),
@@ -85,6 +89,10 @@ struct App<'a> {
     scene: &'a Scene,
     assets: Option<PathBuf>,
     presentation: Presentation,
+    /// `--fps`; `None` takes the display's refresh rate, `Some(0.0)` uncaps.
+    fps: Option<f32>,
+    /// `--scale`; `None` fits the canvas to the display.
+    scale: Option<f32>,
     /// Built by `open_window`, once the monitor it will render for is known.
     static_scene: Option<compose::StaticScene<'a>>,
     headers: HashMap<String, String>,
@@ -398,6 +406,18 @@ struct State {
     content_size: (u32, u32),
     /// How `content_size` meets a window of a different shape.
     fit: pass::Fit,
+    /// The window server says nothing of this window is visible — a maximized
+    /// window over the desktop, another Space, a sleeping display. Rendering
+    /// into it produces pixels nobody can see, so the loop stops asking for
+    /// frames and sleeps until that changes. `g_Time` stays on the wall clock,
+    /// so whatever comes back is the frame the scene would have reached anyway.
+    occluded: bool,
+    /// Shortest gap between frames, or `None` to draw as fast as the scene
+    /// allows. Vsync does not enforce this for us — measured at 120 fps on a
+    /// display that cannot show them — so the loop sleeps instead.
+    min_frame: Option<Duration>,
+    /// When the last frame started, for `min_frame` to measure from.
+    last_frame: Instant,
     background: [f32; 4],
     layers: Vec<LiveLayer>,
     /// `None` on the desktop background, which is click-through and so has
@@ -442,29 +462,57 @@ fn rect_of(left: i64, top: i64, image: &RgbaImage) -> (i32, i32, i32, i32) {
 /// has to magnify: a 16:9 canvas on the 3420x2214 screen of §14.4 renders at
 /// 3420x1924 under `Contain` and is blown back up to 3936x2214 to cover.
 ///
-/// `SIMULATE_SCALE=<factor>` overrides it, which is how a render at one scale
-/// is compared against the same frame at another without moving machines.
-fn render_resolution(canvas: (u32, u32), monitor: Option<(u32, u32)>, fit: pass::Fit) -> Option<Resolution> {
-    match std::env::var("SIMULATE_SCALE").ok().and_then(|value| value.parse::<f32>().ok()) {
-        Some(scale) => scaled_resolution(canvas, scale),
-        None => scaled_resolution(canvas, fit_scale(canvas, monitor?, fit)),
+/// `--scale`, or `SIMULATE_SCALE=<factor>`, overrides it. Both stay a fraction
+/// of the *authored canvas* in either mode, because §4.22's whole comparison
+/// method is pinned to `SIMULATE_SCALE=1` meaning the authored canvas — so an
+/// explicit scale also gives up the background's crop, and renders the parts
+/// of the canvas that fall off-screen like the window does.
+fn render_resolution(
+    canvas: (u32, u32),
+    monitor: Option<(u32, u32)>,
+    presentation: Presentation,
+    scale: Option<f32>,
+) -> Option<Resolution> {
+    let requested = scale.or_else(|| std::env::var("SIMULATE_SCALE").ok().and_then(|value| value.parse().ok()));
+    if let Some(scale) = requested {
+        return scaled_resolution(canvas, scale);
+    }
+    let (monitor_w, monitor_h) = monitor?;
+    match presentation {
+        // The screen, exactly: one rendered pixel per pixel it can show, and
+        // `Framing::Cover` crops away the rest of the canvas rather than
+        // drawing it to be thrown out at the window's edge.
+        Presentation::Background => Some(Resolution { width: monitor_w, height: monitor_h }),
+        // A window is free to letterbox, so the whole canvas is kept and
+        // scaled down to fit inside the display.
+        Presentation::Window => {
+            scaled_resolution(canvas, fit_scale(canvas, (monitor_w, monitor_h)))
+        }
     }
 }
 
-/// The uniform scale that fits `canvas` to `monitor`: the tighter of the two
-/// ratios to keep all of it on screen, the looser to leave none of the screen
-/// uncovered. Either way the aspect ratio survives on a canvas that is not the
+/// How the render target relates to the canvas, per mode — the sizing half of
+/// `screen_fit`'s presentation half, and it has to agree with it.
+fn framing(presentation: Presentation) -> compose::Framing {
+    match presentation {
+        Presentation::Window => compose::Framing::Whole,
+        Presentation::Background => compose::Framing::Cover,
+    }
+}
+
+/// The uniform scale that fits all of `canvas` inside `monitor` — the tighter
+/// of the two ratios, so the aspect ratio survives on a canvas that is not the
 /// display's (`scene_example5` is 5824x3264, which is not 16:9).
+///
+/// Only the window wants this. A background does not scale the canvas to the
+/// screen at all; it takes the screen as its target and lets `Framing::Cover`
+/// crop the canvas to it (§14.6), which is why there is no `Cover` arm here.
 #[expect(clippy::cast_precision_loss, reason = "display and canvas dimensions, nowhere near 2^24")]
-fn fit_scale((canvas_w, canvas_h): (u32, u32), (mon_w, mon_h): (u32, u32), fit: pass::Fit) -> f32 {
+fn fit_scale((canvas_w, canvas_h): (u32, u32), (mon_w, mon_h): (u32, u32)) -> f32 {
     if canvas_w == 0 || canvas_h == 0 {
         return 1.0;
     }
-    let (by_width, by_height) = (mon_w as f32 / canvas_w as f32, mon_h as f32 / canvas_h as f32);
-    match fit {
-        pass::Fit::Contain => by_width.min(by_height),
-        pass::Fit::Cover => by_width.max(by_height),
-    }
+    (mon_w as f32 / canvas_w as f32).min(mon_h as f32 / canvas_h as f32)
 }
 
 /// `canvas` at `scale`, or `None` when that is not a reduction worth making.
@@ -480,6 +528,24 @@ fn scaled_resolution(canvas: (u32, u32), scale: f32) -> Option<Resolution> {
     }
     let side = |side: u32| -> u32 { ((side as f32 * scale).round() as u32).max(1) };
     Some(Resolution { width: side(canvas.0), height: side(canvas.1) })
+}
+
+/// The shortest gap between frames, from an explicit `--fps` or, failing that,
+/// the display's own refresh rate.
+///
+/// Defaulting to the refresh rate is not a quality tradeoff: a frame drawn
+/// between two refreshes is never scanned out, so the work that made it is
+/// discarded in full. `scene_example2` at quarter scale measured 120 fps on a
+/// 60 Hz panel — half of every frame's GPU time and power spent on pixels the
+/// display had no opportunity to show. `Some(0.0)` asks for no cap at all.
+fn frame_interval(requested: Option<f32>, screen: Option<&MonitorHandle>) -> Option<Duration> {
+    let hz = match requested {
+        Some(fps) if fps <= 0.0 => return None,
+        Some(fps) => fps,
+        #[expect(clippy::cast_precision_loss, reason = "a refresh rate in millihertz, nowhere near 2^24")]
+        None => screen?.refresh_rate_millihertz()? as f32 / 1000.0,
+    };
+    (hz > 0.0).then(|| Duration::from_secs_f32(1.0 / hz))
 }
 
 /// How a canvas that is not the screen's shape meets the screen.
@@ -590,12 +656,17 @@ impl App<'_> {
             (size.width, size.height)
         });
         let fit = screen_fit(self.presentation);
-        let resolution = render_resolution((ortho.width, ortho.height), monitor, fit);
+        let min_frame = frame_interval(self.fps, screen.as_ref());
+        match min_frame {
+            Some(gap) => println!("  capped at {:.0} fps", 1.0 / gap.as_secs_f32()),
+            None => println!("  uncapped — drawing frames the display may never show"),
+        }
+        let resolution = render_resolution((ortho.width, ortho.height), monitor, self.presentation, self.scale);
         if let Some(resolution) = resolution {
             println!("  rendering at {resolution} for a {}x{} canvas", ortho.width, ortho.height);
         }
         let static_scene =
-            compose::prepare_static(self.archive, self.scene, self.assets.as_deref(), resolution)?;
+            compose::prepare_static(self.archive, self.scene, self.assets.as_deref(), resolution, framing(self.presentation))?;
         // Everything the window and its targets need is read out here, before
         // the scene is parked: `build_layers` below takes `self` mutably.
         let (width, height) = (static_scene.width, static_scene.height);
@@ -643,6 +714,9 @@ impl App<'_> {
             camera,
             content_size: (width, height),
             fit,
+            occluded: false,
+            min_frame,
+            last_frame: Instant::now(),
             background,
             layers,
             egui,
@@ -1209,14 +1283,24 @@ fn redraw(app: &mut App, time: f32) -> Result<bool> {
         }
     }
 
+    let present_start = Instant::now();
     let size = state.window.inner_size();
+    let sized = present_start.elapsed();
     #[expect(clippy::cast_possible_wrap, reason = "window dimensions are nowhere near i32::MAX")]
     let window = (size.width as i32, size.height as i32);
     pass::blit_to_screen(&state.gl, &state.blit, &state.display_quad, state.composite.texture, state.content_size, window, state.fit);
     if let Some(egui) = &mut state.egui {
         egui.paint(&state.window);
     }
+    // Timed separately from `gpu` above, which only counts issuing the commands
+    // — GL runs them asynchronously, so this is where the GPU is actually
+    // waited on, and where vsync sleeps. The two together are what says whether
+    // a slow frame is real work or an idle wait for the display.
+    let swap_start = Instant::now();
+    state.frames_since.present += swap_start - present_start;
+    state.frames_since.sized += sized;
     state.surface.swap_buffers(&state.context).context("swapping buffers")?;
+    state.frames_since.swap += swap_start.elapsed();
 
     report_fps(&mut state.frames_since);
     Ok(false)
@@ -1328,11 +1412,27 @@ struct FrameStats {
     cpu: Duration,
     upload: Duration,
     gpu: Duration,
+    swap: Duration,
+    present: Duration,
+    sized: Duration,
+    /// The whole of `redraw`, so whatever the four buckets above do not cover
+    /// is attributable rather than just missing.
+    frame: Duration,
 }
 
 impl FrameStats {
     fn new() -> Self {
-        FrameStats { since: Instant::now(), frames: 0, cpu: Duration::ZERO, upload: Duration::ZERO, gpu: Duration::ZERO }
+        FrameStats {
+            since: Instant::now(),
+            frames: 0,
+            cpu: Duration::ZERO,
+            upload: Duration::ZERO,
+            gpu: Duration::ZERO,
+            swap: Duration::ZERO,
+            present: Duration::ZERO,
+            sized: Duration::ZERO,
+            frame: Duration::ZERO,
+        }
     }
 }
 
@@ -1347,7 +1447,15 @@ fn report_fps(stats: &mut FrameStats) {
         let cpu = stats.cpu.as_secs_f64() * 1000.0 / frames;
         let gpu = stats.gpu.as_secs_f64() * 1000.0 / frames;
         let upload = stats.upload.as_secs_f64() * 1000.0 / frames;
-        println!("  {fps:.0} fps  (cpu {cpu:.0} ms, upload {upload:.0} ms, gpu {gpu:.0} ms)");
+        let swap = stats.swap.as_secs_f64() * 1000.0 / frames;
+        // Whatever the frame period is that `redraw` did not spend: the event
+        // loop's own round trip.
+        let loop_ms = (elapsed.as_secs_f64() - stats.frame.as_secs_f64()) * 1000.0 / frames;
+        let present = stats.present.as_secs_f64() * 1000.0 / frames;
+        let sized = stats.sized.as_secs_f64() * 1000.0 / frames;
+        println!(
+            "  {fps:.0} fps  (cpu {cpu:.1}, upload {upload:.1}, gpu {gpu:.1}, present {present:.1} [sized {sized:.1}], swap {swap:.1}, loop {loop_ms:.1} ms)"
+        );
         *stats = FrameStats::new();
     }
 }
@@ -1456,6 +1564,14 @@ impl ApplicationHandler for App<'_> {
             {
                 event_loop.exit();
             }
+            WindowEvent::Occluded(occluded) => {
+                if let Some(state) = &mut self.state {
+                    state.occluded = occluded;
+                    // The fps line stops while paused, so say why rather than
+                    // leaving it looking hung.
+                    println!("  {}", if occluded { "hidden — paused" } else { "visible — resumed" });
+                }
+            }
             WindowEvent::Resized(size) => {
                 if let (Some(width), Some(height), Some(state)) =
                     (NonZeroU32::new(size.width), NonZeroU32::new(size.height), &self.state)
@@ -1468,7 +1584,13 @@ impl ApplicationHandler for App<'_> {
                     .ok()
                     .and_then(|value| value.parse().ok())
                     .unwrap_or_else(|| self.start.elapsed().as_secs_f32());
-                match redraw(self, time) {
+                let started = Instant::now();
+                let drawn = redraw(self, time);
+                if let Some(state) = &mut self.state {
+                    state.frames_since.frame += started.elapsed();
+                    state.last_frame = started;
+                }
+                match drawn {
                     Ok(true) => event_loop.exit(),
                     Ok(false) => {}
                     Err(error) => {
@@ -1481,10 +1603,27 @@ impl ApplicationHandler for App<'_> {
         }
     }
 
-    fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
-        if let Some(state) = &self.state {
-            state.window.request_redraw();
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        let Some(state) = &self.state else { return };
+        if state.occluded {
+            // `Wait` actually sleeps the thread, where `Poll` would spin
+            // through the run loop for frames nobody would see. The
+            // un-occlusion event is itself what wakes it.
+            event_loop.set_control_flow(ControlFlow::Wait);
+            return;
         }
+        // Sleeping until the next frame is due is the whole saving: `Poll`
+        // would return here immediately and draw a frame the display cannot
+        // show, at full GPU cost.
+        if let Some(gap) = state.min_frame {
+            let due = state.last_frame + gap;
+            if Instant::now() < due {
+                event_loop.set_control_flow(ControlFlow::WaitUntil(due));
+                return;
+            }
+        }
+        event_loop.set_control_flow(ControlFlow::Poll);
+        state.window.request_redraw();
     }
 
     fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
@@ -1498,12 +1637,13 @@ impl ApplicationHandler for App<'_> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Presentation, fit_scale, scaled_resolution, screen_fit};
+    use super::{Presentation, fit_scale, framing, frame_interval, render_resolution, scaled_resolution, screen_fit};
     use crate::render::pass::Fit;
+    use crate::scene::compose::Framing;
 
     #[test]
     fn a_4k_canvas_on_a_1080p_display_renders_at_the_display() {
-        let scale = fit_scale((3840, 2160), (1920, 1080), Fit::Contain);
+        let scale = fit_scale((3840, 2160), (1920, 1080));
         assert!((scale - 0.5).abs() < 1e-6, "{scale}");
         let resolution = scaled_resolution((3840, 2160), scale).expect("a reduction");
         assert_eq!((resolution.width, resolution.height), (1920, 1080));
@@ -1513,23 +1653,69 @@ mod tests {
     /// it by width alone would push it off the bottom of the display.
     #[test]
     fn a_canvas_that_is_not_the_display_aspect_fits_by_its_tighter_side() {
-        let scale = fit_scale((5824, 3264), (1920, 1080), Fit::Contain);
+        let scale = fit_scale((5824, 3264), (1920, 1080));
         assert!((scale - 1920.0 / 5824.0).abs() < 1e-6, "{scale}");
         let resolution = scaled_resolution((5824, 3264), scale).expect("a reduction");
         assert_eq!(resolution.width, 1920);
         assert!(resolution.height <= 1080, "{resolution}");
     }
 
-    /// The background's opposite: on the 3420x2214 screen §14.4 was measured
-    /// on, `Contain` renders 3420x1924 and leaves a bar, so the wallpaper takes
-    /// the looser ratio — here above 1.0, which `scaled_resolution` then caps
-    /// back to the full authored canvas rather than upscaling before the blit.
+    /// The two modes size their target from different things entirely: the
+    /// window from the canvas (fitted into the display), the background from
+    /// the display itself. On the 3420x2214 screen §14.4 was measured on, that
+    /// is 3420x1924 against 3420x2214 — the background renders fewer pixels
+    /// than the 3840x2160 canvas *and* shows them 1:1, because `Framing::Cover`
+    /// throws the off-screen part away instead of rendering it (§14.6).
     #[test]
-    fn a_background_scales_to_cover_the_screen_rather_than_fit_inside_it() {
-        let screen = (3420, 2214);
-        assert!(fit_scale((3840, 2160), screen, Fit::Contain) < 1.0);
-        assert!(fit_scale((3840, 2160), screen, Fit::Cover) > 1.0);
-        assert!(scaled_resolution((3840, 2160), fit_scale((3840, 2160), screen, Fit::Cover)).is_none());
+    fn a_background_renders_the_screen_and_a_window_renders_the_canvas() {
+        let screen = Some((3420, 2214));
+        let canvas = (3840, 2160);
+
+        let background = render_resolution(canvas, screen, Presentation::Background, None).expect("a target");
+        assert_eq!((background.width, background.height), (3420, 2214), "the screen, exactly");
+        assert!(background.width * background.height < canvas.0 * canvas.1, "fewer pixels than the canvas");
+
+        let window = render_resolution(canvas, screen, Presentation::Window, None).expect("a target");
+        assert_eq!(window.width, 3420, "the canvas fitted by its tighter side");
+        assert!(window.height < 2214, "which leaves the bar the window is allowed to have");
+    }
+
+    /// An explicit scale gives up the crop — it is a fraction of the authored
+    /// canvas in both modes, because §4.22's method depends on that meaning.
+    #[test]
+    fn an_explicit_scale_is_a_fraction_of_the_canvas_in_either_mode() {
+        let screen = Some((3420, 2214));
+        for mode in [Presentation::Background, Presentation::Window] {
+            let target = render_resolution((3840, 2160), screen, mode, Some(0.5)).expect("a target");
+            assert_eq!((target.width, target.height), (1920, 1080));
+        }
+    }
+
+    #[test]
+    fn only_the_background_crops() {
+        assert!(framing(Presentation::Window) == Framing::Whole);
+        assert!(framing(Presentation::Background) == Framing::Cover);
+    }
+
+    /// `--fps 0` is the documented way to ask for no cap, and must not be
+    /// confused with "no `--fps` given", which takes the display's rate.
+    #[test]
+    fn an_explicit_zero_fps_means_uncapped() {
+        assert!(frame_interval(Some(0.0), None).is_none());
+        assert!(frame_interval(Some(-1.0), None).is_none());
+    }
+
+    #[test]
+    fn an_explicit_rate_is_its_own_reciprocal() {
+        let gap = frame_interval(Some(30.0), None).expect("a cap");
+        assert!((gap.as_secs_f32() - 1.0 / 30.0).abs() < 1e-6, "{gap:?}");
+    }
+
+    /// With no flag and no monitor to ask, there is nothing to derive a cap
+    /// from — the loop must draw rather than stall on a zero-length interval.
+    #[test]
+    fn no_flag_and_no_monitor_leaves_the_rate_uncapped() {
+        assert!(frame_interval(None, None).is_none());
     }
 
     #[test]
@@ -1540,9 +1726,8 @@ mod tests {
 
     #[test]
     fn a_canvas_the_display_can_already_show_is_left_alone() {
-        let contain = |canvas, monitor| fit_scale(canvas, monitor, Fit::Contain);
-        assert!(scaled_resolution((1920, 1080), contain((1920, 1080), (3840, 2160))).is_none());
-        assert!(scaled_resolution((1920, 1080), contain((1920, 1080), (1920, 1080))).is_none());
+        assert!(scaled_resolution((1920, 1080), fit_scale((1920, 1080), (3840, 2160))).is_none());
+        assert!(scaled_resolution((1920, 1080), fit_scale((1920, 1080), (1920, 1080))).is_none());
     }
 
     #[test]

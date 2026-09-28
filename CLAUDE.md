@@ -51,6 +51,24 @@ macOS only — the other platforms need a different mechanism entirely and it sa
 opening an ordinary window. It has no title bar and never becomes key, so Ctrl-C in its terminal is
 how it stops.
 
+Both live subcommands take `--fps` and `--scale`, and both pause entirely while the window is
+occluded (plan.md §14.5). The frame rate defaults to the display's refresh rate because vsync does
+*not* enforce one here — uncapped, `scene_example2` measured 120 fps on a 60 Hz panel, i.e. half of
+every frame's GPU time spent on pixels the display had no opportunity to scan out. `--fps 0` removes
+the cap; `--scale` trades sharpness for frames and is the only lever that helps a GPU-bound scene.
+
+The two modes size their render target from different things (§14.6). `desktop` takes **the screen**
+as its target and crops the canvas to it (`compose::Framing::Cover`), so it covers the screen 1:1 and
+never renders the part of the canvas that falls outside it. `simulate` takes the **canvas**, fitted
+inside the display by its tighter side (`Framing::Whole`), and lets the window letterbox. `--scale`
+and `SIMULATE_SCALE` stay a fraction of the *authored canvas* in both modes — §4.22's comparison
+method depends on `SIMULATE_SCALE=1` meaning exactly that — so passing either gives up the crop.
+
+The fps line accounts for the *whole* frame — `cpu` (which nests `upload`), `gpu`, `present`, `swap`
+and `loop`. `gpu` is only the cost of *issuing* commands; because GL is asynchronous, the GPU is
+actually waited on at `present`, the first touch of the default framebuffer. A frame that is slow
+with a large `present` is GPU-bound on scene work, not on the blit.
+
 `simulate` has a headless dump hook, which is the fastest way to verify a rendering change:
 
 ```bash

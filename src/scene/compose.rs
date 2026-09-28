@@ -155,27 +155,57 @@ struct Canvas {
     scale: f32,
     width: u32,
     height: u32,
+    /// Top-left of the render target within the scaled canvas. Non-zero only
+    /// under `Framing::Cover`, where the target is a crop of the canvas and
+    /// everything outside it is never drawn.
+    offset: (f32, f32),
 }
 
-fn canvas_for(ortho: Orthographic, resolution: Option<Resolution>) -> Result<Canvas> {
+/// How the render target relates to the authored canvas.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Framing {
+    /// The target *is* the canvas, scaled uniformly from the width. Anything
+    /// the canvas does not fill is the caller's to letterbox. What `export`
+    /// wants, and what a window wants.
+    Whole,
+    /// The target is a *crop* of the canvas, scaled to leave no edge of it
+    /// uncovered. What a wallpaper wants: it has to reach every corner of a
+    /// screen that is not the canvas's shape, and the part of the canvas that
+    /// falls outside the screen is never rendered rather than rendered and
+    /// thrown away.
+    Cover,
+}
+
+fn canvas_for(ortho: Orthographic, resolution: Option<Resolution>, framing: Framing) -> Result<Canvas> {
     if ortho.width == 0 || ortho.height == 0 {
         bail!("scene has an empty {}x{} canvas", ortho.width, ortho.height);
     }
 
+    let Some(target) = resolution else {
+        return Ok(Canvas { ortho, scale: 1.0, width: ortho.width, height: ortho.height, offset: (0.0, 0.0) });
+    };
+
     // Both sides are image dimensions, always far below f32's 2^24 exact-
     // integer range, so the conversion loses no precision in practice.
     #[expect(clippy::cast_precision_loss, reason = "image dimensions, nowhere near 2^24")]
-    let (width, height, scale) = match resolution {
-        Some(target) => {
-            // Uniform scale from the width; a request with a different aspect
-            // ratio letterboxes rather than stretching the art.
-            let scale = target.width as f32 / ortho.width as f32;
-            (target.width, target.height, scale)
+    let (canvas_w, canvas_h, target_w, target_h) =
+        (ortho.width as f32, ortho.height as f32, target.width as f32, target.height as f32);
+    let (by_width, by_height) = (target_w / canvas_w, target_h / canvas_h);
+
+    let (scale, offset) = match framing {
+        // Uniform scale from the width; a request with a different aspect
+        // ratio letterboxes rather than stretching the art.
+        Framing::Whole => (by_width, (0.0, 0.0)),
+        // The looser of the two ratios is the one that leaves no edge short.
+        // Whatever the scaled canvas then has beyond the target is off-screen,
+        // split evenly between the two opposite edges.
+        Framing::Cover => {
+            let scale = by_width.max(by_height);
+            (scale, ((canvas_w * scale - target_w) / 2.0, (canvas_h * scale - target_h) / 2.0))
         }
-        None => (ortho.width, ortho.height, 1.0),
     };
 
-    Ok(Canvas { ortho, scale, width, height })
+    Ok(Canvas { ortho, scale, width: target.width, height: target.height, offset })
 }
 
 /// Scene units to output pixels.
@@ -186,7 +216,7 @@ fn canvas_for(ortho: Orthographic, resolution: Option<Resolution>) -> Result<Can
 fn to_pixels(canvas: &Canvas, world_x: f32, world_y: f32) -> (f32, f32) {
     #[expect(clippy::cast_precision_loss, reason = "image dimensions, nowhere near 2^24")]
     let height = canvas.ortho.height as f32;
-    (world_x * canvas.scale, (height - world_y) * canvas.scale)
+    (world_x * canvas.scale - canvas.offset.0, (height - world_y) * canvas.scale - canvas.offset.1)
 }
 
 /// An object's base texture plus the two things the material tells us about
@@ -776,9 +806,10 @@ pub fn prepare<'a>(
     scene: &'a Scene,
     assets: Option<&Path>,
     resolution: Option<Resolution>,
+    framing: Framing,
     time: f32,
 ) -> Result<Layered<'a>> {
-    let static_scene = prepare_static(archive, scene, assets, resolution)?;
+    let static_scene = prepare_static(archive, scene, assets, resolution, framing)?;
     Ok(animate(archive, &static_scene, time))
 }
 
@@ -790,12 +821,13 @@ pub fn prepare_static<'a>(
     scene: &'a Scene,
     assets: Option<&Path>,
     resolution: Option<Resolution>,
+    framing: Framing,
 ) -> Result<StaticScene<'a>> {
     let ortho = scene
         .general
         .orthographic
         .context("scene has no orthographic projection, so it is not a flat wallpaper")?;
-    let canvas = canvas_for(ortho, resolution)?;
+    let canvas = canvas_for(ortho, resolution, framing)?;
 
     let mut items = Vec::new();
     let mut omissions = Vec::new();
@@ -1094,7 +1126,7 @@ mod tests {
     use crate::scene::model::Orthographic;
 
     fn canvas(width: u32, height: u32, resolution: Option<Resolution>) -> Canvas {
-        canvas_for(Orthographic { width, height }, resolution).unwrap()
+        canvas_for(Orthographic { width, height }, resolution, Framing::Whole).unwrap()
     }
 
     /// The anchor of a parentless object: its own transform, unmodified.
@@ -1191,8 +1223,44 @@ mod tests {
 
     #[test]
     fn an_empty_canvas_is_rejected() {
-        assert!(canvas_for(Orthographic { width: 0, height: 1080 }, None).is_err());
-        assert!(canvas_for(Orthographic { width: 1920, height: 0 }, None).is_err());
+        assert!(canvas_for(Orthographic { width: 0, height: 1080 }, None, Framing::Whole).is_err());
+        assert!(canvas_for(Orthographic { width: 1920, height: 0 }, None, Framing::Whole).is_err());
+    }
+
+    /// The wallpaper case (plan.md §14.6): a 16:9 canvas on the 3420x2214
+    /// screen §14.4 was measured on. The target is the screen exactly, and the
+    /// 516 canvas pixels that fall outside it are cropped away rather than
+    /// rendered — so the scale is the *looser* ratio and the left edge of the
+    /// canvas lands off-target at x = -258.
+    #[test]
+    fn covering_a_screen_crops_the_canvas_instead_of_rendering_past_it() {
+        let screen = Resolution { width: 3420, height: 2214 };
+        let canvas = canvas_for(Orthographic { width: 3840, height: 2160 }, Some(screen), Framing::Cover)
+            .expect("a valid canvas");
+
+        assert_eq!((canvas.width, canvas.height), (3420, 2214), "the target is the screen, 1:1");
+        assert!((canvas.scale - 2214.0 / 2160.0).abs() < 1e-6, "{}", canvas.scale);
+        assert!((canvas.offset.0 - 258.0).abs() < 0.5, "{:?}", canvas.offset);
+        assert!(canvas.offset.1.abs() < 0.5, "height is the binding side, so no vertical crop");
+
+        // The canvas's own left and right edges sit symmetrically outside it,
+        // which is what "covered, with nothing rendered off-screen" means.
+        let (left, _) = to_pixels(&canvas, 0.0, 0.0);
+        let (right, _) = to_pixels(&canvas, 3840.0, 0.0);
+        assert!(left < 0.0 && right > 3420.0, "{left} .. {right}");
+        assert!((left + (right - 3420.0)).abs() < 1.0, "the crop is centred: {left} vs {right}");
+    }
+
+    /// `Cover` on a screen that *is* the canvas's shape must be a no-op, or
+    /// every ordinary 16:9 display would be paying for a crop it does not need.
+    #[test]
+    fn covering_a_matching_aspect_crops_nothing() {
+        let target = Resolution { width: 1920, height: 1080 };
+        let canvas = canvas_for(Orthographic { width: 3840, height: 2160 }, Some(target), Framing::Cover)
+            .expect("a valid canvas");
+        assert!((canvas.scale - 0.5).abs() < 1e-6, "{}", canvas.scale);
+        assert!(canvas.offset.0.abs() < 0.5 && canvas.offset.1.abs() < 0.5, "{:?}", canvas.offset);
+        assert_eq!(to_pixels(&canvas, 3840.0, 0.0), (1920.0, 1080.0));
     }
 
     #[test]

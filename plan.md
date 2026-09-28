@@ -2123,4 +2123,160 @@ optional — the alternative is a black bar.
 
 This is one window on the primary monitor. Multi-monitor, the control channel,
 live Video playback, persisted state, the library view and idle courtesy are
-all still §14.2's table.
+all still §14.2's table — §14.5 takes the last of those.
+
+---
+
+### 14.5 The frames nobody sees
+
+§4.16 split the live frame into `cpu`, `upload` and `gpu` and that split was
+enough to find what it was looking for. It is not enough for a wallpaper, and
+the reason is a measurement bug: **`gpu` only times *issuing* the commands.**
+GL is asynchronous, so the work itself lands somewhere else entirely, and on
+`scene_example2` at the background's 4K the two together named 12 ms of a 23 ms
+frame. Half the frame was unattributed.
+
+Closing it took three more buckets — `present` (the gap between the last chain
+draw and `swap_buffers`), `swap`, and `loop` (the frame period minus all of
+`redraw`) — after which the numbers add up:
+
+```
+48 fps  (cpu 4.1, upload 1.3, gpu 2.9, present 12.1, swap 1.7, loop 0.3 ms)
+```
+
+**`present` is not the blit.** It looks like it should be — it brackets exactly
+one full-window textured quad — and `sized` was split out first to clear
+`inner_size()` of suspicion (0.0 ms, every frame). What settles it is holding
+the blit's own output fixed at the window's 3420x2214 and shrinking only the
+*scene* behind it:
+
+| `--scale` | scene renders | fps | cpu | gpu | **present** | swap |
+|---|---|---:|---:|---:|---:|---:|
+| 1.0 | 3840x2160 | 48 | 4.1 | 2.9 | **12.1** | 1.7 |
+| 0.5 | 1920x1080 | 117 | 0.7 | 1.3 | **0.7** | 5.8 |
+| 0.25 | 960x540 | 120 | 0.6 | 2.5 | **0.4** | 4.7 |
+
+The blit is byte-for-byte the same draw in all three rows and its cost moves by
+30x, so `present` is not fill — it is the driver blocking at the first touch of
+the default framebuffer while the GPU finishes the scene queued behind it. That
+is the real GPU number, and `gpu` never was.
+
+*Which of the two it lands in is per-scene — and even per-moment — so they have
+to be read together.* `scene_example8` settles at the opposite shape,
+`gpu 55.4, present 0.1`, because its forty particle systems fill the driver's
+queue during submission and block there instead. The same run shows the block
+migrating as it warms: `gpu 45.4, present 7.7` early against `gpu 55.4,
+present 0.1` late, with the sum unmoved at ~53–55 ms and the frame rate unmoved
+at 17–18 fps. The sum is what means anything; neither half alone does.
+
+**And the second column is the actual finding: 120 fps on a 60 Hz panel.**
+`set_swap_interval(Wait(1))` is called and does not bind here, so the renderer
+was free-running at twice what the display can scan out. Every other frame was
+built at full cost and discarded before it was ever shown. Three things follow
+from that, and none of them cost a visible pixel:
+
+- **Cap the rate in the loop**, since vsync will not. `ControlFlow::WaitUntil`
+  genuinely sleeps the thread where `Poll` returned straight into another
+  wasted frame. Default is the display's own `refresh_rate_millihertz`, which
+  is why this is not a quality setting — `--fps 0` opts back out.
+
+  | cap | fps | work/frame | sleep | busy |
+  |---|---:|---:|---:|---:|
+  | none | 119 | 8.2 ms | 0.0 ms | **98 %** |
+  | 60 (default) | 56 | 8.5 ms | 9.5 ms | **47 %** |
+  | 30 | 29 | 7.0 ms | 26.9 ms | **21 %** |
+
+  Per-frame work is unmoved across all three — the cap removes frames, not
+  speed — so the busy fraction is the whole story, and it halves for free.
+
+- **Stop entirely when the window is occluded.** `WindowEvent::Occluded` is
+  `windowDidChangeOcclusionState:` underneath, which is exactly the question a
+  wallpaper wants answered: is any of me visible? A maximized window over the
+  desktop, another Space, a sleeping display all say no, and a wallpaper nobody
+  can see should cost nothing at all rather than 47 % of a GPU. `g_Time` stays
+  on the wall clock, so what comes back on resume is the frame the scene would
+  have reached anyway — there is no state to rewind.
+
+- **Do not clear what is about to be overwritten.** `blit_to_screen` cleared the
+  whole window every frame; under `Cover` (§14.4) the quad then covered every
+  pixel of it. The clear is now conditional on the fit actually leaving a bar,
+  tested on the extents rather than the offsets so integer halving cannot hide
+  an odd uncovered column.
+
+**What this does *not* do is make a GPU-bound scene faster.** `scene_example2`
+at the background's full canvas sits at 48 fps with the cap never binding, and
+`scene_example8` at 17 fps is still §4.17's overdraw — 35 fog and smoke systems
+whose sprites each cover most of a 4K canvas. For those the only lever is
+drawing fewer pixels, which is why `SIMULATE_SCALE` is now also `--scale`: it
+is the difference between a wallpaper that runs and one that does not.
+
+| `scene_example8`, background | fps | gpu |
+|---|---:|---:|
+| full canvas | 17 | ~55 ms |
+| `--scale 0.5` | **49** | ~17 ms |
+
+A 2.9x for a half-resolution render, and it is a real cost in sharpness rather
+than a free win — which is exactly why it is a flag and not a default.
+
+**Both rows are settled figures, and taking them early gets them wrong.** The
+half-scale run reads 55 fps for its first ten seconds and only falls to 49 after
+about fifteen — this is §4.16's climb, the particle population filling to
+`maxcount`, and it applies to the frame rate exactly as it applied to the CPU
+cost. An earlier draft of this section recorded 53 fps from the first two
+samples. Read `scene_example8` after 20 seconds or not at all. The
+structural fix that would not cost sharpness is still the one §4.17 named:
+merge a run of consecutive particle layers into one reduced-resolution scratch
+composited once. `scene_example8`'s 41 particle objects fall into runs of 29, 1,
+6 and 4, so the big run would collapse to a single composite.
+
+---
+
+### 14.6 A wallpaper renders the screen, not the canvas
+
+§14.4 gave the background a `Cover` fit and left the *sizing* alone: the render
+target stayed a uniform scale of the authored canvas, capped at 1.0, and the
+blit stretched it to cover. On the 3420x2214 screen that meant rendering
+3840x2160 and magnifying it 1.025x, of which 516 columns were then cropped off
+the window's edges. Both halves of that are waste — the magnification throws
+away sharpness, and the cropped columns are pixels rendered in full and
+discarded.
+
+**So the background now takes the screen as its target and crops the canvas to
+it.** `compose::Framing` says which: `Whole` keeps the canvas and lets the
+caller letterbox (the window, and `export`), `Cover` scales the canvas by the
+*looser* ratio and offsets the origin so the target is a crop of it. The offset
+lives in `Canvas` and is subtracted once, in `to_pixels`, which is the single
+seam every layer rect, particle placement and puppet rectangle already passes
+through — nothing else changed.
+
+| `scene_example2` background, 3420x2214 screen | §14.4 | now |
+|---|---|---|
+| render target | 3840x2160 | **3420x2214** |
+| pixels | 8.29 Mpx | **7.57 Mpx** (−9 %) |
+| blit | upscale 1.025x | **1:1** |
+| off-screen canvas rendered | 516 columns | **none** |
+
+**Verified as a transform, not an impression.** The background's frame should be
+exactly the window's frame scaled by 2214/2160 and cropped 258 px off each side,
+and it is: dumping both modes at `SIMULATE_TIME=2.6` and applying that predicted
+transform to the window's gives **34.2 dB** against the background's, where the
+same comparison without the crop — the naive stretch — gives **15.8 dB**. An
+integer shift search around the predicted 258 px peaks sharply at it and falls
+5 dB within two pixels either side, so the offset is right rather than merely
+close. The residual at the peak is not error: the background renders its chains
+and particles natively at 2214 rows where the comparison image is a lanczos
+upscale of 1924, so it holds detail the prediction cannot.
+
+**The frame rate does not move: 48 fps before, 47 after.** Worth stating plainly
+because it is the thing one would expect 9 % fewer pixels to buy. It does not,
+because the frame is not purely fill-bound — the per-layer chains carry
+per-pass costs that do not scale with area. What the change actually buys is
+sharpness and the end of rendering off-screen work, and the honest summary is
+that it is strictly better rather than measurably faster.
+
+**`--scale` gives up the crop**, in both modes, because `SIMULATE_SCALE=1` has
+to keep meaning "the authored canvas" for §4.22's comparison method to hold.
+An explicit scale is therefore a fraction of the canvas, rendered whole, and
+covered by the blit the way §14.4 did it. That is a deliberate asymmetry
+between the default path and the override, and it is the one place the two
+disagree.

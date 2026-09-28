@@ -479,11 +479,19 @@ pub fn blit_to_screen(
     fit: Fit,
 ) {
     let (x, y, width, height) = fit_rect(content, window, fit);
+    // Only `Contain` can leave a bar to clear. Under `Cover` the quad covers
+    // every pixel of the window, so the clear would write a window's worth of
+    // black that the very next draw overwrites. Tested on the extents rather
+    // than on `x`/`y`: integer halving can put the offset at 0 while still
+    // leaving an odd pixel column uncovered on the far side.
+    let bars = width < window.0 || height < window.1;
     unsafe {
         gl.bind_framebuffer(glow::FRAMEBUFFER, None);
-        gl.viewport(0, 0, window.0, window.1);
-        gl.clear_color(0.0, 0.0, 0.0, 1.0);
-        gl.clear(glow::COLOR_BUFFER_BIT);
+        if bars {
+            gl.viewport(0, 0, window.0, window.1);
+            gl.clear_color(0.0, 0.0, 0.0, 1.0);
+            gl.clear(glow::COLOR_BUFFER_BIT);
+        }
 
         gl.viewport(x, y, width, height);
         gl.use_program(Some(blit.program.handle));

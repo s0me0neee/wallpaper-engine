@@ -64,6 +64,18 @@ struct SimulateArgs {
     /// from it is redistributed.
     #[arg(long)]
     we_assets: Option<PathBuf>,
+
+    /// Cap the frame rate. Defaults to the display's refresh rate, which is
+    /// free: a frame drawn between two refreshes is never scanned out, so the
+    /// GPU time and power that made it are discarded. `0` removes the cap.
+    #[arg(long, value_name = "FPS")]
+    fps: Option<f32>,
+
+    /// Render at this fraction of the authored canvas. Defaults to whatever
+    /// fits the display. On a GPU-bound scene this is the only lever that
+    /// actually buys frames, and it costs sharpness to do it.
+    #[arg(long, value_name = "FACTOR")]
+    scale: Option<f32>,
 }
 
 #[derive(Args)]
@@ -606,7 +618,7 @@ fn run_simulate(args: &SimulateArgs, presentation: Presentation) -> Result<()> {
         // window, so the terminal that launched it is the only way to stop it.
         println!("  playing as the desktop background — Ctrl-C to stop");
     }
-    simulate::run(&mut archive, &scene, assets.as_deref(), title, presentation)
+    simulate::run(&mut archive, &scene, assets.as_deref(), title, presentation, args.fps, args.scale)
 }
 
 fn main() -> Result<()> {
