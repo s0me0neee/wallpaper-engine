@@ -101,8 +101,8 @@ pub struct Project {
     /// naming a file that does not exist is normal for them, not an error.
     pub package: Option<PathBuf>,
     pub oversized: bool,
-    /// User-facing settings from `general.properties`, still as JSON. Scene
-    /// rendering will bind these to shader uniforms; nothing reads them yet.
+    /// User-facing settings from `general.properties`, still as JSON; the scene
+    /// loader resolves user-bound values against them.
     pub properties: Map<String, Value>,
 }
 

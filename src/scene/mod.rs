@@ -16,10 +16,10 @@ pub mod video;
 use anyhow::{Context, Result};
 use model::Scene;
 
-/// Read and parse `scene.json` out of an open package.
-pub fn load(archive: &mut crate::pkg::Archive) -> Result<Scene> {
+/// Read and parse `scene.json` out of an open package, with the project's settings applied.
+pub fn load(archive: &mut crate::pkg::Archive, properties: &serde_json::Map<String, serde_json::Value>) -> Result<Scene> {
     let bytes = archive
         .read("scene.json")
         .context("the package has no scene.json")?;
-    model::parse_scene(&bytes).context("parsing scene.json")
+    model::parse_scene(&bytes, properties).context("parsing scene.json")
 }

@@ -84,13 +84,14 @@ fn r#true() -> bool {
     true
 }
 
-/// Parse `scene.json`, reducing driven values to their static defaults first.
-pub fn parse_scene(bytes: &[u8]) -> Result<Scene, serde_json::Error> {
+/// Parse `scene.json`, reducing driven values to static ones first: a user-bound value to its setting in
+/// `properties` (`project.json`'s `general.properties`), anything else to the value it was published with.
+pub fn parse_scene(bytes: &[u8], properties: &Map<String, Value>) -> Result<Scene, serde_json::Error> {
     let mut document: Value = serde_json::from_slice(bytes)?;
     hoist_alpha_tracks(&mut document);
     hoist_text_scripts(&mut document);
     gather_control_points(&mut document);
-    strip_driven_values(&mut document);
+    strip_driven_values(&mut document, properties);
     Scene::deserialize(document)
 }
 
@@ -122,10 +123,13 @@ const DRIVER_KEYS: [&str; 5] = ["user", "script", "scriptproperties", "animation
 /// material keys, so an object that merely *has* a `value` key may well be a
 /// pass's uniform table with a uniform called "value" in it.
 ///
-/// Honouring a *changed* user setting would mean reading `project.json`, which
-/// the scene loader deliberately never opens; across the corpus the two agree
-/// except for `scene_example4`'s cloud opacity (0.3 here, 0.2 there). Script-
-/// and animation-driven values are simply frozen at their published value.
+/// A user-bound value takes the setting's value from `project.json` instead,
+/// which is what Wallpaper Engine plays before anyone touches the settings: the
+/// `value` beside it is only what the editor saw last, and across an 87-scene
+/// library 29 scenes disagree with their own settings, 816 values in all
+/// (`scene_example4`'s cloud opacity is 0.3 here and 0.2 there; ⟦Horror⟧ hides
+/// its album widget behind a `media` checkbox that ships unticked). Script- and
+/// animation-driven values are simply frozen at their published value.
 /// Copy each object's `alpha` keyframe track somewhere `strip_driven_values`
 /// will not eat it.
 ///
@@ -211,15 +215,19 @@ fn gather_control_points(node: &mut Value) {
     }
 }
 
-fn strip_driven_values(node: &mut Value) {
+fn strip_driven_values(node: &mut Value, properties: &Map<String, Value>) {
     match node {
         Value::Object(map) => {
             // A driver can itself be null (`"user": null`) and still marks the `value` beside it.
             if DRIVER_KEYS.iter().any(|key| map.contains_key(*key))
                 && let Some(mut value) = map.remove("value")
             {
-                strip_driven_values(&mut value);
-                *node = value;
+                strip_driven_values(&mut value, properties);
+                let setting = map.get("user").and_then(|user| user_setting(user, properties));
+                *node = match setting {
+                    Some(setting) => coerce_setting(setting, value),
+                    None => value,
+                };
                 return;
             }
             // An explicit `null` means "not set" to Wallpaper Engine; dropping it lets the field's default apply.
@@ -232,15 +240,79 @@ fn strip_driven_values(node: &mut Value) {
                 if key == HOISTED_TRACK {
                     continue;
                 }
-                strip_driven_values(value);
+                strip_driven_values(value, properties);
             }
         }
         Value::Array(items) => {
             for item in items {
-                strip_driven_values(item);
+                strip_driven_values(item, properties);
             }
         }
         _ => {}
+    }
+}
+
+/// The value a `user` driver names, or `None` when the setting is missing and the published value stands.
+///
+/// `{"name": "weather", "condition": "2"}` ties a value to one choice of a combo: true exactly when the
+/// setting is that choice.
+fn user_setting(user: &Value, properties: &Map<String, Value>) -> Option<Value> {
+    match user {
+        Value::String(name) => properties.get(name)?.get("value").cloned(),
+        Value::Object(binding) => {
+            let live = properties.get(binding.get("name")?.as_str()?)?.get("value")?;
+            Some(Value::Bool(setting_text(live)? == setting_text(binding.get("condition")?)?))
+        }
+        _ => None,
+    }
+}
+
+/// A setting as a combo compares it: a checkbox is `"1"`/`"0"`, and a whole number has no decimals.
+fn setting_text(value: &Value) -> Option<String> {
+    match value {
+        Value::String(text) => Some(text.clone()),
+        Value::Bool(flag) => Some(if *flag { "1" } else { "0" }.to_string()),
+        Value::Number(number) => Some(match number.as_f64() {
+            Some(float) if float.fract() == 0.0 && number.as_i64().is_none() => format!("{float:.0}"),
+            _ => number.to_string(),
+        }),
+        _ => None,
+    }
+}
+
+/// A setting in the shape of the value it replaces, so the field still deserializes.
+///
+/// Settings are typed by their control rather than by what they drive: a slider is a number even where
+/// it scales a `"0.61400 0.61400 0.61400"` vector (spread to every component), and a checkbox drives
+/// `visible` flags and `parallaxDepth` vectors alike.
+fn coerce_setting(setting: Value, published: Value) -> Value {
+    let number = match &setting {
+        Value::Bool(flag) => Some(f64::from(u8::from(*flag))),
+        Value::Number(number) => number.as_f64(),
+        _ => None,
+    };
+    match (&published, number) {
+        (Value::Bool(_), Some(number)) => Value::Bool(number != 0.0),
+        (Value::Number(_), Some(number)) => serde_json::Number::from_f64(number).map_or(published, Value::Number),
+        (Value::Number(_), None) => setting
+            .as_str()
+            .and_then(|text| text.trim().parse::<f64>().ok())
+            .and_then(serde_json::Number::from_f64)
+            .map_or(published, Value::Number),
+        (Value::String(vector), Some(number)) => {
+            let components = vector.split_whitespace().filter(|part| part.parse::<f64>().is_ok()).count();
+            match components {
+                0 => Value::String(setting_text(&setting).unwrap_or_default()),
+                _ => Value::String(vec![number.to_string(); components].join(" ")),
+            }
+        }
+        (Value::String(_), None) => match setting {
+            Value::String(_) => setting,
+            _ => published,
+        },
+        (Value::Bool(_), None) => published,
+        _ if setting.is_null() => published,
+        _ => setting,
     }
 }
 
@@ -788,6 +860,10 @@ pub fn base_refracts(material: &Material) -> bool {
 mod tests {
     use super::*;
 
+    fn parse_published(bytes: &[u8]) -> Result<Scene, serde_json::Error> {
+        parse_scene(bytes, &Map::new())
+    }
+
     #[test]
     fn parses_a_three_component_vector() {
         assert_eq!(
@@ -834,7 +910,7 @@ mod tests {
     fn a_user_bound_value_parses_as_the_value_it_wraps() {
         // scene_example3 hides its girl layer behind a "girl" checkbox, and
         // scene_example4 binds a cloud's opacity to a slider.
-        let scene = parse_scene(
+        let scene = parse_published(
             br#"{"objects":[
                 {"image":"models/a.json","visible":{"user":"girl","value":false}},
                 {"image":"models/b.json","alpha":{"user":"opacity","value":0.25},
@@ -851,7 +927,7 @@ mod tests {
     /// Workshop item 1195626192 writes `"bloomstrength": null`, which failed the whole scene.
     #[test]
     fn a_null_field_takes_its_default() {
-        let scene = parse_scene(br#"{"general":{"bloomstrength":null,"clearenabled":null},"objects":[]}"#).unwrap();
+        let scene = parse_published(br#"{"general":{"bloomstrength":null,"clearenabled":null},"objects":[]}"#).unwrap();
         assert_eq!(scene.general.bloomstrength, 2.0);
         assert!(scene.general.clearenabled);
     }
@@ -859,7 +935,7 @@ mod tests {
     /// Workshop item 3307673833 (Magic-Hat) binds a particle's colour with `"user": null`.
     #[test]
     fn a_null_driver_still_unwraps_its_value() {
-        let scene = parse_scene(
+        let scene = parse_published(
             br#"{"objects":[{"image":"models/a.json","color":{"user":null,"value":"0.5 0.25 1.0"}}]}"#,
         )
         .unwrap();
@@ -871,7 +947,7 @@ mod tests {
         // `scene_example6` drives a layer's origin from inline JavaScript and
         // `scene_example8` drives a strength from a keyframe track; both write
         // the published value beside the driver.
-        let scene = parse_scene(
+        let scene = parse_published(
             br#"{"objects":[
                 {"image":"models/a.json","origin":{"script":"export function update(v){return v}",
                  "scriptproperties":{"x":0.5},"value":"1362.5 736.7 0.0"},
@@ -891,7 +967,7 @@ mod tests {
         // right for a slider and wrong for a fade: every control point carries
         // `frame`, itself a driver key, so an unprotected track would come back
         // as a list of bare numbers.
-        let scene = parse_scene(
+        let scene = parse_published(
             br#"{"objects":[
                 {"image":"models/a.json",
                  "alpha":{"animation":{"c0":[{"frame":0,"value":1},{"frame":420,"value":0}],
@@ -911,7 +987,7 @@ mod tests {
 
     #[test]
     fn a_looping_track_wraps_instead_of_holding() {
-        let scene = parse_scene(
+        let scene = parse_published(
             br#"{"objects":[
                 {"image":"models/a.json",
                  "alpha":{"animation":{"c0":[{"frame":0,"value":0},{"frame":60,"value":1}],
@@ -930,7 +1006,7 @@ mod tests {
         // `constantshadervalues` is a free-form map, so a shader uniform may
         // simply be called "value"; without a driver key beside it there is
         // nothing to unwrap.
-        let scene = parse_scene(
+        let scene = parse_published(
             br#"{"objects":[{"image":"models/a.json","effects":[{"file":"e.json",
                 "passes":[{"constantshadervalues":{"value":0.75}}]}]}]}"#,
         )
@@ -944,7 +1020,7 @@ mod tests {
     fn user_bindings_are_stripped_wherever_they_appear() {
         // The wrapper reaches keys no struct here names, and `user` is itself a
         // map when a layer is tied to one setting of a combo.
-        let scene = parse_scene(
+        let scene = parse_published(
             br#"{"objects":[{
                 "image":"models/a.json",
                 "visible":{"user":{"name":"clock","condition":"1"},"value":true},
@@ -962,6 +1038,38 @@ mod tests {
             object.effects[0].passes[0].constantshadervalues["scale"],
             Value::String("0.4 0.4".to_string())
         );
+    }
+
+    #[test]
+    fn a_user_bound_value_takes_its_setting_over_the_published_one() {
+        // scene_example4 publishes its cloud opacity as 0.3 but ships the slider at 0.2, and blurs by a
+        // slider that is one number where the uniform is two.
+        let properties = serde_json::from_str::<Map<String, Value>>(
+            r#"{"cloud":{"type":"slider","value":0.2},"blur":{"type":"slider","value":0.5},
+                "media":{"type":"bool","value":false},"weather":{"type":"combo","value":2},
+                "tint":{"type":"color","value":"0.1 0.2 0.3"},"depth":{"type":"bool","value":false}}"#,
+        )
+        .unwrap();
+        let scene = parse_scene(
+            br#"{"objects":[
+                {"image":"models/a.json","visible":{"user":"media","value":true},"alpha":{"user":"cloud","value":0.3},
+                 "color":{"user":"tint","value":"1 1 1"},"parallaxDepth":{"user":"depth","value":"1 1"},
+                 "effects":[{"file":"effects/blur/effect.json","passes":[
+                    {"constantshadervalues":{"scale":{"user":"blur","value":"0.4 0.4"}}}]}]},
+                {"image":"models/b.json","visible":{"user":{"name":"weather","condition":"2"},"value":false},
+                 "alpha":{"user":"gone","value":0.5}}
+            ]}"#,
+            &properties,
+        )
+        .unwrap();
+
+        let (first, second) = (&scene.objects[0], &scene.objects[1]);
+        assert!(!first.visible);
+        assert_eq!(first.alpha, 0.2);
+        assert_eq!(first.color, Vec3 { x: 0.1, y: 0.2, z: 0.3 });
+        assert_eq!(first.effects[0].passes[0].constantshadervalues["scale"], Value::String("0.5 0.5".to_string()));
+        assert!(second.visible, "combo choice 2 is the one selected");
+        assert_eq!(second.alpha, 0.5, "a setting the project lacks keeps the published value");
     }
 
     #[test]

@@ -425,7 +425,7 @@ fn run_info(args: &InfoArgs) -> Result<()> {
     if project.kind == Kind::Scene
         && let Some(package) = project.package.as_deref()
         && let Ok(mut archive) = pkg::Archive::open(package)
-        && let Ok(scene) = scene::load(&mut archive)
+        && let Ok(scene) = scene::load(&mut archive, &project.properties)
     {
         let visible_images: Vec<_> = scene
             .objects
@@ -516,7 +516,7 @@ fn export_video(project: &Project, options: &Options) -> Result<()> {
 fn export_scene(project: &Project, options: &Options) -> Result<()> {
     let package = project::require_package(project)?;
     let mut archive = pkg::Archive::open(package)?;
-    let scene = scene::load(&mut archive)?;
+    let scene = scene::load(&mut archive, &project.properties)?;
 
     let time = options.frames.first().copied().unwrap_or(0.0);
     let composite =
@@ -605,7 +605,7 @@ fn run_simulate(args: &SimulateArgs, presentation: Presentation) -> Result<()> {
 
     let package = project::require_package(&project)?;
     let mut archive = pkg::Archive::open(package)?;
-    let scene = scene::load(&mut archive)?;
+    let scene = scene::load(&mut archive, &project.properties)?;
 
     let assets = we_assets(args.we_assets.as_ref());
     let title = project::display_name(&project);
