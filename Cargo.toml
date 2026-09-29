@@ -129,3 +129,6 @@ exit = "deny"
 opt-level = 3
 lto = "fat"
 codegen-units = 1
+
+[dev-dependencies]
+tempfile = "3"

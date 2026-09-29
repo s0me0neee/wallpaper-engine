@@ -24,7 +24,7 @@ use std::{
     collections::HashMap,
     fs::File,
     io::{self, BufReader, Read},
-    path::Path,
+    path::{Path, PathBuf},
 };
 
 #[derive(Debug, Clone)]
@@ -93,6 +93,10 @@ pub struct Archive {
     blob_start: u64,
     total: u64,
     index: HashMap<String, Entry>,
+    /// A Wallpaper Engine `assets/` directory that `read` falls back to, as WE itself does: a pass may name a
+    /// stock texture or material the package never shipped (`materials/particle/normal_ring_smooth.tex`,
+    /// `materials/util/effectcomposebackground.json`), and without it the layer's whole chain drops.
+    fallback: Option<PathBuf>,
 }
 
 impl Archive {
@@ -118,7 +122,14 @@ impl Archive {
             blob_start,
             total,
             index,
+            fallback: None,
         })
+    }
+
+    /// Serve entries the package lacks from a WE install's `assets/`. `contains` still answers for the
+    /// package alone, which is how a builtin model such as `models/util/fullscreenlayer.json` is told apart.
+    pub fn set_fallback(&mut self, root: Option<PathBuf>) {
+        self.fallback = root;
     }
 
     /// Every entry path in the archive, in no particular order.
@@ -133,10 +144,9 @@ impl Archive {
 
     /// Read one entry into memory.
     pub fn read(&mut self, path: &str) -> Result<Vec<u8>> {
-        let entry = self
-            .index
-            .get(&normalize(path))
-            .with_context(|| format!("{path:?} is not in the package"))?;
+        let Some(entry) = self.index.get(&normalize(path)) else {
+            return self.read_fallback(path).with_context(|| format!("{path:?} is not in the package"));
+        };
 
         let start = self.blob_start + u64::from(entry.offset);
         let end = start + u64::from(entry.length);
@@ -154,6 +164,13 @@ impl Archive {
         let mut buffer = vec![0u8; length];
         reader.into_inner().read_exact(&mut buffer)?;
         Ok(buffer)
+    }
+}
+
+impl Archive {
+    fn read_fallback(&self, path: &str) -> Result<Vec<u8>> {
+        let root = self.fallback.as_deref().context("no stock assets to fall back to")?;
+        Ok(std::fs::read(resolve_under(root, path)?)?)
     }
 }
 
@@ -221,4 +238,39 @@ pub fn unpack(pkg_path: &Path, out_dir: &Path, list_only: bool) -> Result<()> {
         println!("\nextracted to {}/", out_dir.display());
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn string(text: &str) -> Vec<u8> {
+        let mut out = i32::try_from(text.len()).unwrap().to_le_bytes().to_vec();
+        out.extend_from_slice(text.as_bytes());
+        out
+    }
+
+    #[test]
+    fn a_read_the_package_lacks_falls_back_to_the_stock_assets_but_contains_does_not() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut bytes = string("PKGV0001");
+        bytes.extend_from_slice(&1_i32.to_le_bytes());
+        bytes.extend(string("scene.json"));
+        bytes.extend_from_slice(&0_i32.to_le_bytes());
+        bytes.extend_from_slice(&2_i32.to_le_bytes());
+        bytes.extend_from_slice(b"{}");
+        let package = dir.path().join("scene.pkg");
+        std::fs::write(&package, bytes).unwrap();
+        let assets = dir.path().join("assets");
+        std::fs::create_dir_all(assets.join("materials/util")).unwrap();
+        std::fs::write(assets.join("materials/util/stock.json"), b"stock").unwrap();
+
+        let mut archive = Archive::open(&package).unwrap();
+        assert!(archive.read("materials/util/stock.json").is_err(), "no fallback until one is set");
+        archive.set_fallback(Some(assets));
+        assert_eq!(archive.read("scene.json").unwrap(), b"{}");
+        assert_eq!(archive.read("materials/util/stock.json").unwrap(), b"stock");
+        assert!(!archive.contains("materials/util/stock.json"));
+        assert!(archive.read("../scene.pkg").is_err(), "a stock read may not leave the asset directory");
+    }
 }

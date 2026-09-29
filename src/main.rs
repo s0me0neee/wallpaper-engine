@@ -517,6 +517,7 @@ fn export_video(project: &Project, options: &Options) -> Result<()> {
 fn export_scene(project: &Project, options: &Options) -> Result<()> {
     let package = project::require_package(project)?;
     let mut archive = pkg::Archive::open(package)?;
+    archive.set_fallback(options.assets.clone());
     let scene = scene::load(&mut archive, &project.properties)?;
 
     let time = options.frames.first().copied().unwrap_or(0.0);
@@ -609,6 +610,7 @@ fn run_simulate(args: &SimulateArgs, presentation: Presentation) -> Result<()> {
     let scene = scene::load(&mut archive, &project.properties)?;
 
     let assets = we_assets(args.we_assets.as_ref());
+    archive.set_fallback(assets.clone());
     let title = project::display_name(&project);
     println!("{title}");
     if let Some(root) = &assets {
