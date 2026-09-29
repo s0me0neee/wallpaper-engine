@@ -49,6 +49,10 @@ vec2 rotateVec2(vec2 v, float angle)
 	return vec2(v.x * c - v.y * s, v.x * s + v.y * c);
 }
 
+// HLSL truncates a wider argument silently, and `shimmer` passes its vec4 `v_TexCoord`.
+vec2 rotateVec2(vec3 v, float angle) { return rotateVec2(v.xy, angle); }
+vec2 rotateVec2(vec4 v, float angle) { return rotateVec2(v.xy, angle); }
+
 // HSV in the 0..1-per-component convention every shader here uses.
 vec3 hsv2rgb(vec3 hsv)
 {
