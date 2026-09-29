@@ -40,6 +40,7 @@ pub struct Particles {
 
 /// Per-instance attributes, in the order the vertex shader declares them.
 ///
+/// `roll.w` is the sprite's vertical squash after its roll (`Shape::Sprite`).
 /// `roll.z` is the pattern mode, not a third axis: a sprite quad carries its
 /// pattern with it as it rolls, while a trail's pattern stays pinned to the
 /// head's rect in canvas space. That is tiny-skia's own split — `fill_rect`
@@ -68,7 +69,7 @@ const VERTEX: &str = "#version 330 core\n\
     void main() {\n\
         vec2 local = a_Corner * i_Rect.zw * 2.0;\n\
         vec2 rolled = vec2(local.x * i_Roll.x - local.y * i_Roll.y,\n\
-                           local.x * i_Roll.y + local.y * i_Roll.x);\n\
+                           (local.x * i_Roll.y + local.y * i_Roll.x) * i_Roll.w);\n\
         vec2 pixel = i_Rect.xy + rolled;\n\
         vec2 pattern = mix(local, pixel - i_UvRect.xy, i_Roll.z);\n\
         v_TexCoord = pattern / (i_UvRect.zw * 2.0) + 0.5;\n\
@@ -308,15 +309,15 @@ fn build(
         let additive = matches!(item.blend, crate::scene::model::Blend::Add);
         let start = instances.len();
         match &item.shape {
-            Shape::Sprite { center, radius, rotation } => {
+            Shape::Sprite { center, radius, rotation, squash } => {
                 let half = half_extent(sprite, *radius);
                 instances.push(Instance {
                     rect: [center.x, center.y, half.x, half.y],
-                    roll: [rotation.cos(), rotation.sin(), 0.0, 0.0],
+                    roll: [rotation.cos(), rotation.sin(), 0.0, *squash],
                     uv_rect: [center.x, center.y, half.x, half.y],
                     color: [item.color.x, item.color.y, item.color.z, item.weight.clamp(0.0, 1.0) * alpha],
                 });
-                grow(&mut bounds, *center, half.length());
+                grow(&mut bounds, *center, half.length() * squash.max(1.0));
             }
             Shape::Trail { points, radius } => {
                 let Some(head) = points.last() else { continue };
@@ -337,7 +338,7 @@ fn build(
                     let center = (from + to) * 0.5;
                     instances.push(Instance {
                         rect: [center.x, center.y, half.x, half.y],
-                        roll: [along.x, along.y, 1.0, 0.0],
+                        roll: [along.x, along.y, 1.0, 1.0],
                         uv_rect: [head.x, head.y, uv.x, uv.y],
                         color: [item.color.x, item.color.y, item.color.z, item.weight.clamp(0.0, 1.0) * alpha],
                     });
@@ -424,7 +425,7 @@ mod tests {
 
     #[test]
     fn consecutive_items_sharing_a_sprite_and_blend_share_a_draw_call() {
-        let shape = || Shape::Sprite { center: Vec2::new(10.0, 10.0), radius: 4.0, rotation: 0.0 };
+        let shape = || Shape::Sprite { center: Vec2::new(10.0, 10.0), radius: 4.0, rotation: 0.0, squash: 1.0 };
         let (instances, batches, _) = build(
             &list(vec![
                 item(0, Blend::Add, shape()),
@@ -444,7 +445,7 @@ mod tests {
 
     #[test]
     fn a_blend_change_breaks_the_batch() {
-        let shape = || Shape::Sprite { center: Vec2::ZERO, radius: 4.0, rotation: 0.0 };
+        let shape = || Shape::Sprite { center: Vec2::ZERO, radius: 4.0, rotation: 0.0, squash: 1.0 };
         let (_, batches, _) = build(
             &list(vec![item(0, Blend::Add, shape()), item(0, Blend::Over, shape())]),
             &SPRITES,
@@ -474,8 +475,8 @@ mod tests {
     #[test]
     fn the_dirty_rectangle_covers_every_particle_and_stops_at_the_canvas() {
         let items = vec![
-            item(1, Blend::Add, Shape::Sprite { center: Vec2::new(-20.0, 40.0), radius: 10.0, rotation: 0.0 }),
-            item(1, Blend::Add, Shape::Sprite { center: Vec2::new(500.0, 400.0), radius: 10.0, rotation: 0.0 }),
+            item(1, Blend::Add, Shape::Sprite { center: Vec2::new(-20.0, 40.0), radius: 10.0, rotation: 0.0, squash: 1.0 }),
+            item(1, Blend::Add, Shape::Sprite { center: Vec2::new(500.0, 400.0), radius: 10.0, rotation: 0.0, squash: 1.0 }),
         ];
         let (_, _, bounds) = build(&list(items), &SPRITES, 1.0);
         let (min, max) = bounds.expect("two particles have a bounding box");

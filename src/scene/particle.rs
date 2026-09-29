@@ -1023,8 +1023,14 @@ fn slot_particle(em: &Emission, slot: u32, time: f32) -> Option<(u64, f32)> {
 /// fill turned out to be the entire live frame budget (plan.md §4.16).
 pub enum Shape {
     /// `radius` sets the longer side of the sprite's rect and its own aspect
-    /// sets the other; `rotation` rolls it about its centre, in radians.
-    Sprite { center: Vec2, radius: f32, rotation: f32 },
+    /// sets the other; `rotation` rolls it about its centre, in radians, and
+    /// `squash` then scales the rolled quad vertically by that much.
+    ///
+    /// WE builds the quad in the system's own space and only then applies the
+    /// object's scale, so a `10 1 1` fog (1195626192) is ten times wider than it
+    /// is tall, and a rolled sprite under it shears. 208 of a 596-system library
+    /// scale their axes unequally.
+    Sprite { center: Vec2, radius: f32, rotation: f32, squash: f32 },
     /// A stroke through `points`, `radius` wide, painted with the sprite
     /// pattern anchored on the head's own rect — so the tail carries the
     /// sprite's clamped edge, not a repeat of it.
@@ -1210,7 +1216,8 @@ fn push_particle(
     // correction that keeps a fog puff inside the frame at all.
     let radius = 0.5 * live.size * place.scale.x.abs() * over.size.max(0.0) * place.px_per_unit
         / SIZE_DIVISOR;
-    if radius < 0.25 || live.alpha <= 0.001 {
+    let squash = place.scale.y.abs() / place.scale.x.abs();
+    if radius < 0.25 || !squash.is_finite() || live.alpha <= 0.001 {
         return;
     }
 
@@ -1220,12 +1227,12 @@ fn push_particle(
     let weight = live.alpha * place.alpha * over.alpha.max(0.0);
     let mut push = |shape, weight| out.items.push(DrawItem { sprite, blend, color, weight, shape });
 
-    let to_px = place.scale.x.abs() * place.px_per_unit;
     match renderer {
         Renderer::SpriteTrail { length, maxlength } => {
             // `length` is seconds of travel; `maxlength` caps the result in
             // sprite radii, and stands alone in four corpus renderers.
-            let vel_px = Vec2::new(live.velocity.x, -live.velocity.y) * to_px;
+            let vel_px = Vec2::new(live.velocity.x * place.scale.x.abs(), -live.velocity.y * place.scale.y.abs())
+                * place.px_per_unit;
             let by_speed = if *length > 0.0 { length * vel_px.length() } else { f32::INFINITY };
             let by_cap = if *maxlength > 0.0 { maxlength * radius } else { f32::INFINITY };
             let back = by_speed.min(by_cap);
@@ -1242,7 +1249,7 @@ fn push_particle(
         _ => {}
     }
 
-    push(Shape::Sprite { center, radius, rotation: live.rotation }, weight);
+    push(Shape::Sprite { center, radius, rotation: live.rotation, squash }, weight);
 }
 
 /// Fill a draw list with tiny-skia.
@@ -1263,18 +1270,17 @@ pub fn rasterize(
         let Some(base) = sprite_of(presets, table, item.sprite) else { continue };
         let sprite = tinted_sprite(tints, item.sprite as u64, base, item.color);
         match &item.shape {
-            Shape::Sprite { center, radius, rotation } => {
+            Shape::Sprite { center, radius, rotation, squash } => {
                 let head = Point::from_xy(center.x, center.y);
                 let Some(rect) = sprite_rect(sprite, head, *radius) else { continue };
                 let Some(paint) = sprite_paint(sprite, item.weight, rect, item.blend) else { continue };
                 // Rolled about the sprite's own centre. tiny-skia applies the
                 // transform to the pattern as well as to the rectangle, so the
                 // sprite turns with it.
-                let transform = if rotation.abs() > 1e-4 {
-                    Transform::from_rotate_at(rotation.to_degrees(), head.x, head.y)
-                } else {
-                    Transform::identity()
-                };
+                let transform = Transform::from_translate(-head.x, -head.y)
+                    .post_rotate(rotation.to_degrees())
+                    .post_scale(1.0, *squash)
+                    .post_translate(head.x, head.y);
                 pixmap.fill_rect(rect, &paint, transform, None);
             }
             Shape::Trail { points, radius } => {
@@ -1736,6 +1742,18 @@ mod tests {
         };
         assert!((*length - 0.0).abs() < f32::EPSILON);
         assert!((*maxlength - 6.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn an_unequal_object_scale_stretches_the_sprite_rather_than_growing_it() {
+        // 1195626192's fog is scaled `10 1 1`: ten times wide, as tall as the preset says.
+        let live = Live { pos: Vec2::ZERO, size: 100.0, alpha: 1.0, color: Vec3::ONE, velocity: Vec2::ZERO, rotation: 0.0, trail: Vec::new() };
+        let place = Placement { scale: Vec2::new(10.0, 1.0), ..test_placement() };
+        let mut out = DrawList { canvas_px: (16, 16), items: Vec::new(), unsupported: Vec::new() };
+        push_particle(&mut out, 0, &place, &Renderer::Sprite, &live, model::Blend::Add);
+        let Shape::Sprite { radius, squash, .. } = out.items[0].shape else { panic!("expected a sprite") };
+        assert!((radius - 500.0 / SIZE_DIVISOR).abs() < 1e-3);
+        assert!((squash - 0.1).abs() < 1e-6);
     }
 
     #[test]
