@@ -1934,6 +1934,15 @@ time is given):
 | HLSL-only forms retried after a failed compile (bare `g_TextureNResolution`, runtime local `const`, `mix(vec4, vec3)`, `int *= float`, bool as a number), with conditionals resolved first by `glsl-lang-pp` | chain skips across the library 27 → 8; 2772653062 21.4 → 32.4, 2582765611 17.2 → 26.1, 3287715210 16.1 → 18.4 |
 | `rotateVec2(vec4, …)`, which HLSL truncates | 3450697231's sword chain compiles |
 | stock textures/materials a pass names but the package never shipped | 3028090166 21.8 → 27.6 at t=3, 2994243715 27.3 → 31.2 |
+| a varying the fragment reads past its declared width (`water_caustics`'s `.zw` of a `vec2`) | 3484246124 26.8 → 28.5 at t=3 (export) |
+| puppet vertex format 14, and a clip record behind a block of its own (not the fixed 35 bytes) | 3490034653's 人物1 and 3022080536's 主体 warp again |
+| `export` drew every layer unrolled | 3490034653's still 8.4 → 16.3 (letterbox bars rolled a quarter turn off-canvas) |
+| `_rt_imageLayerComposite_<id>` naming *another*, usually hidden, layer was bound to the chain's own base | 3640882040 6.9 → 12.9 at t=4 (its character), 3113287126 21.8 → 25.7 |
+
+A full re-run with the chain fixes in (before the last four rows) moved the
+78-scene mean from 23.6 to 24.2 dB; the only scene more than 0.3 dB worse is
+3497488774, which now draws its character where it used to draw a grey box
+that happened to resemble WE's notes panel.
 
 **Where the library sits** before the chain fixes above (mean PSNR, 78
 scenes): mean 23.6; 25 below 20 dB, 39 between 20 and 30, 14 above 30. The
@@ -1973,11 +1982,9 @@ worst, and why, from their `motion.png`/`worst.png`:
    applies them, so the curve has to be fitted from captures. Camera parallax
    is still unimplemented too; the comparisons only hold because the cursor is
    parked at rest.
-5. **What still fails to build** (8 layers): `water_caustics` declares
-   `v_TexCoord` as `vec2` in the fragment stage, reads `.zw`, and gets `vec4`
-   from the vertex stage (3484246124, three layers); puppet vertex format 14
-   (3490034653) and a puppet whose animation header reads as 3683078338 tracks
-   (3022080536); `audio_yuan`'s syntax (3749558337, which crashes WE too).
+5. **What still fails to build**: only `audio_yuan`'s syntax (3749558337,
+   which crashes WE too). 3640882040 draws its character now but sits larger and
+   offset against WE, with a smaller clock font — framing, not content.
 6. **ex3's two building layers** (§4.25), confirmed static; scene lights (3
    scenes); `util/noise`-driven sparkle phase.
 
