@@ -1631,7 +1631,7 @@ fn fnv1a(text: &str) -> u64 {
 /// `demultiply` costs a division per channel, and a particle canvas is mostly
 /// empty — the two saturated cases need no division at all, and skipping them
 /// is most of this function's cost on a scene with dozens of systems.
-fn pixmap_to_rgba(pixmap: &Pixmap) -> RgbaImage {
+pub(crate) fn pixmap_to_rgba(pixmap: &Pixmap) -> RgbaImage {
     let mut out = RgbaImage::new(pixmap.width(), pixmap.height());
     for (dst, src) in out.pixels_mut().zip(pixmap.pixels()) {
         dst.0 = match src.alpha() {

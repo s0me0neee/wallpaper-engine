@@ -52,6 +52,8 @@ pub struct PreparedLayer<'a> {
     pub composition: bool,
     /// See `StaticImage::texel_scale`.
     pub texel_scale: (f32, f32),
+    /// Roll about the layer's own centre, in radians — `Anchor::roll`.
+    pub roll: f32,
 }
 
 /// A scene resolved as far as a plain flatten can take it: the output canvas
@@ -1003,6 +1005,7 @@ pub fn animate<'a>(archive: &mut Archive, static_scene: &StaticScene<'a>, time: 
                 warp_error: image.warp_error.clone(),
                 composition: image.composition,
                 texel_scale: image.texel_scale,
+                roll: image.roll,
             },
             StaticItem::Puppet(puppet) => {
                 let (image, left, top) = warp_frame(puppet, time);
@@ -1016,6 +1019,7 @@ pub fn animate<'a>(archive: &mut Archive, static_scene: &StaticScene<'a>, time: 
                     warp_error: None,
                     composition: false,
                     texel_scale: puppet.texel_scale,
+                    roll: puppet.roll,
                 }
             }
             StaticItem::Particle(particle) => {
@@ -1033,6 +1037,8 @@ pub fn animate<'a>(archive: &mut Archive, static_scene: &StaticScene<'a>, time: 
                             warp_error: None,
                             composition: false,
                             texel_scale: (1.0, 1.0),
+                            // Rolled inside the simulation, about the emitter.
+                            roll: 0.0,
                         }
                     }
                     Err(error) => {
@@ -1150,9 +1156,42 @@ pub fn flatten(layered: &Layered) -> RgbaImage {
         if layer.composition {
             continue;
         }
-        blit(&mut output, &layer.image, layer.left, layer.top, layer.blend);
+        match rolled(&layer.image, layer.roll) {
+            Some((image, dx, dy)) => blit(&mut output, &image, layer.left + dx, layer.top + dy, layer.blend),
+            None => blit(&mut output, &layer.image, layer.left, layer.top, layer.blend),
+        }
     }
     output
+}
+
+/// A layer image rolled about its own centre, as the live compositor draws it, and where its larger
+/// bounding box starts relative to the unrolled one. `None` when there is no roll to apply.
+///
+/// 3490034653 frames its canvas with black bars rolled 90 degrees off the edges; drawn unrolled, two of
+/// them covered the left and right thirds of every exported still.
+fn rolled(image: &RgbaImage, roll: f32) -> Option<(RgbaImage, i64, i64)> {
+    if roll.abs() < 1e-4 {
+        return None;
+    }
+    #[expect(clippy::cast_precision_loss, reason = "layer sides are at most a few thousand pixels")]
+    let (width, height) = (image.width() as f32, image.height() as f32);
+    let (cos, sin) = (roll.cos().abs(), roll.sin().abs());
+    // Less a hair, so a quarter turn's cos of -4e-8 does not grow the box by a pixel.
+    let (out_w, out_h) = ((width * cos + height * sin - 1e-3).ceil(), (width * sin + height * cos - 1e-3).ceil());
+    let mut source = tiny_skia::Pixmap::new(image.width(), image.height())?;
+    for (dst, src) in source.pixels_mut().iter_mut().zip(image.pixels()) {
+        let [red, green, blue, alpha] = src.0;
+        *dst = tiny_skia::ColorU8::from_rgba(red, green, blue, alpha).premultiply();
+    }
+    #[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss, reason = "a positive bounding box a few thousand wide")]
+    let mut target = tiny_skia::Pixmap::new(out_w as u32, out_h as u32)?;
+    let transform = tiny_skia::Transform::from_translate(-width / 2.0, -height / 2.0)
+        .post_rotate(roll.to_degrees())
+        .post_translate(out_w / 2.0, out_h / 2.0);
+    let paint = tiny_skia::PixmapPaint { quality: tiny_skia::FilterQuality::Bilinear, ..tiny_skia::PixmapPaint::default() };
+    target.draw_pixmap(0, 0, source.as_ref(), &paint, transform, None);
+    let (dx, dy) = ((width - out_w) / 2.0, (height - out_h) / 2.0);
+    Some((crate::scene::particle::pixmap_to_rgba(&target), round_to_i64(dx), round_to_i64(dy)))
 }
 
 /// `dst + src·factor`, saturating at 255.
@@ -1269,6 +1308,16 @@ mod tests {
         let tilted: Object =
             serde_json::from_str(r#"{"name":"b","image":"models/a.json","angles":"0.3 0.0 0.0"}"#).unwrap();
         assert_eq!(omissions_for(&tilted), vec!["b: out-of-plane rotation not applied"]);
+    }
+
+    #[test]
+    fn a_quarter_turn_swaps_the_layer_s_sides_about_its_centre() {
+        let image = RgbaImage::from_pixel(40, 20, Rgba([255, 0, 0, 255]));
+        assert!(rolled(&image, 0.0).is_none());
+        let (turned, dx, dy) = rolled(&image, std::f32::consts::FRAC_PI_2).unwrap();
+        assert_eq!((turned.width(), turned.height()), (20, 40));
+        assert_eq!((dx, dy), (10, -10), "the centre stays put");
+        assert_eq!(turned.get_pixel(10, 20).0, [255, 0, 0, 255]);
     }
 
     #[test]
