@@ -379,11 +379,14 @@ pub struct Anchor {
     /// parent's rotation swings its children too. This is `angles.z`; the other
     /// two axes tilt a layer out of the plane and are not applied.
     pub roll: f32,
+    /// Hiding a group hides everything under it: ⟦Horror⟧ (3450697231) keeps a media widget under a hidden
+    /// `Media Info` node whose own layers never say `visible: false`.
+    pub visible: bool,
 }
 
 impl Default for Anchor {
     fn default() -> Self {
-        Anchor { origin: Vec3::default(), scale: Vec3::splat(1.0), roll: 0.0 }
+        Anchor { origin: Vec3::default(), scale: Vec3::splat(1.0), roll: 0.0, visible: true }
     }
 }
 
@@ -426,6 +429,7 @@ fn resolve_anchors(scene: &Scene) -> Vec<Anchor> {
                 z: anchor.scale.z * node.scale.z,
             };
             anchor.roll += node.angles.z;
+            anchor.visible &= node.visible;
         }
         anchors.push(anchor);
     }
@@ -899,7 +903,7 @@ pub fn prepare_static<'a>(
     let anchors = resolve_anchors(scene);
 
     for (object, anchor) in scene.objects.iter().zip(&anchors) {
-        if !object.visible || is_sound(object) {
+        if !anchor.visible || is_sound(object) {
             continue;
         }
         if is_text(object) {
@@ -1206,6 +1210,7 @@ mod tests {
             origin: object.origin,
             scale: object.scale,
             roll: object.angles.z,
+            visible: object.visible,
         }
     }
 
@@ -1264,6 +1269,16 @@ mod tests {
         let tilted: Object =
             serde_json::from_str(r#"{"name":"b","image":"models/a.json","angles":"0.3 0.0 0.0"}"#).unwrap();
         assert_eq!(omissions_for(&tilted), vec!["b: out-of-plane rotation not applied"]);
+    }
+
+    #[test]
+    fn a_hidden_parent_hides_its_children() {
+        let scene = scene_of(
+            r#"[{"id":1,"visible":false},{"id":2,"parent":1},{"id":3,"parent":2,"image":"models/a.json"},
+                {"id":4,"image":"models/a.json"}]"#,
+        );
+        let visible: Vec<bool> = resolve_anchors(&scene).iter().map(|anchor| anchor.visible).collect();
+        assert_eq!(visible, [false, false, false, true]);
     }
 
     #[test]
