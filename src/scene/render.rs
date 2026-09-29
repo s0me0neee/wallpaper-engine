@@ -369,7 +369,7 @@ pub fn prepare_effect_chain(
     let mut skipped = Vec::new();
 
     for effect in effects {
-        let definition: EffectDefinition = serde_json::from_slice(&archive.read(&effect.file)?)
+        let definition: EffectDefinition = crate::json::from_slice(&archive.read(&effect.file)?)
             .with_context(|| format!("parsing {}", effect.file))?;
 
         // A definition pass with no material is a render-target command, and
@@ -393,7 +393,7 @@ pub fn prepare_effect_chain(
             };
             let (target_width, target_height) =
                 target_size(&definition, definition_pass.target.as_deref(), width, height);
-            let material: Material = serde_json::from_slice(&archive.read(material_path)?)
+            let material: Material = crate::json::from_slice(&archive.read(material_path)?)
                 .with_context(|| format!("parsing {material_path}"))?;
 
             for material_pass in &material.passes {

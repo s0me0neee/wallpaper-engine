@@ -8,6 +8,7 @@
 
 mod desktop;
 mod export;
+mod json;
 mod paths;
 mod pkg;
 mod project;

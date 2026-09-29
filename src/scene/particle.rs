@@ -1569,7 +1569,7 @@ fn collect_presets(
         return Ok(());
     }
     let bytes = archive.read(key).with_context(|| format!("reading {key}"))?;
-    let mut preset: Preset = serde_json::from_slice(&bytes).with_context(|| format!("parsing {key}"))?;
+    let mut preset: Preset = crate::json::from_slice(&bytes).with_context(|| format!("parsing {key}"))?;
     let material = read_material(archive, &preset.material);
     preset.blend = material.as_ref().map_or(model::Blend::Add, model::base_blend);
     preset.sprite = Some(sprite::resolve(
@@ -1593,7 +1593,7 @@ pub fn layer_blend(archive: &mut Archive, preset_path: &str) -> model::Blend {
 }
 
 fn read_blend(archive: &mut Archive, preset_path: &str) -> Option<model::Blend> {
-    let preset: Preset = serde_json::from_slice(&archive.read(preset_path).ok()?).ok()?;
+    let preset: Preset = crate::json::from_slice(&archive.read(preset_path).ok()?).ok()?;
     material_blend(archive, &preset.material)
 }
 
@@ -1601,7 +1601,7 @@ fn read_blend(archive: &mut Archive, preset_path: &str) -> Option<model::Blend> 
 /// compositor reproduces by multiplying the layer into the frame.
 pub fn layer_refracts(archive: &mut Archive, preset_path: &str) -> bool {
     let Ok(bytes) = archive.read(preset_path) else { return false };
-    let Ok(preset) = serde_json::from_slice::<Preset>(&bytes) else { return false };
+    let Ok(preset) = crate::json::from_slice::<Preset>(&bytes) else { return false };
     read_material(archive, &preset.material).is_some_and(|material| model::base_refracts(&material))
 }
 
@@ -1614,7 +1614,7 @@ fn read_material(archive: &mut Archive, material_path: &str) -> Option<Material>
     if material_path.is_empty() {
         return None;
     }
-    serde_json::from_slice(&archive.read(material_path).ok()?).ok()
+    crate::json::from_slice(&archive.read(material_path).ok()?).ok()
 }
 
 fn fnv1a(text: &str) -> u64 {

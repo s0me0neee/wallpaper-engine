@@ -258,10 +258,10 @@ fn layer_texture(archive: &mut Archive, object: &Object) -> Result<Option<LayerT
         return Ok(None);
     };
 
-    let model: Model = serde_json::from_slice(&archive.read(model_path)?)
+    let model: Model = crate::json::from_slice(&archive.read(model_path)?)
         .with_context(|| format!("parsing {model_path}"))?;
 
-    let material: Material = serde_json::from_slice(&archive.read(&model.material)?)
+    let material: Material = crate::json::from_slice(&archive.read(&model.material)?)
         .with_context(|| format!("parsing {}", model.material))?;
 
     let Some(name) = base_texture(&material) else {
@@ -583,7 +583,7 @@ fn static_solid<'a>(
     let path = object.image.as_deref()?;
     let solid = if archive.contains(path) {
         let bytes = archive.read(path).ok()?;
-        serde_json::from_slice::<Model>(&bytes).is_ok_and(|model| model.solidlayer)
+        crate::json::from_slice::<Model>(&bytes).is_ok_and(|model| model.solidlayer)
     } else {
         let name = path.rsplit('/').next().unwrap_or(path);
         matches!(name, "solidlayer.json" | "solidlayer_depthtest.json")
