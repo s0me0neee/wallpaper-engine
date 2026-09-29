@@ -26,7 +26,7 @@
     reason = "bounded mesh/pixel arithmetic; see module docs"
 )]
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use byteorder::{LittleEndian, ReadBytesExt};
 use image::{Rgba, RgbaImage};
 use smallvec::SmallVec;
@@ -165,6 +165,7 @@ pub fn parse(bytes: &[u8]) -> Result<Puppet> {
         let x = cursor.read_f32::<LittleEndian>()?;
         let y = cursor.read_f32::<LittleEndian>()?;
         cursor.read_f32::<LittleEndian>()?; // z, always 0 for these 2D puppets
+        skip(&mut cursor, layout.position_pad)?;
         if layout.lit {
             skip(&mut cursor, LIT_VERTEX_PREFIX)?; // normal, tangent, handedness
         }
@@ -250,6 +251,8 @@ struct VertexLayout {
     lit: bool,
     /// Bone indices and weights are present.
     skinned: bool,
+    /// Bytes after the position: one zero word in format 14.
+    position_pad: i64,
 }
 
 /// Read the vertex format, which sits behind a version-dependent run of words:
@@ -268,19 +271,54 @@ fn vertex_layout(magic: [u8; 8], cursor: &mut Cursor<&[u8]>) -> Result<VertexLay
     skip(cursor, 4 * prefix_words)?;
     let format = cursor.read_u32::<LittleEndian>()?;
     if format == 0 && version <= 13 {
-        return Ok(VertexLayout { stride: VERTEX_SIZE, lit: false, skinned: true });
+        return Ok(VertexLayout { stride: VERTEX_SIZE, lit: false, skinned: true, position_pad: 0 });
     }
     let skinned = format >> 16 & 0x0180 == 0x0180;
-    let (lit, base) = match format & 0xffff {
-        9 => (false, VERTEX_SIZE - SKIN_SIZE),
-        15 => (true, VERTEX_SIZE_LIT - SKIN_SIZE),
+    // 14 is 15 with the low bit clear and a zero word after each position: 3490034653's 402108-byte block
+    // divides by 84 exactly, and its first vertex reads as position, 0, normal (0 0 1), tangent (1 0 0), skin, uv.
+    let (lit, base, position_pad) = match format & 0xffff {
+        9 => (false, VERTEX_SIZE - SKIN_SIZE, 0),
+        14 => (true, VERTEX_SIZE_LIT - SKIN_SIZE + 4, 4),
+        15 => (true, VERTEX_SIZE_LIT - SKIN_SIZE, 0),
         other => bail!("unknown puppet vertex format ({other})"),
     };
-    Ok(VertexLayout { stride: base + if skinned { SKIN_SIZE } else { 0 }, lit, skinned })
+    Ok(VertexLayout { stride: base + if skinned { SKIN_SIZE } else { 0 }, lit, skinned, position_pad })
 }
 
 fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     haystack.windows(needle.len()).position(|window| window == needle)
+}
+
+/// How a clip record starts: an id, a zero word, its name, and a play mode WE knows.
+const MODES: [&[u8]; 3] = [b"loop\0", b"mirror\0", b"single\0"];
+
+/// Whether a clip record starts at `at`.
+fn record_at(bytes: &[u8], at: u64) -> bool {
+    let Some(rest) = usize::try_from(at).ok().and_then(|at| bytes.get(at + 8..)) else { return false };
+    let Some(name_end) = rest.iter().position(|&byte| byte == 0) else { return false };
+    std::str::from_utf8(&rest[..name_end]).is_ok() && MODES.iter().any(|mode| rest[name_end + 1..].starts_with(mode))
+}
+
+/// The start of the next clip record at or after `from`.
+///
+/// Between records `MDLA0006` usually leaves 35 bytes, but a clip can carry a block of its own there:
+/// 3490034653's blink clip is followed by 101530 bytes before its breathing clip. The record is found by
+/// its mode string instead, backing up over the name (which cannot hold a zero byte) and the two words.
+fn next_record(bytes: &[u8], from: u64) -> Option<u64> {
+    let from = usize::try_from(from).ok()?;
+    let window = bytes.get(from..)?;
+    let mut candidates: Vec<usize> = MODES
+        .iter()
+        .filter_map(|mode| window.windows(mode.len()).position(|w| w == *mode))
+        .map(|at| from + at)
+        .collect();
+    candidates.sort_unstable();
+    candidates.into_iter().find_map(|mode_at| {
+        let name_end = mode_at.checked_sub(1)?;
+        let name_start = bytes[from..name_end].iter().rposition(|&byte| byte == 0).map(|at| from + at + 1)?;
+        let start = u64::try_from(name_start.checked_sub(8)?).ok()?;
+        (name_start >= from + 8 && record_at(bytes, start)).then_some(start)
+    })
 }
 
 fn parse_animations(cursor: &mut Cursor<&[u8]>, bone_count: usize) -> Result<Vec<Animation>> {
@@ -337,6 +375,11 @@ fn parse_animations(cursor: &mut Cursor<&[u8]>, bone_count: usize) -> Result<Vec
             tracks.push(poses);
         }
         skip(cursor, trailer)?;
+        if animations.len() + 1 < animation_count && !record_at(cursor.get_ref(), cursor.position()) {
+            let from = cursor.position().saturating_sub(u64::try_from(trailer).unwrap_or(0));
+            let next = next_record(cursor.get_ref(), from).context("puppet animation record not found")?;
+            cursor.seek(SeekFrom::Start(next))?;
+        }
 
         let frame_count = tracks.iter().map(Vec::len).min().unwrap_or(0);
         if frame_count == 0 {
@@ -669,6 +712,23 @@ fn blend_over(dst: &mut Rgba<u8>, src: [f32; 4]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_next_clip_record_is_found_past_a_block_of_its_own() {
+        let mut bytes = vec![7u8; 40];
+        bytes.extend_from_slice(&[0, 0, 0, 0, 1, 0, 0, 0]);
+        let start = bytes.len() as u64;
+        bytes.extend_from_slice(&0x08a3_u32.to_le_bytes());
+        bytes.extend_from_slice(&0_u32.to_le_bytes());
+        bytes.extend_from_slice("呼吸\0loop\0".as_bytes());
+        assert!(!record_at(&bytes, 0));
+        assert!(record_at(&bytes, start));
+        assert_eq!(next_record(&bytes, 0), Some(start));
+
+        // An empty clip name backs up over the zero word just the same.
+        let empty = [&[9u8; 12][..], &[3, 0, 0, 0, 0, 0, 0, 0, 0], b"single\0"].concat();
+        assert_eq!(next_record(&empty, 0), Some(12));
+    }
 
     /// The container up to and including the format word, for `version` with
     /// `prefix` words ahead of it.
