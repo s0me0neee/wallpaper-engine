@@ -435,8 +435,7 @@ pub fn prepare_effect_chain(
                     Some(&vertex_source),
                 )
                     .with_context(|| format!("preprocessing {stem}.frag"))?;
-                let program = pass::compile_program(gl, &vertex_glsl, &fragment_glsl)
-                    .with_context(|| format!("compiling {stem}"))?;
+                let program = compile_or_repair(gl, &vertex_glsl, &fragment_glsl).with_context(|| format!("compiling {stem}"))?;
 
                 let (mut textures, resolutions) = resolve_textures(
                     gl,
@@ -583,6 +582,13 @@ fn resolve_textures(
     }
 
     Ok((bound, resolutions))
+}
+
+/// Compile a pass as written, or failing that with its HLSL-only forms rewritten; the first error is the one kept.
+fn compile_or_repair(gl: &glow::Context, vertex: &str, fragment: &str) -> Result<pass::Program> {
+    pass::compile_program(gl, vertex, fragment).or_else(|error| {
+        pass::compile_program(gl, &preprocess::repair_hlsl(vertex), &preprocess::repair_hlsl(fragment)).map_err(|_| error)
+    })
 }
 
 /// However a slot reached the chain's own upload of the layer image — slot 0 of the first pass, or
