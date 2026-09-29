@@ -1890,9 +1890,11 @@ scene); the first-run welcome dialog is CEF and CEF crashes under Wine, so
 `config.json` needs `hasshownwelcomedialog: true`; and Proton 11, not 9. The
 UI never has to open: `wallpaper64.exe -control openWallpaper -file …
 -playInWindow` is the whole interface. `tools/we_capture.py` does the rest: a
-headless Hyprland output at the canvas's own size (≤4K, aspect kept), a named
-workspace declared before the output exists so it never claims a numbered one,
-`wf-recorder` lossless, and `hyprctl reload` on exit. `tools/we_compare.py`
+headless Hyprland output at the canvas's own size fitted in 1080p (aspect kept), a
+named workspace declared before the output exists so it never claims a numbered
+one, `wf-recorder` at 45 fps and x264 crf 18 (~50 MB a clip, against ~1 GB for
+lossless 4K; `--crf 0 --max 3840x2160` brings that back), and `hyprctl reload`
+on exit. `tools/we_compare.py`
 renders `simulate` frames on a `g_Time` grid with WE's stock assets
 (`WE_ASSETS`), aligns them, and writes tile PSNR, a map of tiles that animate in
 one renderer only, and the worst tiles side by side.
@@ -1910,48 +1912,77 @@ centred ex3's vertical offsets vanish (they were mouse-driven), and the
 horizontal ones stay — left buildings +21 px, centre −48, right buildings −87 at
 4K, steady from t = 1 s on. The per-layer displacement is static and real.
 
-**Fixed by it**, each measured on these captures:
+**The whole library.** 87 scenes: 66 more captured at 1080p45, of which 8
+crash WE itself under Wine partway through (an access-violation dialog:
+2992022633, 3326873240, 3448877775, 3460097090, 3470764447, 3483456356,
+3689822347, 3749558337) and are left out. 78 compared. A headless `export` of
+every scene (`--resolution 640x360`) is the cheap companion: it reports every
+effect chain that failed to build, which is where most of the big losses were.
+
+**Fixed by it**, each measured on these captures (dB, mean over 10 s unless a
+time is given):
 
 | fix | evidence |
 |---|---|
 | a puppet chain's `previous` bind followed the prepare-time rest pose | ex2 pendant 20–22 → 31 dB median |
 | RG88 decoded as grey+alpha; WE samples `(R, G, 0, 1)` | ex2 shake: WE-only motion tiles 21 → 7; 124-texture survey, all flow maps |
 | puppet vertices placed by UV fit instead of model position | ex6 15.8 → 20.3 dB, 3450697231 11.5 → 15.3 |
+| user-bound values baked from `scene.json`, not resolved from `project.json` | 2932157836 23.4 → 36.1, 2978198116 +1.3, ex4 +0.5, ex5 +0.4; 29 of 87 scenes disagreed on 816 values |
+| a hidden parent did not hide its children | 3450697231's media widget and Rainy Day's clock/date gone, as in WE |
+| particle sprite scaled by `scale.x` on both axes; WE applies the object scale after building the quad | 1195626192 26.95 → 27.80, WE-free motion tiles 43 → 0; 2549887469 +1.0; 208 of 596 systems scale unequally |
+| a trailing comma in WE's own `fluidsimulation/effect.json` | 2967697841 14.5 → 30.6 at t=5 |
+| HLSL-only forms retried after a failed compile (bare `g_TextureNResolution`, runtime local `const`, `mix(vec4, vec3)`, `int *= float`, bool as a number), with conditionals resolved first by `glsl-lang-pp` | chain skips across the library 27 → 8; 2772653062 21.4 → 32.4, 2582765611 17.2 → 26.1, 3287715210 16.1 → 18.4 |
+| `rotateVec2(vec4, …)`, which HLSL truncates | 3450697231's sword chain compiles |
+| stock textures/materials a pass names but the package never shipped | 3028090166 21.8 → 27.6 at t=3, 2994243715 27.3 → 31.2 |
 
-**Where the corpus sits** (mean PSNR over 10 s at the capture's size, stock
-assets): ex2 33.6, ex1 32.1, ex5 30.3, ex4 29.5, ex8 22.9, ex6 20.3, ex3 16.0.
-Fourteen library scenes: 3258032485 51.0 (a match), 2978198116 30.6,
-3302432630 26.4, 3018516781 25.3, 3497595750 25.0, 3203778110 23.7,
-2487042463 23.7, 2932157836 23.4, 3028090166 21.1, 2772653062 20.3,
-3113287126 20.1, 3055600522 16.1, 3450697231 15.3, 3233141951 12.1.
+**Where the library sits** before the chain fixes above (mean PSNR, 78
+scenes): mean 23.6; 25 below 20 dB, 39 between 20 and 30, 14 above 30. The
+worst, and why, from their `motion.png`/`worst.png`:
+
+| scene | dB | cause |
+|---|---|---|
+| 3438699689 | 5.9 | frame entirely black: every layer's alpha/visibility is a script (`shared.kj`) |
+| 3640882040 | 6.4 | the character is drawn through a `composelayer` + `blend`, which renders nothing here |
+| 3497488774 | 10.3 | WE shows a first-run notes panel; the clock is a script frozen at "12:34" |
+| 3340707146, 2911866381, 2925278995, 3088099655 | 10–17 | day/night chosen by scripts reading `engine.timeOfDay`; WE was captured in the afternoon |
+| 3233141951, 3219908811, 3308867900 | 12–16 | scripted layers throughout (`thisLayer`, `shared`, sway/parallax helpers) |
+| 3047405322 | 16.6 | a scene `light` (point light, `genericimage3` with a normal map) with audio-scripted intensity |
+| 3287715210, 3291326967, ex8 | 15–23 | `bloom` + `hdr` on — the HDR bloom path is the next thing to check |
+| 3307673833, 3308867900 | 16–20 | scattered motion only in ours, in dark areas: sparkle particles brighter or denser than WE's |
 
 **Open, in order of payoff:**
 
-1. **User properties.** The loader (`model.rs`, `strip_driven_values`) bakes every `{"user": …, "value": …}` to
-   the value in `scene.json` and never reads `project.json`. The library
-   disproves "the two agree": 29 of 87 scenes disagree on 816 bound values —
-   colours, bar counts, and visibility (3450697231's media widget is off in
-   `project.json` and drawn here). Resolve from `general.properties`, coercing a
-   scalar onto a vec uniform and a combo `condition` onto a bool.
+1. **SceneScript.** 53 of 87 scenes script a value somewhere — `visible` 277
+   times, `scale` 267, `origin` 257, `alpha` 189, `text` 351 — against an API
+   of `engine.frametime`/`runtime`/`timeOfDay`/`canvasSize`/`userProperties`,
+   `thisLayer`, `thisScene.getLayer`, `shared`, `createScriptProperties` and
+   audio buffers. Text scripts run already (`script.rs`); everything else is
+   frozen at its published value, which is what the five worst scenes above
+   have in common. It is the largest single gap left and needs a per-frame
+   runtime over the whole object tree, not a per-value evaluator.
 2. **Puppet effects run in texture space, before the warp.** A puppet with
    effects has its chain run over our CPU-warped, padded image, so masks miss
    (ex2's irises lose the purple `shine`/`godrays`). Dropping the pad fixed the
    masks but clipped ex2's pendant, which WE does not clip. WE's order must be:
    chain over the flat texture, then draw the skinned mesh sampling its result —
    a GPU mesh pass, since `puppet::rasterize` is CPU-only.
-3. **Camera shake** (§4.19) is now measurable: ex8's WE frame moves vertically
-   −10..+24 px, not at all horizontally. Camera parallax is still unimplemented
-   too; the comparisons only hold because the cursor is parked at rest.
-4. **ex3's two building layers** (§4.25), now confirmed static.
-5. **Large WE-only motion** still unexplained in 3055600522 (twirl ×21),
-   2772653062, 3028090166 (waterflow ×4) and 3233141951 — the next scenes to
-   open with `motion.png`.
-6. `util/noise`-driven sparkle only matches with WE's own texture; our
-   generated stand-in differs in phase by construction.
+3. **Composition layers drawn through `blend`** (3640882040) and the HDR bloom
+   scenes.
+4. **Camera shake** (§4.19): ex8's WE frame moves vertically −10..+24 px, not
+   at all horizontally. `linux-wallpaperengine` parses the settings and never
+   applies them, so the curve has to be fitted from captures. Camera parallax
+   is still unimplemented too; the comparisons only hold because the cursor is
+   parked at rest.
+5. **What still fails to build** (8 layers): `water_caustics` declares
+   `v_TexCoord` as `vec2` in the fragment stage, reads `.zw`, and gets `vec4`
+   from the vertex stage (3484246124, three layers); puppet vertex format 14
+   (3490034653) and a puppet whose animation header reads as 3683078338 tracks
+   (3022080536); `audio_yuan`'s syntax (3749558337, which crashes WE too).
+6. **ex3's two building layers** (§4.25), confirmed static; scene lights (3
+   scenes); `util/noise`-driven sparkle phase.
 
-Next: capture and compare the remaining ~66 library scenes (`we_capture.py`
-takes ~30 s each, `we_compare.py --times 0:10:1` ~2 min), then take the list
-above from the top.
+Next: re-run `we_compare.py` over the library with the chain fixes in, then take
+the list above from the top.
 
 ---
 

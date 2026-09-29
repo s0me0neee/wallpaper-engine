@@ -95,7 +95,9 @@ built.
 ### The scene resolution chain
 
 Everything a scene needs is inside `scene.pkg`, so `scene/` never touches the filesystem beyond
-opening that archive (`pkg.rs`, a flat path→(offset,length) table over one data blob).
+opening that archive (`pkg.rs`, a flat path→(offset,length) table over one data blob) — except that
+`Archive::read` falls back to WE's `assets/` (`--we-assets`/`WE_ASSETS`) for a stock file a pass names
+and the package never shipped; `contains` stays package-only.
 
 ```
 scene.json  →  models/*.json  →  materials/*.json  →  materials/*.tex
