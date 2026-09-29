@@ -348,6 +348,11 @@ struct LiveLayer {
     kind: LiveKind,
     /// The object's name, for the tweakable panel.
     name: String,
+    /// The object's id, and the ids of the other layers its chain samples.
+    id: i64,
+    references: Vec<i64>,
+    /// A hidden layer drawn only for another chain to sample (`StaticScene::sources`).
+    source: bool,
     additive: bool,
     /// The layer's own effect chain, compiled once. `None` if it has no effects.
     chain: Option<EffectChain>,
@@ -423,6 +428,8 @@ struct State {
     last_frame: Instant,
     background: [f32; 4],
     layers: Vec<LiveLayer>,
+    /// Indices of the layers another chain samples, each after whatever it samples in turn.
+    sampled_order: Vec<usize>,
     /// `None` on the desktop background, which is click-through and so has
     /// nothing to drive a slider with.
     egui: Option<egui_glow::winit::EguiGlow>,
@@ -697,6 +704,7 @@ impl App<'_> {
         report_layer_roster(&layers);
         report_tweakables(&layers, self.presentation);
         let panel = panel_labels(&layers);
+        let sampled_order = sampled_order(&layers);
 
         let egui = (self.presentation == Presentation::Window)
             .then(|| egui_glow::winit::EguiGlow::new(event_loop, Arc::clone(&gl), None, None, true));
@@ -722,6 +730,7 @@ impl App<'_> {
             last_frame: Instant::now(),
             background,
             layers,
+            sampled_order,
             egui,
             tweak_values,
             panel,
@@ -815,7 +824,7 @@ impl App<'_> {
                     archive,
                     headers,
                     object,
-                    render::ChainBase { image, texel_scale },
+                    render::ChainBase { image, texel_scale, id: object.id },
                     target_format(static_scene.hdr),
                     &mut omissions,
                 )
@@ -835,6 +844,9 @@ impl App<'_> {
             layers.push(LiveLayer {
                 kind,
                 name: model::label(object),
+                id: object.id,
+                references: compose::layer_references(object).collect(),
+                source: static_scene.sources.contains(&object.id),
                 additive: blend == Blend::Add,
                 chain,
                 tweaks: start..tweak_values.len(),
@@ -1199,6 +1211,40 @@ fn swap_note(notes: &mut [String], stale: &str, replacement: String) {
     }
 }
 
+/// A layer's pixels this frame: its chain's output, or its own texture when it has no chain. `None` for
+/// a kind that owns no texture (`ParticleGpu`).
+fn layer_output(
+    state: &State,
+    layer: &LiveLayer,
+    finished: &HashMap<i64, glow::Texture>,
+    time: f32,
+) -> Result<Option<glow::Texture>> {
+    let Some(textures) = &layer.textures else { return Ok(None) };
+    let Some(chain) = &layer.chain else { return Ok(Some(textures.current())) };
+    // A static image's chain keeps its baked-in base; a puppet or
+    // particle layer's image changed this frame, so re-feed it.
+    let base = match &layer.kind {
+        LiveKind::Image => None,
+        LiveKind::Composition { region } => Some(region.texture),
+        LiveKind::Puppet(_) | LiveKind::Video { .. } | LiveKind::Particle { .. } | LiveKind::ParticleGpu { .. } => {
+            Some(textures.current())
+        }
+    };
+    let target = chain.render_with(&state.gl, base, finished, time, &state.tweak_values[layer.tweaks.clone()])?;
+    Ok(Some(target.texture))
+}
+
+/// `State::sampled_order`: the layers some chain samples, in an order that finishes each before its samplers.
+fn sampled_order(layers: &[LiveLayer]) -> Vec<usize> {
+    let ids: Vec<i64> = layers.iter().map(|layer| layer.id).collect();
+    let references: Vec<Vec<i64>> = layers.iter().map(|layer| layer.references.clone()).collect();
+    let sampled: HashSet<i64> = references.iter().flatten().copied().collect();
+    compose::source_order(&ids, &references)
+        .into_iter()
+        .filter(|&index| sampled.contains(&ids[index]) && !matches!(layers[index].kind, LiveKind::Composition { .. }))
+        .collect()
+}
+
 /// Returns `true` when the caller should close the window (the debug dump hook
 /// asks for this after writing its frame).
 fn redraw(app: &mut App, time: f32) -> Result<bool> {
@@ -1214,9 +1260,19 @@ fn redraw(app: &mut App, time: f32) -> Result<bool> {
     // Stack the layers into the composite target, each under its blend mode.
     let gpu_start = Instant::now();
     pass::clear_target(&state.gl, &state.composite, state.background);
+
+    // A layer another chain samples is finished first, so the chain sampling it sees this frame's pixels.
+    let mut finished: HashMap<i64, glow::Texture> = HashMap::new();
+    for &index in &state.sampled_order {
+        let layer = &state.layers[index];
+        if let Some(texture) = layer_output(state, layer, &finished, time)? {
+            finished.insert(layer.id, texture);
+        }
+    }
+
     let only = layer_filter();
     for (index, layer) in state.layers.iter().enumerate() {
-        if only.as_ref().is_some_and(|wanted| !wanted.contains(&index)) {
+        if layer.source || only.as_ref().is_some_and(|wanted| !wanted.contains(&index)) {
             continue;
         }
 
@@ -1240,25 +1296,12 @@ fn redraw(app: &mut App, time: f32) -> Result<bool> {
             );
         }
 
-        // Every remaining layer kind owns a texture; only `ParticleGpu`, handled
-        // above, does not.
-        let Some(textures) = &layer.textures else { continue };
-        let source = match &layer.chain {
-            Some(chain) => {
-                // A static image's chain keeps its baked-in base; a puppet or
-                // particle layer's image changed this frame, so re-feed it.
-                let base = match &layer.kind {
-                    LiveKind::Image => None,
-                    LiveKind::Composition { region } => Some(region.texture),
-                    LiveKind::Puppet(_) | LiveKind::Video { .. } | LiveKind::Particle { .. } | LiveKind::ParticleGpu { .. } => {
-                        Some(textures.current())
-                    }
-                };
-                chain
-                    .render_over(&state.gl, base, time, &state.tweak_values[layer.tweaks.clone()])?
-                    .texture
-            }
-            None => textures.current(),
+        let source = match finished.get(&layer.id) {
+            Some(&texture) => texture,
+            None => match layer_output(state, layer, &finished, time)? {
+                Some(texture) => texture,
+                None => continue,
+            },
         };
         composite_one(state, layer, source, time, false);
     }

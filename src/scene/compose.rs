@@ -65,6 +65,8 @@ pub struct Layered<'a> {
     pub background: Rgba<u8>,
     pub layers: Vec<PreparedLayer<'a>>,
     pub omissions: Vec<String>,
+    /// See `StaticScene::sources`.
+    pub sources: HashSet<i64>,
 }
 
 /// A scene's time-independent groundwork: every layer's pixels decoded, every
@@ -90,6 +92,9 @@ pub struct StaticScene<'a> {
     /// kept so `animate` re-simulates particles against the same sprites
     /// `prepare_static` resolved them with.
     pub assets: Option<PathBuf>,
+    /// Hidden objects prepared only because a visible layer's chain samples them
+    /// (`_rt_imageLayerComposite_<id>`): rendered, never composited.
+    pub sources: HashSet<i64>,
 }
 
 /// One scene object, resolved as far as time-independent work allows.
@@ -903,9 +908,10 @@ pub fn prepare_static<'a>(
     let mut items = Vec::new();
     let mut omissions = Vec::new();
     let anchors = resolve_anchors(scene);
+    let sources = hidden_sources(scene, &anchors);
 
     for (object, anchor) in scene.objects.iter().zip(&anchors) {
-        if !anchor.visible || is_sound(object) {
+        if !(anchor.visible || sources.contains(&object.id)) || is_sound(object) {
             continue;
         }
         if is_text(object) {
@@ -982,7 +988,64 @@ pub fn prepare_static<'a>(
         items,
         omissions,
         assets: assets.map(Path::to_path_buf),
+        sources,
     })
+}
+
+/// The other layers an object's chain samples, by id.
+pub fn layer_references(object: &Object) -> impl Iterator<Item = i64> + '_ {
+    model::visible_effects(object)
+        .flat_map(|effect| &effect.passes)
+        .flat_map(|pass| pass.textures.iter().flatten())
+        .filter_map(|name| crate::scene::render::layer_composite_id(name))
+        .filter(move |&id| id != object.id)
+}
+
+/// Hidden objects some visible layer samples, directly or through another source.
+///
+/// 20 references across five library scenes name another layer, nearly always a hidden one kept as a
+/// mask or a cut-out: 3640882040's character is a hidden layer its composition layers blend in, and
+/// 3450697231's wings sample a hidden `angelmask` that itself samples a hidden solid.
+fn hidden_sources(scene: &Scene, anchors: &[Anchor]) -> HashSet<i64> {
+    let by_id: HashMap<i64, (&Object, &Anchor)> =
+        scene.objects.iter().zip(anchors).map(|(object, anchor)| (object.id, (object, anchor))).collect();
+    let mut pending: Vec<i64> = scene
+        .objects
+        .iter()
+        .zip(anchors)
+        .filter(|(_, anchor)| anchor.visible)
+        .flat_map(|(object, _)| layer_references(object))
+        .collect();
+    let mut sources = HashSet::new();
+    while let Some(id) = pending.pop() {
+        let Some(&(object, anchor)) = by_id.get(&id) else { continue };
+        if !anchor.visible && sources.insert(id) {
+            pending.extend(layer_references(object));
+        }
+    }
+    sources
+}
+
+/// Layer indices in an order that renders every sampled layer before the layers sampling it; `ids` and
+/// `references` are per layer, in scene order. A cycle, which WE would not resolve either, keeps scene order.
+pub fn source_order(ids: &[i64], references: &[Vec<i64>]) -> Vec<usize> {
+    let index_of: HashMap<i64, usize> = ids.iter().enumerate().map(|(index, &id)| (id, index)).collect();
+    let mut placed = vec![false; ids.len()];
+    let mut order = Vec::with_capacity(ids.len());
+    while order.len() < ids.len() {
+        let before = order.len();
+        for index in 0..ids.len() {
+            let ready = references[index].iter().filter_map(|id| index_of.get(id)).all(|&other| other == index || placed[other]);
+            if !placed[index] && ready {
+                placed[index] = true;
+                order.push(index);
+            }
+        }
+        if order.len() == before {
+            order.extend((0..ids.len()).filter(|&index| !placed[index]));
+        }
+    }
+    order
 }
 
 /// Produce the frame at `time`: puppet layers re-skinned, particle systems
@@ -1058,6 +1121,7 @@ pub fn animate<'a>(archive: &mut Archive, static_scene: &StaticScene<'a>, time: 
         background: static_scene.background,
         layers,
         omissions,
+        sources: static_scene.sources.clone(),
     }
 }
 
@@ -1153,7 +1217,7 @@ pub fn flatten(layered: &Layered) -> RgbaImage {
     for layer in &layered.layers {
         // A composition layer's pixels are the frame beneath it, which a flat
         // overlay has no way to feed back through an effect chain.
-        if layer.composition {
+        if layer.composition || layered.sources.contains(&layer.object.id) {
             continue;
         }
         match rolled(&layer.image, layer.roll) {
@@ -1318,6 +1382,31 @@ mod tests {
         assert_eq!((turned.width(), turned.height()), (20, 40));
         assert_eq!((dx, dy), (10, -10), "the centre stays put");
         assert_eq!(turned.get_pixel(10, 20).0, [255, 0, 0, 255]);
+    }
+
+    #[test]
+    fn a_hidden_layer_another_chain_samples_is_kept_as_a_source() {
+        // 3450697231: the wings sample a hidden mask, which samples a hidden solid; a third hidden layer
+        // nobody samples stays out.
+        let scene = scene_of(
+            r#"[{"id":21,"image":"models/a.json","effects":[{"file":"effects/blend/effect.json","passes":[
+                    {"textures":[null,"_rt_imageLayerComposite_64378_a"]}]}]},
+                {"id":64378,"visible":false,"image":"models/b.json","effects":[{"file":"effects/blend/effect.json",
+                    "passes":[{"textures":[null,"_rt_imageLayerComposite_26429_a","_rt_imageLayerComposite_64378_a"]}]}]},
+                {"id":26429,"visible":false,"image":"models/c.json"},
+                {"id":5,"visible":false,"image":"models/d.json"}]"#,
+        );
+        let sources = hidden_sources(&scene, &resolve_anchors(&scene));
+        assert_eq!(sources, HashSet::from([64378, 26429]));
+        assert_eq!(layer_references(&scene.objects[1]).collect::<Vec<_>>(), [26429], "its own target is not another layer");
+    }
+
+    #[test]
+    fn a_sampled_layer_is_finished_before_the_layers_sampling_it() {
+        let order = source_order(&[21, 64378, 26429, 7], &[vec![64378], vec![26429], vec![], vec![]]);
+        assert_eq!(order, [2, 3, 1, 0]);
+        let cycle = source_order(&[1, 2], &[vec![2], vec![1]]);
+        assert_eq!(cycle, [0, 1], "a cycle keeps scene order");
     }
 
     #[test]

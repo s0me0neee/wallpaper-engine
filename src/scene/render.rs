@@ -21,7 +21,7 @@ use anyhow::{Context, Result, bail};
 use image::RgbaImage;
 use noise::{NoiseFn, Perlin};
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::f64::consts::TAU;
 use std::sync::OnceLock;
 
@@ -154,14 +154,25 @@ pub fn render_frame(
         // failed layer below re-add a note of its own.
         layered.omissions.retain(|note| !note.ends_with("effect(s) not applied"));
 
-        for index in effected {
-            let name = model::label(layered.layers[index].object);
-            match run_layer_chain(&gpu, archive, &layered.layers[index], &headers, time) {
-                Ok((processed, skipped)) => {
-                    layered.layers[index].image = processed;
-                    layered.omissions.extend(skipped.into_iter().map(|note| format!("{name}: {note}")));
+        // A layer another chain samples runs first, and its finished pixels are handed on.
+        let ids: Vec<i64> = layered.layers.iter().map(|layer| layer.object.id).collect();
+        let references: Vec<Vec<i64>> =
+            layered.layers.iter().map(|layer| compose::layer_references(layer.object).collect()).collect();
+        let sampled: HashSet<i64> = references.iter().flatten().copied().collect();
+        let mut finished: HashMap<i64, glow::Texture> = HashMap::new();
+        for index in compose::source_order(&ids, &references) {
+            if effected.contains(&index) {
+                let name = model::label(layered.layers[index].object);
+                match run_layer_chain(&gpu, archive, &layered.layers[index], &headers, &finished, time) {
+                    Ok((processed, skipped)) => {
+                        layered.layers[index].image = processed;
+                        layered.omissions.extend(skipped.into_iter().map(|note| format!("{name}: {note}")));
+                    }
+                    Err(error) => layered.omissions.push(format!("{name}: effect chain skipped ({error:#})")),
                 }
-                Err(error) => layered.omissions.push(format!("{name}: effect chain skipped ({error:#})")),
+            }
+            if sampled.contains(&ids[index]) {
+                finished.insert(ids[index], pass::upload_texture(&gpu.gl, &layered.layers[index].image)?);
             }
         }
     }
@@ -176,13 +187,14 @@ fn run_layer_chain(
     archive: &mut Archive,
     layer: &compose::PreparedLayer,
     headers: &HashMap<String, String>,
+    finished: &HashMap<i64, glow::Texture>,
     time: f32,
 ) -> Result<(RgbaImage, Vec<String>)> {
     let effects: Vec<&Effect> = model::visible_effects(layer.object).collect();
-    let base = ChainBase { image: &layer.image, texel_scale: layer.texel_scale };
+    let base = ChainBase { image: &layer.image, texel_scale: layer.texel_scale, id: layer.object.id };
     let chain = prepare_effect_chain(&gpu.gl, archive, &effects, base, headers, pass::Format::Ldr)
         .context("preparing the effect chain")?;
-    let target = chain.render(&gpu.gl, time, &[]).context("running the effect chain")?;
+    let target = chain.render_with(&gpu.gl, None, finished, time, &[]).context("running the effect chain")?;
     let image = capture::read_rgba(&gpu.gl, target.framebuffer, target.width, target.height)?;
     Ok((image, chain.skipped))
 }
@@ -210,6 +222,10 @@ enum PassTexture {
     /// resolved, because a puppet or particle layer re-uploads that image
     /// every frame and the binding has to follow it.
     LayerBase,
+    /// Another layer's finished image, `_rt_imageLayerComposite_<id>_*` naming a layer other than this
+    /// one — usually a hidden layer kept only as a source (3640882040 draws its character through one).
+    /// Resolved per frame from what the caller hands `render_with`.
+    Layer(i64),
 }
 
 /// One shader parameter Wallpaper Engine's own Properties panel would show as
@@ -267,24 +283,19 @@ pub struct EffectChain {
 
 impl EffectChain {
     /// Redraw every pass in order with `g_Time` set to `time`, and return the
-    /// final pass's target (its texture is what a caller displays or reads
-    /// back).
-    ///
-    /// `overrides` gives a live value for each of `self.tweakables`, in the
-    /// same order — pass `&[]` to just use the wallpaper's own presets, as
-    /// export does.
-    pub fn render(&self, gl: &glow::Context, time: f32, overrides: &[f32]) -> Result<&pass::Target> {
-        self.render_over(gl, None, time, overrides)
-    }
-
-    /// As `render`, but the first pass reads `base` as `g_Texture0` instead of
-    /// the texture baked in at prepare time. A puppet-warp layer's image
+    /// final pass's target. `base`, when given, is read as `g_Texture0` instead
+    /// of the texture baked in at prepare time: a puppet-warp layer's image
     /// changes every frame, so its chain's input has to be re-fed each frame
-    /// rather than uploaded once.
-    pub fn render_over(
+    /// rather than uploaded once. `overrides` gives a live value for each of
+    /// `self.tweakables`, in order; `&[]` keeps the wallpaper's own presets.
+    ///
+    /// `layers` holds the current images of the other layers this chain samples, by object id; one it
+    /// lacks reads as this chain's own base.
+    pub fn render_with(
         &self,
         gl: &glow::Context,
         base: Option<glow::Texture>,
+        layers: &HashMap<i64, glow::Texture>,
         time: f32,
         overrides: &[f32],
     ) -> Result<&pass::Target> {
@@ -315,6 +326,7 @@ impl EffectChain {
                 .map(|(name, texture)| {
                     let texture = match *texture {
                         PassTexture::LayerBase => base.unwrap_or(self.base),
+                        PassTexture::Layer(id) => layers.get(&id).copied().unwrap_or(base.unwrap_or(self.base)),
                         PassTexture::Fixed(handle) => handle,
                     };
                     (name.as_str(), texture)
@@ -346,6 +358,8 @@ impl EffectChain {
 pub struct ChainBase<'a> {
     pub image: &'a RgbaImage,
     pub texel_scale: (f32, f32),
+    /// The object's own id, which tells its own `_rt_imageLayerComposite_<id>` from another layer's.
+    pub id: i64,
 }
 
 /// Compile every visible effect's every pass over `base`, in order, without
@@ -567,6 +581,8 @@ fn resolve_textures(
             (PassTexture::Fixed(texture), size, texel_scale)
         } else if slot == 0 {
             (PassTexture::Fixed(current.0), current.1, texel_scale)
+        } else if let Some(id) = name.and_then(layer_composite_id).filter(|&id| id != base.id) {
+            (PassTexture::Layer(id), base.image.dimensions(), texel_scale)
         } else if name.is_some_and(is_layer_composite_target) {
             (PassTexture::LayerBase, base.image.dimensions(), texel_scale)
         } else {
@@ -614,6 +630,11 @@ fn is_render_target(name: &str) -> bool {
 /// the layer loses every effect it has.
 fn is_layer_composite_target(name: &str) -> bool {
     name.starts_with("_rt_imageLayerComposite")
+}
+
+/// The object id in `_rt_imageLayerComposite_<id>_<slot>`.
+pub fn layer_composite_id(name: &str) -> Option<i64> {
+    name.strip_prefix("_rt_imageLayerComposite_")?.split('_').next()?.parse().ok()
 }
 
 /// Load and upload one texture slot: the scene's own mask/map texture when
