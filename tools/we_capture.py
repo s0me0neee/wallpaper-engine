@@ -4,7 +4,9 @@
     tools/we_capture.py papers/scene_example2 2862539849 --seconds 12
 
 Each wallpaper (a workshop id or a wallpaper directory) gets a fresh WE process
-and a lossless recording, <out>/<id>.mkv. WE's own `g_Time` starts at its first
+and a recording, <out>/<id>.mkv: x264 at `--crf` (0 is lossless, ~1 GB per 4K
+clip; the default 18 at 1080p45 keeps compression noise far below the
+differences a comparison looks for). WE's own `g_Time` starts at its first
 presented frame, which `we_compare.py` finds in the clip.
 
 WE plays in its `-playInWindow` mode on a headless Hyprland output, so nothing
@@ -155,8 +157,8 @@ def setup_output():
         hypr("output", "create", "headless", OUTPUT)
 
 
-def size_output(width, height):
-    hypr("keyword", "monitor", f"{OUTPUT},{width}x{height}@60,{output_left()}x0,1")
+def size_output(width, height, fps):
+    hypr("keyword", "monitor", f"{OUTPUT},{width}x{height}@{fps},{output_left()}x0,1")
 
 
 def park_cursor_on(width, height, at):
@@ -186,7 +188,7 @@ def capture(wallpaper, args):
     general = scene_general(project)
     width, height = window_size(general, args.max)
     stop_we(args.proton)
-    size_output(width, height)
+    size_output(width, height, args.fps)
     log = open(args.out / f"{ident}.we.log", "w")
     subprocess.Popen(
         [STEAM / "steamapps/common" / args.proton / "proton", "run", WE / "wallpaper64.exe",
@@ -203,8 +205,8 @@ def capture(wallpaper, args):
     clip = args.out / f"{ident}.mkv"
     with open(args.out / f"{ident}.wfr.log", "w") as wfr_log:
         subprocess.run(
-            ["timeout", "--signal=INT", str(args.seconds), "wf-recorder", "-y", "-o", OUTPUT, "-r", "60",
-             "-c", "libx264rgb", "-p", "crf=0", "-p", "preset=ultrafast", "-f", str(clip)],
+            ["timeout", "--signal=INT", str(args.seconds), "wf-recorder", "-y", "-o", OUTPUT, "-r", str(args.fps),
+             "-c", "libx264rgb", "-p", f"crf={args.crf}", "-p", "preset=veryfast", "-f", str(clip)],
             stdout=wfr_log, stderr=wfr_log,
         )
     if "Error" in {c["title"] for c in hypr_json("clients")}:
@@ -221,8 +223,10 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("wallpapers", nargs="+", help="workshop ids or wallpaper directories")
     parser.add_argument("--seconds", type=float, default=12)
-    parser.add_argument("--max", default="3840x2160", help="largest window, WxH; the canvas is fitted inside it")
-    parser.add_argument("--out", type=Path, default=Path("papers/_we_captures/proton_4k"))
+    parser.add_argument("--fps", type=int, default=45)
+    parser.add_argument("--crf", type=int, default=18, help="x264 quality, 0 for lossless")
+    parser.add_argument("--max", default="1920x1080", help="largest window, WxH; the canvas is fitted inside it")
+    parser.add_argument("--out", type=Path, default=Path("papers/_we_captures/proton_1080p"))
     parser.add_argument("--cursor", default="0.5,0.5",
                         help="where a parallax scene's cursor is parked, as fractions of the window")
     parser.add_argument("--proton", default="Proton 11.0", help="directory under steamapps/common")

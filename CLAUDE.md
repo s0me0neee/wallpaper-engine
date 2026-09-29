@@ -210,8 +210,9 @@ all used before:
 - watch the `simulate` startup report for chains that stopped compiling.
 
 The strongest reference is native Wallpaper Engine itself, run under Proton on Linux (plan.md
-§4.32). `tools/we_capture.py <ids or dirs>` records each scene as lossless video on a headless
-Hyprland output, at the canvas's own size (≤4K), and puts the compositor back afterwards;
+§4.32). `tools/we_capture.py <ids or dirs>` records each scene on a headless Hyprland output at
+the canvas's own size fitted in 1080p, 45 fps, x264 crf 18 (~50 MB a clip; `--crf 0 --max 3840x2160` for
+lossless 4K at ~1 GB), and puts the compositor back afterwards;
 `tools/we_compare.py <wallpaper> <clip>` renders our frames on a `g_Time` grid with WE's stock assets
 (`WE_ASSETS`), aligns them to the clip, and writes per-tile PSNR, a map of tiles that animate in one
 renderer and not the other, and the worst tiles side by side. Captures and reports live under
