@@ -155,6 +155,15 @@ pub fn repair(glsl: &str) -> String {
     // With the combos' `#if`s decided, a local declared one way per branch (`float bar` / `int bar`) has one
     // type, and the typed passes above can act on it.
     let resolved = resolve_conditionals(glsl).map_or_else(|| glsl.to_string(), |source| relax(&source));
+    // A sampler2D is all WE binds, so texture coordinates past two components are HLSL's truncation.
+    let coordinates: HashMap<String, Vec<Option<Type>>> = [("texture", 2), ("textureLod", 3)]
+        .into_iter()
+        .map(|(name, arity)| {
+            let mut params = vec![None; arity];
+            params[1] = Some(Type { kind: Kind::Float, components: 2 });
+            (name.to_string(), params)
+        })
+        .collect();
     let lined = repair_lines(&resolved);
     let (chunks, scope) = top_level_chunks(&lined);
     let global = declared_types(&scope);
@@ -163,7 +172,7 @@ pub fn repair(glsl: &str) -> String {
         let chunk = &lined[start..end];
         let mut types = global.clone();
         types.extend(declared_types(chunk));
-        out.push_str(&repair_compound_assignments(chunk, &types));
+        out.push_str(&truncate_call_arguments(&repair_compound_assignments(chunk, &types), &types, &coordinates));
     }
     out
 }
@@ -1377,6 +1386,12 @@ mod tests {
         assert!(out.contains("g_Texture0Resolution.zw)"), "a swizzled use is left alone: {out}");
         assert!(out.contains("albedo.rgb = vec3(mix(albedo.rgb, tint, mask));"));
         assert!(out.contains("color.rgb = mix(albedo, tint, mask);"), "only the target's own vector is narrowed");
+    }
+
+    #[test]
+    fn a_repaired_texture_lookup_takes_two_coordinates() {
+        let out = repair("uniform sampler2D s;\nvoid main() {\n\tvec4 uv = vec4(0.0);\n\tvec4 c = texture(s, uv);\n}\n");
+        assert!(out.contains("texture(s, vec2(uv))"), "got {out}");
     }
 
     #[test]

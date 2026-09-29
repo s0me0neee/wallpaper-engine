@@ -173,6 +173,15 @@ fn reconcile_varyings(body: &str, produced: &BTreeMap<String, String>) -> String
         if *written == declared {
             continue;
         }
+        // Declared narrower than it is read: `water_caustics` (3484246124) declares `vec2 v_TexCoord` and
+        // reads its `.zw`, which only the vertex stage's `vec4` has. It takes that type whole; a `vec4` passed
+        // where a `vec2` belongs is left to the failed-compile repair to truncate.
+        if components(written) > components(&declared) && reads_beyond(&body, &name, components(&declared)) {
+            #[expect(clippy::unwrap_used, reason = "a fixed literal pattern built from an identifier")]
+            let declaration = Regex::new(&format!(r"(?m)^([ \t]*varying\s+){declared}(\s+{name}\s*;)")).unwrap();
+            body = declaration.replace(&body, format!("${{1}}{written}${{2}}").as_str()).into_owned();
+            continue;
+        }
 
         let alias = format!("we_{name}");
         body = replace_word(&body, &name, &alias);
@@ -193,6 +202,14 @@ fn reconcile_varyings(body: &str, produced: &BTreeMap<String, String>) -> String
             .into_owned();
     }
     body
+}
+
+/// Whether `body` swizzles `name` past its first `width` components (`.zw` of a `vec2`).
+fn reads_beyond(body: &str, name: &str, width: usize) -> bool {
+    #[expect(clippy::unwrap_used, reason = "a fixed literal pattern built from an identifier")]
+    let swizzle = Regex::new(&format!(r"\b{name}\.([xyzwrgbastpq]+)\b")).unwrap();
+    let index = |c: char| ["xrs", "ygt", "zbp", "waq"].iter().position(|set| set.contains(c));
+    swizzle.captures_iter(body).any(|caps| caps[1].chars().any(|c| index(c).is_some_and(|at| at >= width)))
 }
 
 /// Give every `keyword` input (`varying` in a fragment shader, `attribute` in a
@@ -348,6 +365,18 @@ mod tests {
             .iter()
             .map(|(name, value)| (name.to_string(), *value))
             .collect()
+    }
+
+    #[test]
+    fn a_varying_read_past_its_declared_width_takes_the_vertex_type() {
+        let produced = varying_types("varying vec4 v_TexCoord;\n");
+        let body = "varying vec2 v_TexCoord;\nvoid main() { float m = texture(s, v_TexCoord.zw).r; }\n";
+        let out = reconcile_varyings(body, &produced);
+        assert!(out.contains("varying vec4 v_TexCoord;"), "got {out}");
+        assert!(!out.contains("we_v_TexCoord"), "no narrowing alias: {out}");
+
+        let narrow = reconcile_varyings("varying vec2 v_TexCoord;\nvoid main() { vec2 uv = v_TexCoord.xy; }\n", &produced);
+        assert!(narrow.contains("#define we_v_TexCoord v_TexCoord.xy"), "a read within the width still narrows: {narrow}");
     }
 
     #[test]
