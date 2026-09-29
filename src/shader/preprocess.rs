@@ -195,59 +195,6 @@ fn reconcile_varyings(body: &str, produced: &BTreeMap<String, String>) -> String
     body
 }
 
-/// Rewrite what HLSL accepts and GLSL does not, for a shader that failed to compile as written.
-///
-/// Only a failed build comes through here, so a rewrite that would change a working shader's meaning
-/// never gets the chance. Two shapes, each from the library:
-///
-/// - a bare `g_TextureNResolution` (a `vec4`) where a `vec2` is meant — `CAST2(500) /
-///   g_Texture0Resolution`, 3497488774 — which HLSL truncates silently; it becomes `.xy`;
-/// - a local `const` with a runtime initializer (`const float cosAngle = cos(radians(u_hueShift))`,
-///   `color_grading`), which is read-only in HLSL but must be a constant expression in GLSL; the
-///   qualifier is dropped inside function bodies;
-/// - `albedo.rgb = mix(albedo, <vec3>, mask)`, a `vec4` blended with a `vec3` into three channels (three
-///   hue-shift effects); the first argument takes the same swizzle as the target.
-pub fn repair_hlsl(glsl: &str) -> String {
-    static RESOLUTION: OnceLock<Regex> = OnceLock::new();
-    static LOCAL_CONST: OnceLock<Regex> = OnceLock::new();
-    static SWIZZLED_MIX: OnceLock<Regex> = OnceLock::new();
-    #[expect(clippy::unwrap_used, reason = "fixed literal patterns")]
-    let (resolution, local_const, swizzled_mix) = (
-        RESOLUTION.get_or_init(|| Regex::new(r"\b(g_Texture\dResolution)\b([^.\w\[]|$)").unwrap()),
-        LOCAL_CONST.get_or_init(|| Regex::new(r"^(\s*)const\s+(\w+\s+\w+\s*=)").unwrap()),
-        SWIZZLED_MIX.get_or_init(|| Regex::new(r"^(\s*(\w+)\.(rgb|xyz)\s*=.*?\bmix\(\s*)(\w+)(\s*,)").unwrap()),
-    );
-    let mut depth = 0_i32;
-    let mut out = String::with_capacity(glsl.len() + 64);
-    for line in glsl.lines() {
-        let code = line.split("//").next().unwrap_or_default();
-        let directive = line.trim_start().starts_with('#');
-        let mut fixed = if directive || code.contains("uniform ") {
-            line.to_string()
-        } else {
-            resolution.replace_all(line, "$1.xy$2").into_owned()
-        };
-        if depth > 0 && !directive {
-            fixed = local_const.replace(&fixed, "$1$2").into_owned();
-            fixed = swizzled_mix
-                .replace(&fixed, |caps: &regex::Captures| {
-                    if caps[2] == caps[4] {
-                        format!("{}{}.{}{}", &caps[1], &caps[4], &caps[3], &caps[5])
-                    } else {
-                        caps[0].to_string()
-                    }
-                })
-                .into_owned();
-        }
-        if !directive {
-            depth += i32::try_from(code.matches('{').count()).unwrap_or(0) - i32::try_from(code.matches('}').count()).unwrap_or(0);
-        }
-        out.push_str(&fixed);
-        out.push('\n');
-    }
-    out
-}
-
 /// Give every `keyword` input (`varying` in a fragment shader, `attribute` in a
 /// vertex shader) a writable copy.
 ///
@@ -497,22 +444,6 @@ mod tests {
         )
         .unwrap();
         assert!(out.contains("#define mul"), "common.h was not prepended");
-    }
-
-    #[test]
-    fn hlsl_repairs_truncate_a_bare_resolution_and_unconst_a_runtime_local() {
-        let source = "uniform vec4 g_Texture0Resolution;\nconst float k = 2.0;\nvoid main() {\n\
-            \tconst float c = cos(g_Time);\n\tvec2 s = CAST2(500) / g_Texture0Resolution;\n\
-            \tvec2 t = g_Texture0Resolution.zw;\n\talbedo.rgb = vec3(mix(albedo, tint, mask));\n\
-            \tcolor.rgb = mix(albedo, tint, mask);\n}\n";
-        let out = repair_hlsl(source);
-        assert!(out.contains("uniform vec4 g_Texture0Resolution;"), "the declaration keeps its type");
-        assert!(out.contains("const float k = 2.0;"), "a global const stays const");
-        assert!(out.contains("\tfloat c = cos(g_Time);"));
-        assert!(out.contains("CAST2(500) / g_Texture0Resolution.xy;"));
-        assert!(out.contains("g_Texture0Resolution.zw;"), "a swizzled use is left alone");
-        assert!(out.contains("albedo.rgb = vec3(mix(albedo.rgb, tint, mask));"));
-        assert!(out.contains("color.rgb = mix(albedo, tint, mask);"), "only the target's own vector is narrowed");
     }
 
     #[test]

@@ -132,6 +132,133 @@ fn top_level_chunks(source: &str) -> (Vec<(usize, usize)>, String) {
 }
 
 // ---------------------------------------------------------------------------
+// Last resort, after a failed compile
+// ---------------------------------------------------------------------------
+
+/// Rewrite what HLSL accepts and GLSL does not, for a shader that failed to compile as written.
+///
+/// Only a failed build comes through here, so a rewrite that would change a working shader's meaning
+/// never gets the chance. Each shape is from the library:
+///
+/// - a bare `g_TextureNResolution` (a `vec4`) where a `vec2` is meant — `CAST2(500) /
+///   g_Texture0Resolution`, 3497488774 — which HLSL truncates silently; it becomes `.xy`;
+/// - a local `const` with a runtime initializer (`const float cosAngle = cos(radians(u_hueShift))`,
+///   `color_grading`), which is read-only in HLSL but must be a constant expression in GLSL; the
+///   qualifier is dropped inside function bodies;
+/// - `albedo.rgb = mix(albedo, <vec3>, mask)`, a `vec4` blended with a `vec3` into three channels (three
+///   hue-shift effects); the first argument takes the same swizzle as the target;
+/// - `int bar = step(..); bar *= <float>;`, a compound assignment that HLSL converts and truncates back
+///   into the integer (`Simple_Audio_Bars`); it becomes `bar = int(float(bar) * (..))`;
+/// - `shapeCoord.x += endAngle - startAngle < 0.0;`, a comparison (or a `&&` of them) used as a number in a
+///   compound assignment; it becomes `float(..)`.
+pub fn repair(glsl: &str) -> String {
+    // With the combos' `#if`s decided, a local declared one way per branch (`float bar` / `int bar`) has one
+    // type, and the typed passes above can act on it.
+    let resolved = resolve_conditionals(glsl).map_or_else(|| glsl.to_string(), |source| relax(&source));
+    let lined = repair_lines(&resolved);
+    let (chunks, scope) = top_level_chunks(&lined);
+    let global = declared_types(&scope);
+    let mut out = String::with_capacity(lined.len() + 64);
+    for &(start, end) in &chunks {
+        let chunk = &lined[start..end];
+        let mut types = global.clone();
+        types.extend(declared_types(chunk));
+        out.push_str(&repair_compound_assignments(chunk, &types));
+    }
+    out
+}
+
+/// Run the preprocessor over an assembled shader: macros expanded, dead branches gone, `#version` kept.
+/// `None` when it reports an error, and the source then goes on unresolved.
+fn resolve_conditionals(glsl: &str) -> Option<String> {
+    use glsl_lang_pp::processor::event::{DirectiveKind, Event};
+
+    let mut out = String::with_capacity(glsl.len());
+    for event in glsl_lang_pp::processor::str::process(glsl, glsl_lang_pp::processor::ProcessorState::default()) {
+        match event.ok()? {
+            Event::Token { token, masked: false } => out.push_str(token.text().to_string().as_str()),
+            Event::Directive { directive, masked: false } => {
+                if matches!(directive.kind(), DirectiveKind::Version(_) | DirectiveKind::Extension(_)) {
+                    let range = directive.text_range();
+                    out.push_str(glsl.get(usize::from(range.start().offset)..usize::from(range.end().offset))?);
+                    out.push('\n');
+                }
+            }
+            Event::Error { masked: false, .. } => return None,
+            _ => {}
+        }
+    }
+    Some(out)
+}
+
+/// The two compound-assignment shapes of `repair`, typed by the chunk's declarations.
+fn repair_compound_assignments(source: &str, types: &HashMap<String, Type>) -> String {
+    static COMPOUND: OnceLock<Regex> = OnceLock::new();
+    let pattern = COMPOUND.get_or_init(|| {
+        Regex::new(r"(?m)^([ \t]*)([A-Za-z_]\w*(?:\.[xyzwrgba]+)?)[ \t]*([-+*])=[ \t]*([^;{}]+);")
+            .unwrap_or_else(|_| unreachable!("the compound assignment pattern is a literal"))
+    });
+    pattern
+        .replace_all(source, |caps: &regex::Captures| {
+            let (indent, target, op, value) = (&caps[1], &caps[2], &caps[3], caps[4].trim());
+            let Some(want) = operand_type(target, types) else { return caps[0].to_string() };
+            let compares = ["<", ">", "==", "!="].iter().any(|cmp| value.contains(cmp))
+                && !value.contains("<<")
+                && !value.contains(">>")
+                && !value.contains('?');
+            match want.kind {
+                Kind::Float if compares => format!("{indent}{target} {op}= {}({value});", spell(want)),
+                Kind::Int | Kind::Uint if want.components == 1 && !target.contains('.') => {
+                    format!("{indent}{target} = {}(float({target}) {op} ({value}));", spell(want))
+                }
+                _ => caps[0].to_string(),
+            }
+        })
+        .into_owned()
+}
+
+fn repair_lines(glsl: &str) -> String {
+    static RESOLUTION: OnceLock<Regex> = OnceLock::new();
+    static LOCAL_CONST: OnceLock<Regex> = OnceLock::new();
+    static SWIZZLED_MIX: OnceLock<Regex> = OnceLock::new();
+    #[expect(clippy::unwrap_used, reason = "fixed literal patterns")]
+    let (resolution, local_const, swizzled_mix) = (
+        RESOLUTION.get_or_init(|| Regex::new(r"\b(g_Texture\dResolution)\b([^.\w\[]|$)").unwrap()),
+        LOCAL_CONST.get_or_init(|| Regex::new(r"^(\s*)const\s+(\w+\s+\w+\s*=)").unwrap()),
+        SWIZZLED_MIX.get_or_init(|| Regex::new(r"^(\s*(\w+)\.(rgb|xyz)\s*=.*?\bmix\(\s*)(\w+)(\s*,)").unwrap()),
+    );
+    let mut depth = 0_i32;
+    let mut out = String::with_capacity(glsl.len() + 64);
+    for line in glsl.lines() {
+        let code = line.split("//").next().unwrap_or_default();
+        let directive = line.trim_start().starts_with('#');
+        let mut fixed = if directive || code.contains("uniform ") {
+            line.to_string()
+        } else {
+            resolution.replace_all(line, "$1.xy$2").into_owned()
+        };
+        if depth > 0 && !directive {
+            fixed = local_const.replace(&fixed, "$1$2").into_owned();
+            fixed = swizzled_mix
+                .replace(&fixed, |caps: &regex::Captures| {
+                    if caps[2] == caps[4] {
+                        format!("{}{}.{}{}", &caps[1], &caps[4], &caps[3], &caps[5])
+                    } else {
+                        caps[0].to_string()
+                    }
+                })
+                .into_owned();
+        }
+        if !directive {
+            depth += i32::try_from(code.matches('{').count()).unwrap_or(0) - i32::try_from(code.matches('}').count()).unwrap_or(0);
+        }
+        out.push_str(&fixed);
+        out.push('\n');
+    }
+    out
+}
+
+// ---------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------
 
@@ -1237,6 +1364,35 @@ mod tests {
     use super::*;
 
     #[test]
+    fn hlsl_repairs_truncate_a_bare_resolution_and_unconst_a_runtime_local() {
+        let source = "uniform vec4 g_Texture0Resolution;\nconst float k = 2.0;\nvoid main() {\n\
+            \tconst float c = cos(g_Time);\n\tvec2 s = CAST2(500) / g_Texture0Resolution;\n\
+            \tvec2 t = g_Texture0Resolution.zw;\n\talbedo.rgb = vec3(mix(albedo, tint, mask));\n\
+            \tcolor.rgb = mix(albedo, tint, mask);\n}\n";
+        let out = repair(source);
+        assert!(out.contains("uniform vec4 g_Texture0Resolution;"), "the declaration keeps its type");
+        assert!(out.contains("const float k = float(2.0);"), "a global const stays const: {out}");
+        assert!(out.contains("\tfloat c = float(cos(g_Time));"), "got {out}");
+        assert!(out.contains("CAST2(500) / g_Texture0Resolution.xy"), "got {out}");
+        assert!(out.contains("g_Texture0Resolution.zw)"), "a swizzled use is left alone: {out}");
+        assert!(out.contains("albedo.rgb = vec3(mix(albedo.rgb, tint, mask));"));
+        assert!(out.contains("color.rgb = mix(albedo, tint, mask);"), "only the target's own vector is narrowed");
+    }
+
+    #[test]
+    fn a_repaired_compound_assignment_keeps_the_hlsl_meaning() {
+        let source = "void main() {\n\tint bar = int(step(0.5, x));\n\tbar *= 1.0 - smoothstep(0.0, 1.0, y);\n\
+            \tvec2 shapeCoord = vec2(0.0);\n\tshapeCoord.x += a - b < 0.0;\n\tshapeCoord.y += 2.0;\n\tfloat clip = 1.0;\n\
+            \tclip *= x > 0.0 && y < 1.0;\n}\n";
+        let out = repair(source);
+        assert!(out.contains("\tbar = int(float(bar) * (1.0 - smoothstep(0.0, 1.0, y)));"), "got {out}");
+        assert!(out.contains("\tshapeCoord.x += float(a - b < 0.0);"), "got {out}");
+        assert!(out.contains("\tshapeCoord.y += 2.0;"), "a float added to a float is left alone: {out}");
+        assert!(out.contains("\tclip *= float(x > 0.0 && y < 1.0);"), "got {out}");
+    }
+
+
+    #[test]
     fn a_narrower_declaration_truncates_its_initializer() {
         // `edge_glow` computes a Sobel magnitude into a float from two vec3s.
         let source = "vec3 gx; vec3 gy;\n\tfloat g = gx*gx + gy*gy;\n";
@@ -1407,3 +1563,4 @@ mod tests {
         assert_eq!(types.get("k").map(|t| t.kind), Some(Kind::Int));
     }
 }
+

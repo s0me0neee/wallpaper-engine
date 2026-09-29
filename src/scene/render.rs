@@ -587,7 +587,7 @@ fn resolve_textures(
 /// Compile a pass as written, or failing that with its HLSL-only forms rewritten; the first error is the one kept.
 fn compile_or_repair(gl: &glow::Context, vertex: &str, fragment: &str) -> Result<pass::Program> {
     pass::compile_program(gl, vertex, fragment).or_else(|error| {
-        pass::compile_program(gl, &preprocess::repair_hlsl(vertex), &preprocess::repair_hlsl(fragment)).map_err(|_| error)
+        pass::compile_program(gl, &crate::shader::hlsl::repair(vertex), &crate::shader::hlsl::repair(fragment)).map_err(|_| error)
     })
 }
 

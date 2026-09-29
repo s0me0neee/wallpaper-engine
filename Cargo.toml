@@ -76,6 +76,7 @@ rayon = "1.12.0"
 ab_glyph = "0.2.32"
 fontdb = "0.24.0"
 serde_json_lenient = "0.2"
+glsl-lang-pp = { version = "0.8", features = ["full"] }
 
 # CGL has no true surfaceless or pbuffer surface, only a window's; these three
 # build the one never-shown NSWindow the headless GL context attaches to
