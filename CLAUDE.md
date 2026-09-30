@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ```bash
 cargo build --release          # always: one scene_example2 frame is 1.5s release vs 19.6s debug
-cargo test                     # 114 tests, all unit tests inside src/
+cargo test                     # ~230 tests, all unit tests inside src/
 cargo test <substring>         # single test, e.g. cargo test blend_mode_comes_from_the_first_pass
 cargo clippy --all-targets     # must be clean: clippy::pedantic is deny, as are unwrap_used/panic/todo/exit
 ```
@@ -170,6 +170,12 @@ any wallpaper — and is not ours to redistribute. So:
   slider for free.
 - `shader/bind.rs` — resolves material values onto uniforms, and derives combo values from which
   texture slots are bound.
+- `shader/hlsl.rs` — workshop shaders are written against HLSL's looser conversions. `relax` always
+  runs typed, lexical fixes (truncation on assignment, bool in arithmetic, `%` on floats, …); when a
+  pass still fails to compile, `render::compile_or_repair` retries it through `hlsl::repair`, which
+  first resolves the `#if`s with `glsl-lang-pp` (so a local has one type) and then applies rewrites
+  that are only safe on a shader already known to fail (bare `g_TextureNResolution` → `.xy`, runtime
+  local `const`, `mix(vec4, vec3)`, `int *= float`, texture coordinates past `.xy`).
 
 `mul` puts the matrix on the left (HLSL convention). Getting this wrong is silent corruption; there
 is a dedicated test.
@@ -215,6 +221,17 @@ evidence.
   textures, which nothing here produces. For a texture derived from the layer it is WE's size, not
   ours: WE sizes effect buffers from the layer's authored `size`, and some shaders build coordinates
   from it, so a chain rendered at display size reports `size × texel_scale` (plan.md §4.29).
+- **`_rt_imageLayerComposite_<id>` may name another layer**, usually a hidden one kept only as a source
+  (20 of 31 uses in the library). Such layers are prepared anyway (`StaticScene::sources`), finished
+  first each frame (`compose::source_order`), and bound as `PassTexture::Layer(id)`.
+- **A composition layer keeps its whole rectangle**, even far past the canvas: its effects run in its
+  own texture coordinates, and clipping it re-maps them (plan.md §4.32, ex4's moon).
+- **An RG88 particle sprite is grey + alpha**, unlike an RG88 flow map read by a shader (`sprite.rs`).
+- **Package JSON may carry trailing commas** (WE's own `fluidsimulation/effect.json` does): asset JSON
+  goes through `crate::json::from_slice`, not `serde_json`.
+- **A user-bound value comes from `project.json`** (`general.properties`), coerced to the shape of the
+  published value; a hidden parent hides its children; a particle's object scale stretches its
+  sprites per axis.
 
 ### Verification
 

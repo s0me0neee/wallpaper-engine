@@ -8,13 +8,25 @@ useful building blocks (thumbnails, debugging, Video-type passthrough) but are
 no longer the deliverable; exporting a finished mp4 for some *other* wallpaper
 app to play is superseded by that goal and dropped from the roadmap (§7, §8).
 
-**Status.** Container layer, type routing and the Video pipeline are built and
-verified against a six-wallpaper corpus. The Scene renderer now runs the real
-GPU effect chain for the common one-image-plus-effects shape (§4); richer
-scenes (multiple image layers, particles) still fall back to the effect-free
-composite (§4.7). A `simulate` subcommand plays that same chain live in a real
-window at wall-clock speed — the base the live desktop backend (§14) builds
-on. Web capture and the desktop backend itself are still to build.
+**Status** (2026-09-30). Container, type routing and the Video pipeline are
+done. The Scene renderer draws every layer kind the library uses — images with
+their own effect chains, puppets, particles on the GPU, text, composition and
+solid layers, blend modes, bloom, camera zoom — and `simulate` plays it live,
+running the scene's scripts and keyframe tracks every frame. Fidelity is
+measured against native Wallpaper Engine run under Proton on this machine: 78
+of the 87 library scenes are captured and scored (mean ~24 dB PSNR, range
+6–51). What is still to build: the desktop backend on Linux (§14 — `desktop`
+is macOS only), web wallpapers (§9), and 60 fps (§14.7).
+
+**Start here** in a new session:
+
+- §4.32 — the Proton reference captures: how to run WE and record it, the
+  comparison tools, every fix they found with its measured effect, where the
+  library sits, and the ranked open list. Read it before touching fidelity.
+- §14.7 — the performance goal (60 fps on most scenes) and where to start.
+- `CLAUDE.md` — commands, the debugging hooks (`SIMULATE_DUMP`, `_LAYERS`,
+  `_TRACE`, `_CLOCK`), format conventions that were each a real bug, and the
+  measuring workflow.
 
 ---
 
@@ -1938,6 +1950,9 @@ time is given):
 | puppet vertex format 14, and a clip record behind a block of its own (not the fixed 35 bytes) | 3490034653's 人物1 and 3022080536's 主体 warp again |
 | `export` drew every layer unrolled | 3490034653's still 8.4 → 16.3 (letterbox bars rolled a quarter turn off-canvas) |
 | `_rt_imageLayerComposite_<id>` naming *another*, usually hidden, layer was bound to the chain's own base | 3640882040 6.9 → 12.9 at t=4 (its character), 3113287126 21.8 → 25.7 |
+| a composition layer clipped to the canvas re-mapped its effect's texture coordinates | ex4's clouds drifted over the opaque sky patch its moon is painted on (a dark box, −21 levels); now within a level of WE; ex4 30.9 → 34.6 at t=6 |
+| an RG88 *sprite* read as two colour channels (df393aa); WE's particle shader reads it as grey+alpha | Magic-Hat's magic circle drew as hard squares, 19.9 → 23.3 at t=5; 2549887469 +2.1 |
+| WE's own `util/noise`/`util/clouds_256` replaced by our synthesized stand-in; repeating textures without mipmaps | now read from the install and mipmapped |
 
 A full re-run with the chain fixes in (before the last four rows) moved the
 78-scene mean from 23.6 to 24.2 dB; the only scene more than 0.3 dB worse is
@@ -1977,37 +1992,61 @@ Found along the way, not yet fixed: text is fitted to its box where WE uses
 may be a parallax overscan zoom — and if so, the same thing as ex3's static
 per-layer offsets (§4.25).
 
-**Open, in order of payoff:**
+**Open, in order of payoff** (as of 2026-09-30):
 
-1. ~~**SceneScript.**~~ Done, above; the original note: 53 of 87 scenes script a value somewhere — `visible` 277
-   times, `scale` 267, `origin` 257, `alpha` 189, `text` 351 — against an API
-   of `engine.frametime`/`runtime`/`timeOfDay`/`canvasSize`/`userProperties`,
-   `thisLayer`, `thisScene.getLayer`, `shared`, `createScriptProperties` and
-   audio buffers. Text scripts run already (`script.rs`); everything else is
-   frozen at its published value, which is what the five worst scenes above
-   have in common. It is the largest single gap left and needs a per-frame
-   runtime over the whole object tree, not a per-value evaluator.
-2. **Puppet effects run in texture space, before the warp.** A puppet with
+1. **Performance** — §14.7. Scenes run 11–37 fps, GPU-bound.
+2. **Camera parallax / overscan.** With `cameraparallax` on, WE draws 3233141951
+   ~1.2x larger than we do; probably an overscan zoom so parallax never shows an
+   edge, and probably the same thing as ex3's static per-layer offsets (§4.25).
+   Camera parallax itself is unimplemented (comparisons hold because the capture
+   parks the cursor at centre). Camera shake (§4.19) is unimplemented too: ex8's
+   WE frame moves −10..+24 px vertically; `linux-wallpaperengine` parses the
+   settings and never applies them, so the curve has to be fitted from captures.
+3. **Text size.** We fit text to its box; WE uses `pointsize`. Clocks come out
+   smaller (SandBlack, 3640882040).
+4. **Puppet effects run in texture space, before the warp.** A puppet with
    effects has its chain run over our CPU-warped, padded image, so masks miss
    (ex2's irises lose the purple `shine`/`godrays`). Dropping the pad fixed the
-   masks but clipped ex2's pendant, which WE does not clip. WE's order must be:
-   chain over the flat texture, then draw the skinned mesh sampling its result —
-   a GPU mesh pass, since `puppet::rasterize` is CPU-only.
-3. **Composition layers drawn through `blend`** (3640882040) and the HDR bloom
-   scenes.
-4. **Camera shake** (§4.19): ex8's WE frame moves vertically −10..+24 px, not
-   at all horizontally. `linux-wallpaperengine` parses the settings and never
-   applies them, so the curve has to be fitted from captures. Camera parallax
-   is still unimplemented too; the comparisons only hold because the cursor is
-   parked at rest.
-5. **What still fails to build**: only `audio_yuan`'s syntax (3749558337,
-   which crashes WE too). 3640882040 draws its character now but sits larger and
-   offset against WE, with a smaller clock font — framing, not content.
-6. **ex3's two building layers** (§4.25), confirmed static; scene lights (3
-   scenes); `util/noise`-driven sparkle phase.
+   masks but clipped ex2's pendant, which WE does not clip. WE's order: chain over
+   the flat texture, then the skinned mesh samples its result — a GPU mesh pass.
+5. **Which keyframe tracks WE plays.** SandBlack's unnamed post-layer Brightness
+   track (−1 → +1 over 4 s) visibly does not play in WE; named ones (3438699689's
+   `b11`, `ll`) do. Until that is understood SandBlack is 0.8 dB worse with tracks.
+6. **Script gaps** (40 of 1814 fail, `info` lists them): the Noeru script library
+   needs real texture-animation frame counts; layers other scripts create at
+   runtime (`thisScene.createLayer` returns null); one script is written against a
+   non-WE `scene.on`; one is obfuscated. Cursor and media events never fire. Text
+   layers whose *first* script run yields nothing are dropped at load and never
+   revived. `export` freezes every scripted/animated value.
+7. **Magic-Hat's glyph** sits in a different place from WE's (WE: blue glows both
+   sides behind her); HDR+bloom scenes (3287715210, 3291326967, ex8) score low;
+   scene lights (3 scenes, 3047405322); ex3's two building layers (§4.25).
+8. **Captures that crash WE** under Wine (8 scenes, listed above) have no
+   reference; 3749558337's `audio_yuan` shader does not compile (WE crashes on it
+   too).
 
-Next: re-run `we_compare.py` over the library with the chain fixes in, then take
-the list above from the top.
+**How to measure a change** (what this work settled on):
+
+- One frame: `tools/we_compare.py <wallpaper> <clip> --times 5:5:1` renders ours
+  hidden, aligns to the capture (±100 ms), and reports PSNR; `--binary` runs any
+  other build, so build the baseline with `git stash; CARGO_TARGET_DIR=<scratch>
+  cargo build --release; git stash pop` and compare the two on the same frames.
+  Never rebuild `target/release` while a background batch is using it; copy the
+  binary and point the batch at the copy.
+- A library sweep: `we_compare.py` per clip (~1 min each at 1080p, ~80 min for
+  all), then compare `report.json` means against the previous run's.
+- What failed to build: `export --resolution 640x360` over every scene is
+  headless and lists every skipped chain (`effect chain skipped (…)`); `info`
+  lists script failures.
+- Which layer: `SIMULATE_LAYERS=0-N` dumps a prefix of the stack (bisect a bad
+  frame), `SIMULATE_LAYERS=all` prints the roster; `SIMULATE_TRACE=1` prints
+  scripted values, uniforms and pass targets.
+- A shader that fails: dump its preprocessed source and run `glslangValidator
+  -S frag` on it for the exact line; the driver's line numbers count injected
+  defines.
+- Any `simulate` dump opens a window; hide it with a Hyprland windowrule on the
+  scene's title (`workspace special:wecompare silent`) and `hyprctl reload`
+  afterwards, as `we_compare.py` does.
 
 ---
 
