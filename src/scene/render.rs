@@ -56,10 +56,26 @@ fn builtin_solid(name: &str) -> Option<[u8; 4]> {
 /// generator) on a torus embedding of the UV square at integer angular
 /// frequencies, so the wrap is continuous by construction — which matters
 /// because these are sampled `REPEAT` well outside `[0, 1]`.
+/// WE's own copy of a noise texture, when its assets are there to read (`Archive::read` falls back to them).
+///
+/// The stand-in below is noise, but not WE's noise: `scene_example4`'s clouds read `util/clouds_256`, and
+/// ours lit the sky a few levels brighter than WE's, enough to show the opaque patch of sky its moon is
+/// painted on as a dark box.
+fn stock_noise(archive: &mut Archive, name: &str) -> Option<RgbaImage> {
+    if !is_noise_name(name) {
+        return None;
+    }
+    let tex = crate::tex::parse_bytes(&archive.read(&format!("materials/{name}.tex")).ok()?).ok()?;
+    crate::tex::decode_rgba(&tex, crate::tex::largest_mipmap(&tex).ok()?).ok()
+}
+
+fn is_noise_name(name: &str) -> bool {
+    matches!(name, "util/noise" | "util/clouds_256" | "util/clouds")
+}
+
 fn builtin_noise(name: &str) -> Option<RgbaImage> {
     static TEXTURE: OnceLock<RgbaImage> = OnceLock::new();
-    matches!(name, "util/noise" | "util/clouds_256" | "util/clouds")
-        .then(|| TEXTURE.get_or_init(build_noise_texture).clone())
+    is_noise_name(name).then(|| TEXTURE.get_or_init(build_noise_texture).clone())
 }
 
 fn build_noise_texture() -> RgbaImage {
@@ -679,7 +695,7 @@ fn resolve_slot_texture(
         if let Some(solid) = builtin_solid(name) {
             return Ok((pass::solid_texture(gl, solid)?, (1, 1)));
         }
-        if let Some(noise) = builtin_noise(name) {
+        if let Some(noise) = stock_noise(archive, name).or_else(|| builtin_noise(name)) {
             let size = (noise.width(), noise.height());
             return Ok((pass::upload_repeating_texture(gl, &noise)?, size));
         }
@@ -694,7 +710,7 @@ fn resolve_slot_texture(
     }
 
     let default_name = default.and_then(Value::as_str);
-    if let Some(noise) = default_name.and_then(builtin_noise) {
+    if let Some(noise) = default_name.and_then(|name| stock_noise(archive, name).or_else(|| builtin_noise(name))) {
         let size = (noise.width(), noise.height());
         return Ok((pass::upload_repeating_texture(gl, &noise)?, size));
     }

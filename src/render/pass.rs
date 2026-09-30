@@ -244,7 +244,17 @@ fn upload_with_wrap(gl: &glow::Context, image: &image::RgbaImage, wrap: u32) -> 
             glow::UNSIGNED_BYTE,
             glow::PixelUnpackData::Slice(Some(image.as_raw())),
         );
-        gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MIN_FILTER, gl_enum(glow::LINEAR));
+        // A tiling texture is sampled at any scale and often at an explicit level: `clouds` reads its
+        // noise with textureLod at `smoothness`, through a perspective warp that shrinks it towards the
+        // horizon. Without a mip chain every level is the full-detail base, which aliases into bright
+        // streaks where WE averages to a faint haze (scene_example4's sky, around its moon).
+        let min_filter = if wrap == glow::REPEAT {
+            gl.generate_mipmap(glow::TEXTURE_2D);
+            glow::LINEAR_MIPMAP_LINEAR
+        } else {
+            glow::LINEAR
+        };
+        gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MIN_FILTER, gl_enum(min_filter));
         gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MAG_FILTER, gl_enum(glow::LINEAR));
         gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_WRAP_S, gl_enum(wrap));
         gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_WRAP_T, gl_enum(wrap));
