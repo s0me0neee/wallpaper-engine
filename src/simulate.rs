@@ -502,6 +502,53 @@ fn uniform_scripts(chain: &EffectChain, bindings: &scripting::Bindings, object_i
         .collect()
 }
 
+/// A particle object's `instanceoverride` this frame, from its tracks and scripts over the published one.
+/// `None` when nothing drives it.
+fn particle_overrides(scripted: &Scripted, scene: &Scene, object_index: usize, time: f32) -> Option<model::InstanceOverride> {
+    let object = scene.objects.get(object_index)?;
+    let published = object.instanceoverride.unwrap_or_default();
+    let mut value = published;
+    let mut driven = false;
+    let mut set = |field: &str, sample: &dyn Fn(usize) -> Option<f32>, relative: bool| {
+        let scalar = |target: &mut f32, base: f32| match sample(0) {
+            Some(sample) => {
+                *target = if relative { base + sample } else { sample };
+                true
+            }
+            None => false,
+        };
+        driven |= match field {
+            "count" => scalar(&mut value.count, published.count),
+            "rate" => scalar(&mut value.rate, published.rate),
+            "size" => scalar(&mut value.size, published.size),
+            "speed" => scalar(&mut value.speed, published.speed),
+            "alpha" => scalar(&mut value.alpha, published.alpha),
+            "brightness" => scalar(&mut value.brightness, published.brightness),
+            "colorn" => match (sample(0), sample(1), sample(2)) {
+                (Some(x), Some(y), Some(z)) => {
+                    value.colorn = Some(model::Vec3 { x, y, z });
+                    true
+                }
+                _ => false,
+            },
+            _ => false,
+        };
+    };
+    for model::PropertyTrack { path, track } in &object.tracks {
+        if let Some(field) = path.strip_prefix("instanceoverride.") {
+            set(field, &|channel| model::sample_channel(track, channel, time), track.relative);
+        }
+    }
+    if let Some(host) = &scripted.host {
+        for (binding, (index, path)) in host.bindings.iter().enumerate() {
+            let (true, Some(field)) = (*index == object_index, path.strip_prefix("instanceoverride.")) else { continue };
+            let Some(floats) = scripted.values.get(binding).and_then(scripting::floats) else { continue };
+            set(field, &|channel| floats.get(channel).copied(), false);
+        }
+    }
+    driven.then_some(value)
+}
+
 /// The keyframed `constantshadervalues` of `object` that `chain` compiled a pass for, each with its
 /// published value to be relative to.
 fn uniform_tracks(chain: &EffectChain, object: &model::Object) -> Vec<(usize, String, model::Track, Vec<f32>)> {
@@ -1534,8 +1581,7 @@ fn redraw(app: &mut App, time: f32) -> Result<bool> {
 
     run_panel(state);
 
-    let texts: &[scripting::LayerState] = scripted.as_ref().map_or(&[], |scripted| scripted.layers.as_slice());
-    let shapes = refresh_layers(state, static_scene, texts, time)?;
+    let shapes = refresh_layers(state, static_scene, scripted.as_ref().map(|scripted| (scripted, &**scene)), time)?;
 
     // Stack the layers into the composite target, each under its blend mode.
     let gpu_start = Instant::now();
@@ -1654,9 +1700,16 @@ fn redraw(app: &mut App, time: f32) -> Result<bool> {
 fn refresh_layers(
     state: &mut State,
     static_scene: &compose::StaticScene<'_>,
-    texts: &[scripting::LayerState],
+    driven: Option<(&Scripted, &Scene)>,
     time: f32,
 ) -> Result<Vec<Option<particle::DrawList>>> {
+    let texts: &[scripting::LayerState] = driven.map_or(&[], |(scripted, _)| scripted.layers.as_slice());
+    // Worked out here rather than in the parallel pass below: the script host is not `Sync`.
+    let overrides: Vec<Option<model::InstanceOverride>> = state
+        .layers
+        .iter()
+        .map(|layer| driven.and_then(|(scripted, scene)| particle_overrides(scripted, scene, layer.object_index, time)))
+        .collect();
     // Per-frame CPU work: re-skin puppets, re-simulate particles, then upload
     // each fresh image into the next texture in its ring.
     // Each layer's own image is independent of every other layer's, so the two
@@ -1667,7 +1720,8 @@ fn refresh_layers(
     let refreshed = state
         .layers
         .par_iter_mut()
-        .map(|layer| match &mut layer.kind {
+        .zip(overrides.par_iter())
+        .map(|(layer, overrides)| match &mut layer.kind {
             // A composition layer's input is produced on the GPU during the
             // composite pass below, not here.
             LiveKind::Image | LiveKind::Composition { .. } => Ok(None),
@@ -1704,11 +1758,17 @@ fn refresh_layers(
                 Ok(Some(Refreshed::Image(image, rect)))
             }
             LiveKind::ParticleGpu { placement, preset_path, presets, table, .. } => {
+                if let Some(overrides) = overrides {
+                    placement.overrides = *overrides;
+                }
                 let list = particle::build_draw_list(presets, table, preset_path, placement, time)
                     .with_context(|| format!("simulating {preset_path}"))?;
                 Ok(Some(Refreshed::Shapes(list)))
             }
             LiveKind::Particle { placement, preset_path, presets, tints } => {
+                if let Some(overrides) = overrides {
+                    placement.overrides = *overrides;
+                }
                 let image = particle::render_system_from(presets, preset_path, placement, time, tints)
                     .with_context(|| format!("simulating {preset_path}"))?
                     .image;
