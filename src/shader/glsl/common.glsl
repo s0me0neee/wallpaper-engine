@@ -35,6 +35,8 @@
 #define rsqrt(x) inversesqrt(x)
 #define atan2(y, x) atan((y), (x))
 #define fmod(a, b) mod((a), (b))
+// HLSL's, which GLSL lacks: `tone_mapping` (2911866381) takes a log10 of luminance.
+#define log10(x) (log(x) * 0.43429448190325176)
 #define ddx(x) dFdx(x)
 #define ddy(x) dFdy(x)
 
