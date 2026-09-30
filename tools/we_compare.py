@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Compare our renderer against a `we_capture.py` recording of native Wallpaper Engine.
 
-    tools/we_compare.py papers/scene_example2 papers/_we_captures/proton_4k/2619088810.mkv
+    tools/we_compare.py papers/scene_example2 papers/_we_captures/proton_1080p/2619088810.mkv
 
 Renders our frames with `simulate`'s dump hook at a grid of `g_Time`s, pairs each
 with the capture at the same time, and writes <out>/report.json plus pictures:
