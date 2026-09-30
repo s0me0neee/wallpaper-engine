@@ -148,7 +148,9 @@
         frameCount: 1, rate: 1, duration: 0, visible: true,
         play() {}, pause() {}, stop() {}, setFrame() {}, getFrame: () => 0, isPlaying: () => false,
         playSingleAnimation() {}, name: '',
+        addEndedCallback() {}, addFrameCallback() {}, removeEndedCallback() {}, removeFrameCallback() {},
     });
+    const material = () => ({ setValue() {}, getValue: () => undefined });
     const vectorFields = ['origin', 'scale', 'angles', 'color', 'size'];
 
     const layers = [];
@@ -166,7 +168,13 @@
         getAnimation() { return animation(); }
         getAnimationLayer() { return animation(); }
         getAnimationLayerCount() { return 0; }
-        getEffect() { return { visible: true, name: '' }; }
+        getEffect() { return { visible: true, name: '', getMaterial: material }; }
+        getMaterial() { return material(); }
+        // A sound layer's; nothing plays here.
+        play() {}
+        stop() {}
+        pause() {}
+        isPlaying() { return false; }
         getEffectCount() { return 0; }
         getParticleSystem() { return null; }
         getVideoTexture() { return null; }
@@ -268,6 +276,9 @@
                 try {
                     if (this.stage === 'init') {
                         if (typeof script.module.init === 'function') set(script, script.module.init(get(script)));
+                    } else if (this.stage === 'apply') {
+                        // After every init, not after each: 3497488774's layers apply their settings through
+                        // helpers a later layer's init has not finished preparing yet.
                         if (typeof script.module.applyUserProperties === 'function') {
                             script.module.applyUserProperties(engine.userProperties);
                         }
@@ -283,6 +294,7 @@
             if (this.cursor > 0) fail(scripts[this.cursor - 1], this.stage, 'interrupted: ran past its budget');
         },
         dropTimers() { timers = []; },
+        begin_stage(stage) { this.stage = stage; this.cursor = 0; },
         begin(time, dt) {
             runtime = time;
             engine.runtime = time;

@@ -31,7 +31,9 @@
 //! single-file scripts with no imports between them, so a module graph would be
 //! plumbing with nothing to resolve.
 
+use regex::Regex;
 use rquickjs::{Context, Runtime};
+use std::sync::OnceLock;
 use serde_json::{Map, Value};
 
 /// Wallpaper Engine's own host surface, as far as this contract needs it.
@@ -58,19 +60,20 @@ globalThis.createScriptProperties = function () {
 ";
 
 /// Rewrite an ES module's exports into plain declarations.
+///
+/// The separator is any whitespace JavaScript accepts, no-break space included: 3409595232 writes
+/// `export\u{a0}function\u{a0}update`.
 pub(crate) fn strip_exports(source: &str) -> String {
-    source
-        .replace("export function", "function")
-        .replace("export var", "var")
-        .replace("export let", "let")
-        .replace("export const", "const")
-        .replace("export default", "var weDefault =")
-        .replace("export class", "class")
-        .replace("export async function", "async function")
-        .lines()
-        .filter(|line| !(line.trim_start().starts_with("export {") && line.trim_end().ends_with([';', '}'])))
-        .collect::<Vec<_>>()
-        .join("\n")
+    static DECLARATION: OnceLock<Regex> = OnceLock::new();
+    static LIST: OnceLock<Regex> = OnceLock::new();
+    #[expect(clippy::unwrap_used, reason = "fixed literal patterns")]
+    let (declaration, list) = (
+        DECLARATION.get_or_init(|| Regex::new(r"\bexport[\s\u{a0}]+(default[\s\u{a0}]+)?(async[\s\u{a0}]+function|function|var|let|const|class)\b").unwrap()),
+        LIST.get_or_init(|| Regex::new(r"(?m)^[ \t]*export[\s\u{a0}]*\{[^}]*\}[ \t]*;?[ \t]*$").unwrap()),
+    );
+    let source = list.replace_all(source, "");
+    let source = declaration.replace_all(&source, "$2");
+    source.replace("export default", "var weDefault =")
 }
 
 /// Run `script`'s `update` and return what it produced.
@@ -135,6 +138,16 @@ mod tests {
         let mut properties = Map::new();
         properties.insert("flag".to_string(), Value::Bool(false));
         assert_eq!(run_text(script, Some(&properties), ""), Ok("false".to_string()));
+    }
+
+    #[test]
+    fn every_export_form_becomes_a_plain_declaration() {
+        let source = "export\u{a0}function\u{a0}update(v) {}\nexport var a = 1;\nexport default function f() {}\n\
+                      export class C {}\nexport async function g() {}\nexport { a, C };\nvar s = 'export function';";
+        let out = strip_exports(source);
+        assert!(!out.contains("export\u{a0}") && !out.contains("export {"), "{out}");
+        assert!(out.contains("\u{a0}update(v)") && out.contains("var a = 1;") && out.contains("class C {}"), "{out}");
+        assert!(out.contains("async function g()") && out.contains("function f()"), "{out}");
     }
 
     #[test]

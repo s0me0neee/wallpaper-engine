@@ -117,6 +117,8 @@ pub fn start(scene: &Scene, properties: &Map<String, Value>, canvas: (u32, u32),
         }
     }
     host.run_scripts()?;
+    host.eval("__we.begin_stage('apply');").map_err(|error| anyhow!("applying the settings: {error}"))?;
+    host.run_scripts()?;
     Ok(Some(host))
 }
 

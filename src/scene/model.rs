@@ -194,7 +194,8 @@ fn hoist_property_scripts(node: &mut Value) {
             Value::Object(map) => {
                 // Keyframes likewise: 150 tracks in 26 library scenes, only 42 of them on `alpha` —
                 // 3438699689 opens by sliding two black bars (`origin`) off a frame faded up from black.
-                if let Some(track) = map.get("animation").filter(|track| track.is_object()) {
+                // A value that carries a script as well is the script's: it gets the value to work with.
+                if let Some(track) = map.get("animation").filter(|track| track.is_object() && !map.contains_key("script")) {
                     tracks.push(json!({ "path": path, "track": track }));
                     return;
                 }
