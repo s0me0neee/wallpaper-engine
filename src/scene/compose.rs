@@ -528,18 +528,18 @@ fn static_composition<'a>(
     let (rect_left, rect_top) = to_pixels(canvas, origin_x - extent_x / 2.0, origin_y + extent_y / 2.0);
     let (width, height) = to_pixel_size(extent_x * canvas.scale, extent_y * canvas.scale);
 
-    // Clipped to the canvas: a composition layer can be far larger than the
-    // screen (`scene_example4`'s cloud layer is 3.07x the canvas in Y), and
-    // only the part over the canvas has any frame under it to read. Allocating
-    // the full rectangle would mean a 4k x 6.6k render target per pass.
-    let (left, top, width, height) = clip_to_canvas(
-        round_to_i64(rect_left),
-        round_to_i64(rect_top),
-        width,
-        height,
-        canvas.width,
-        canvas.height,
-    );
+    // Kept whole, as WE renders it, unless that is beyond any sane target: a composition layer's effects
+    // run in its own texture coordinates, so clipping it to the canvas re-maps them. `scene_example4`'s
+    // cloud layer is 3.07x the canvas in Y, and clipped, its perspective warp and cloud scale ran over the
+    // visible third as if it were the whole — the clouds drifted into the patch of sky its moon is
+    // painted on and showed it as a dark box, which WE's never do. Only the part over the canvas has a
+    // frame under it; the rest reads the clamped edge, and draws off-screen.
+    let budget = 4 * u64::from(canvas.width) * u64::from(canvas.height);
+    let (left, top, width, height) = if u64::from(width) * u64::from(height) <= budget && width.max(height) <= 16384 {
+        (round_to_i64(rect_left), round_to_i64(rect_top), width, height)
+    } else {
+        clip_to_canvas(round_to_i64(rect_left), round_to_i64(rect_top), width, height, canvas.width, canvas.height)
+    };
 
     Some(StaticImage {
         object,
