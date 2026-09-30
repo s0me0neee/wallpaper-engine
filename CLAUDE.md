@@ -79,6 +79,10 @@ SIMULATE_DUMP=/tmp/frame.png SIMULATE_TIME=2.6 cargo run --release -- simulate p
 It renders the composited frame at a pinned `g_Time` through the *live* pipeline, writes it, and
 exits. Its startup line also reports the tweakable-parameter count and any layer whose effect chain
 failed to compile — a chain silently dropping is the failure mode this catches.
+It also reports how many of the scene's scripts failed and why; `SIMULATE_CLOCK=<unix seconds>`
+pins the scripts' wall clock (`Date`, `engine.timeOfDay`) so a clock or time-of-day scene can be
+compared against a capture taken at that moment, and `SIMULATE_TRACE=1` prints every scripted
+value at the dumped frame.
 
 `export` on a scene writes only `still.png` and honours only the *first* `--frame`; the repeated
 `--frame` and video options apply to video wallpapers.
@@ -132,6 +136,20 @@ the same concept, so `Vec3` has a custom deserializer.
 
 An `EffectChain` is compiled once and redrawn at any `g_Time` without touching the archive, the
 preprocessor or the GL compiler again — that split is why the live simulator is viable.
+
+### Driven values: scripts and keyframe tracks
+
+Any value in `scene.json` can be a script (`{"script": …, "value": …}`) or a keyframe track
+(`{"animation": …}`) instead of a number. The loader keeps both, by dotted path, on the object
+(`Object::scripts`, `Object::tracks`) and otherwise freezes the value at the published one, which is
+all `export` uses. `simulate` runs them: `scene/scripting.rs` hosts every script of the scene in one
+QuickJS context (`scripting.js` is WE's host API — `engine`, `thisLayer`, `thisScene`, `shared`,
+`WEMath`/`WEVector`/`WEColor`, timers, a pinnable clock), each wrapped in a function of its own as a
+module would be. Every frame it steps them, reads each layer's `visible`/`alpha`/`origin`/`scale`/
+`angles`/`text` back, plays the tracks over that, and re-resolves the parent chain; effect uniforms
+(`effects.N.passes.M.constantshadervalues.KEY`) reach the chain through `render_with`, after the
+panel's tweakables so the wallpaper's own value wins. Scripts see `angles` in degrees. A script that
+throws or overruns its budget is dropped and its value stays where it was.
 
 ### The shader pipeline
 

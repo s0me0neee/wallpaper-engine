@@ -83,8 +83,10 @@ def first_frame_time(clip):
 WE_ASSETS = Path.home() / ".local/share/Steam/steamapps/common/wallpaper_engine/assets"
 
 
-def render_ours(binary, wallpaper, time, scale, dump, assets):
-    env = {"SIMULATE_DUMP": str(dump), "SIMULATE_TIME": f"{time:.4f}", "SIMULATE_SCALE": f"{scale:.6f}"}
+def render_ours(binary, wallpaper, time, scale, dump, assets, clock):
+    # SIMULATE_CLOCK pins the scripts' wall clock (clocks, time-of-day scenes) to when WE's g_Time was 0.
+    env = {"SIMULATE_DUMP": str(dump), "SIMULATE_TIME": f"{time:.4f}", "SIMULATE_SCALE": f"{scale:.6f}",
+           "SIMULATE_CLOCK": f"{clock:.3f}"}
     if assets:
         env["WE_ASSETS"] = str(assets)
     subprocess.run([binary, "simulate", wallpaper], env={**os.environ, **env},
@@ -171,6 +173,8 @@ def main():
 def compare(args, title, canvas, size, scale, out):
     t0 = first_frame_time(args.clip)
     last = clip_pts(args.clip)[-1]
+    # The clip is written as it records, so its mtime is its end.
+    clock = os.path.getmtime(args.clip) - last + t0
     start, stop, step = map(float, args.times.split(":"))
     times = [t for t in np.arange(start, stop + step / 2, step) if t0 + t + 0.1 <= last]
     print(f"{title}: canvas {canvas[0]}x{canvas[1]} -> {size[0]}x{size[1]} (scale {scale:.4f}), WE starts at {t0:.3f}s, "
@@ -182,7 +186,7 @@ def compare(args, title, canvas, size, scale, out):
     worst_tile = None
     we_stack, our_stack = [], []
     for time in times:
-        ours = cover_crop(render_ours(args.binary, args.wallpaper, time, scale, out / "ours.png", args.assets), (size[0], size[1]))
+        ours = cover_crop(render_ours(args.binary, args.wallpaper, time, scale, out / "ours.png", args.assets, clock), (size[0], size[1]))
         candidates = decode(args.clip, t0 + time - 0.1, 0.2, size)
         scores = [(((we.astype(np.float32) - ours) ** 2).mean(), pts, we) for pts, we in candidates]
         mse, pts, we = min(scores, key=lambda s: s[0])

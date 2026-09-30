@@ -93,8 +93,11 @@ pub struct StaticScene<'a> {
     /// `prepare_static` resolved them with.
     pub assets: Option<PathBuf>,
     /// Hidden objects prepared only because a visible layer's chain samples them
-    /// (`_rt_imageLayerComposite_<id>`): rendered, never composited.
+    /// (`_rt_imageLayerComposite_<id>`), or because the scene's scripts may show them: rendered, and
+    /// composited only when a script makes them visible.
     pub sources: HashSet<i64>,
+    /// Output pixels per scene unit, for moving a layer a script moves.
+    pub px_per_unit: f32,
 }
 
 /// One scene object, resolved as far as time-independent work allows.
@@ -397,29 +400,50 @@ impl Default for Anchor {
     }
 }
 
+/// One object's own transform and visibility, before its parents are applied.
+#[derive(Debug, Clone, Copy)]
+pub struct Node {
+    pub origin: Vec3,
+    pub scale: Vec3,
+    pub roll: f32,
+    pub visible: bool,
+}
+
+impl Node {
+    pub fn of(object: &Object) -> Self {
+        Node { origin: object.origin, scale: object.scale, roll: object.angles.z, visible: object.visible }
+    }
+}
+
 /// Resolve every object's parent chain, index-aligned with `scene.objects`.
+pub fn resolve_anchors(scene: &Scene) -> Vec<Anchor> {
+    anchors_from(&scene.objects, |_, object| Node::of(object))
+}
+
+/// As `resolve_anchors`, over whatever `node` says each object's own fields are — the scene's, or the ones
+/// its scripts left this frame.
 ///
 /// Indices rather than ids because `id` is `#[serde(default)]` and a scene that
 /// omits it would collide every such object onto id 0.
-fn resolve_anchors(scene: &Scene) -> Vec<Anchor> {
-    let mut index_of: HashMap<i64, usize> = HashMap::with_capacity(scene.objects.len());
-    for (index, object) in scene.objects.iter().enumerate() {
+pub fn anchors_from(objects: &[Object], node: impl Fn(usize, &Object) -> Node) -> Vec<Anchor> {
+    let mut index_of: HashMap<i64, usize> = HashMap::with_capacity(objects.len());
+    for (index, object) in objects.iter().enumerate() {
         index_of.entry(object.id).or_insert(index);
     }
 
-    let mut anchors = Vec::with_capacity(scene.objects.len());
-    for (index, object) in scene.objects.iter().enumerate() {
+    let mut anchors = Vec::with_capacity(objects.len());
+    for (index, object) in objects.iter().enumerate() {
         // Walk to the root, then fold back down. A malformed scene could name
         // itself an ancestor, so stop the walk at the first repeat.
-        let mut chain = vec![object];
+        let mut chain = vec![node(index, object)];
         let mut seen = HashSet::from([index]);
         let mut cursor = object.parent;
         while let Some(parent_index) = cursor.and_then(|id| index_of.get(&id).copied()) {
             if !seen.insert(parent_index) {
                 break;
             }
-            let parent = &scene.objects[parent_index];
-            chain.push(parent);
+            let parent = &objects[parent_index];
+            chain.push(node(parent_index, parent));
             cursor = parent.parent;
         }
 
@@ -435,7 +459,7 @@ fn resolve_anchors(scene: &Scene) -> Vec<Anchor> {
                 y: anchor.scale.y * node.scale.y,
                 z: anchor.scale.z * node.scale.z,
             };
-            anchor.roll += node.angles.z;
+            anchor.roll += node.roll;
             anchor.visible &= node.visible;
         }
         anchors.push(anchor);
@@ -989,6 +1013,7 @@ pub fn prepare_static<'a>(
         omissions,
         assets: assets.map(Path::to_path_buf),
         sources,
+        px_per_unit: canvas.scale,
     })
 }
 
@@ -1016,7 +1041,13 @@ fn hidden_sources(scene: &Scene, anchors: &[Anchor]) -> HashSet<i64> {
         .filter(|(_, anchor)| anchor.visible)
         .flat_map(|(object, _)| layer_references(object))
         .collect();
-    let mut sources = HashSet::new();
+    // A script can show any layer at any time (by the clock, by `shared` flags, through
+    // `thisScene.getLayer`), so a scripted scene keeps every hidden layer ready.
+    let mut sources: HashSet<i64> = if scene.objects.iter().any(|object| !object.scripts.is_empty()) {
+        scene.objects.iter().zip(anchors).filter(|(_, anchor)| !anchor.visible).map(|(object, _)| object.id).collect()
+    } else {
+        HashSet::new()
+    };
     while let Some(id) = pending.pop() {
         let Some(&(object, anchor)) = by_id.get(&id) else { continue };
         if !anchor.visible && sources.insert(id) {

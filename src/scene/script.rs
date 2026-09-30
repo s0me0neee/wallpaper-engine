@@ -58,13 +58,19 @@ globalThis.createScriptProperties = function () {
 ";
 
 /// Rewrite an ES module's exports into plain declarations.
-fn strip_exports(source: &str) -> String {
+pub(crate) fn strip_exports(source: &str) -> String {
     source
         .replace("export function", "function")
         .replace("export var", "var")
         .replace("export let", "let")
         .replace("export const", "const")
         .replace("export default", "var weDefault =")
+        .replace("export class", "class")
+        .replace("export async function", "async function")
+        .lines()
+        .filter(|line| !(line.trim_start().starts_with("export {") && line.trim_end().ends_with([';', '}'])))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// Run `script`'s `update` and return what it produced.

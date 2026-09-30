@@ -9,9 +9,10 @@
 //! **The text is usually a script.** `text` arrives as
 //! `{"script": …, "scriptproperties": …, "value": …}`, where the script is the
 //! JavaScript that produces the live string and `value` is the design-time
-//! preview the editor last saw. We do not run scripts, so `value` is what there
-//! is — and it is sometimes a real-looking string (`"PM O8:24\nApr. 14 2025"`)
-//! and sometimes a bare placeholder (`"<Date>"`). A placeholder is not drawn:
+//! preview the editor last saw — sometimes a real-looking string
+//! (`"PM O8:24\nApr. 14 2025"`), sometimes a bare placeholder (`"<Date>"`). The
+//! script runs once here for a still, and every frame in the live simulator
+//! (`scripting`), which redraws the layer when its string changes. A placeholder is not drawn:
 //! putting the literal text `<Date>` on the wallpaper is worse than leaving the
 //! layer out, and the omission says so.
 //!
@@ -111,7 +112,7 @@ pub fn render(
     archive: &mut Archive,
     assets: Option<&Path>,
     object: &Object,
-    (width, height): (u32, u32),
+    size: (u32, u32),
 ) -> Result<Rendered, String> {
     let stored = object.text.as_deref().unwrap_or_default();
     let live = live_text(object, stored);
@@ -122,34 +123,51 @@ pub fn render(
             None => "text is a script we could not run, and its stored value is a placeholder".into(),
         });
     }
+    Ok(Rendered { image: draw(&style(archive, assets, object)?, text, size) })
+}
 
+/// What drawing a text object's string needs besides the string: resolved once, so a layer whose
+/// script changes the string (a clock) redraws without the archive.
+pub struct Style {
+    font: FontVec,
+    color: Rgba<u8>,
+    align: Align,
+}
+
+pub fn style(archive: &mut Archive, assets: Option<&Path>, object: &Object) -> Result<Style, String> {
     let font_name = object.font.as_deref().unwrap_or_default();
     let font = load_font(archive, assets, font_name)
         .ok_or_else(|| format!("font {font_name:?} is not in the package and no system font matched"))?;
+    let align = parse_align(object.horizontalalign.as_deref().unwrap_or("center"));
+    Ok(Style { font, color: tint(object), align })
+}
 
+/// Whether `text` is something to draw rather than an editor placeholder.
+pub fn drawable(text: &str) -> bool {
+    !is_placeholder(text)
+}
+
+/// `text` fitted into a `(width, height)` box in `style`.
+pub fn draw(style: &Style, text: &str, (width, height): (u32, u32)) -> RgbaImage {
     #[expect(clippy::cast_precision_loss, reason = "layer dimensions, nowhere near 2^24")]
     let (box_width, box_height) = (width as f32, height as f32);
-    let scale = PxScale::from(fitted_size(&font, text, (box_width, box_height)));
-    let scaled = font.as_scaled(scale);
+    let scale = PxScale::from(fitted_size(&style.font, text, (box_width, box_height)));
+    let scaled = style.font.as_scaled(scale);
     let line_height = scaled.height() + scaled.line_gap();
 
-    let color = tint(object);
     let mut image = RgbaImage::new(width.max(1), height.max(1));
-    let align = parse_align(object.horizontalalign.as_deref().unwrap_or("center"));
     let mut baseline = scaled.ascent();
-
     for line in text.split('\n') {
         let advance = line_advance(&scaled, line);
-        let start = match align {
+        let start = match style.align {
             Align::Left => 0.0,
             Align::Center => (box_width - advance) / 2.0,
             Align::Right => box_width - advance,
         };
-        draw_line(&mut image, &scaled, line, start, baseline, color);
+        draw_line(&mut image, &scaled, line, start, baseline, style.color);
         baseline += line_height;
     }
-
-    Ok(Rendered { image })
+    image
 }
 
 /// The layer's colour, as `color * brightness` with the object's alpha.

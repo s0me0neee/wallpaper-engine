@@ -9,6 +9,7 @@ pub mod particle;
 pub mod puppet;
 pub mod render;
 pub mod script;
+pub mod scripting;
 pub mod sprite;
 pub mod text;
 pub mod video;

@@ -17,7 +17,7 @@
 
 use anyhow::Result;
 use serde::{Deserialize, Deserializer, de};
-use serde_json::{Map, Value};
+use serde_json::{Map, Value, json};
 
 /// A 2- or 3-component vector, however the file spelled it.
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
@@ -90,6 +90,7 @@ pub fn parse_scene(bytes: &[u8], properties: &Map<String, Value>) -> Result<Scen
     let mut document: Value = serde_json::from_slice(bytes)?;
     hoist_alpha_tracks(&mut document);
     hoist_text_scripts(&mut document);
+    hoist_property_scripts(&mut document);
     gather_control_points(&mut document);
     strip_driven_values(&mut document, properties);
     Scene::deserialize(document)
@@ -176,6 +177,70 @@ fn hoist_text_scripts(node: &mut Value) {
     }
 }
 
+/// Where `hoist_property_scripts` parks an object's scripted and animated values.
+const HOISTED_PROPERTY_SCRIPTS: &str = "propertyscripts";
+const HOISTED_PROPERTY_TRACKS: &str = "propertytracks";
+
+/// Record every scripted value an object carries, wherever it sits, before the strip freezes it.
+///
+/// 53 of an 87-scene library script something — `visible` 277 times, `scale` 267, `origin` 257,
+/// `alpha` 189 — and the published `value` beside each is only the editor's last preview. The entry keeps
+/// the source, its `scriptproperties` and that preview (`initial`, not `value`, so the strip resolves what
+/// is inside it instead of collapsing the entry), under a dotted path: `alpha`, or
+/// `effects.0.passes.0.constantshadervalues.multiply`.
+fn hoist_property_scripts(node: &mut Value) {
+    fn collect(node: &Value, path: &str, out: &mut Vec<Value>, tracks: &mut Vec<Value>) {
+        match node {
+            Value::Object(map) => {
+                // Keyframes likewise: 150 tracks in 26 library scenes, only 42 of them on `alpha` —
+                // 3438699689 opens by sliding two black bars (`origin`) off a frame faded up from black.
+                if let Some(track) = map.get("animation").filter(|track| track.is_object()) {
+                    tracks.push(json!({ "path": path, "track": track }));
+                    return;
+                }
+                if let Some(Value::String(script)) = map.get("script") {
+                    let mut entry = Map::new();
+                    entry.insert("path".to_string(), Value::String(path.to_string()));
+                    entry.insert("script".to_string(), Value::String(script.clone()));
+                    if let Some(properties) = map.get("scriptproperties").filter(|value| value.is_object()) {
+                        entry.insert("properties".to_string(), properties.clone());
+                    }
+                    if let Some(initial) = map.get("value") {
+                        entry.insert("initial".to_string(), initial.clone());
+                    }
+                    out.push(Value::Object(entry));
+                    return;
+                }
+                for (key, value) in map {
+                    if key != HOISTED_TRACK && key != HOISTED_SCRIPT && key != HOISTED_SCRIPT_PROPERTIES {
+                        collect(value, &if path.is_empty() { key.clone() } else { format!("{path}.{key}") }, out, tracks);
+                    }
+                }
+            }
+            Value::Array(items) => {
+                for (index, item) in items.iter().enumerate() {
+                    collect(item, &format!("{path}.{index}"), out, tracks);
+                }
+            }
+            _ => {}
+        }
+    }
+    let Some(objects) = node.get_mut("objects").and_then(Value::as_array_mut) else {
+        return;
+    };
+    for object in objects {
+        let (mut scripts, mut tracks) = (Vec::new(), Vec::new());
+        collect(object, "", &mut scripts, &mut tracks);
+        let Some(map) = object.as_object_mut() else { continue };
+        if !scripts.is_empty() {
+            map.insert(HOISTED_PROPERTY_SCRIPTS.to_string(), Value::Array(scripts));
+        }
+        if !tracks.is_empty() {
+            map.insert(HOISTED_PROPERTY_TRACKS.to_string(), Value::Array(tracks));
+        }
+    }
+}
+
 fn hoist_alpha_tracks(node: &mut Value) {
     let Some(objects) = node.get_mut("objects").and_then(Value::as_array_mut) else {
         return;
@@ -236,8 +301,9 @@ fn strip_driven_values(node: &mut Value, properties: &Map<String, Value>) {
                 // `hoist_alpha_tracks` put a keyframe track here precisely so
                 // it would survive; every control point in it carries `frame`,
                 // which is itself a driver key, so stripping would collapse the
-                // whole track to a list of bare numbers.
-                if key == HOISTED_TRACK {
+                // whole track to a list of bare numbers. So would the tracks
+                // `hoist_property_scripts` parked.
+                if key == HOISTED_TRACK || key == HOISTED_PROPERTY_TRACKS {
                     continue;
                 }
                 strip_driven_values(value, properties);
@@ -455,6 +521,12 @@ pub struct Object {
     pub text_script: Option<String>,
     #[serde(default, rename = "textscriptproperties")]
     pub text_script_properties: Option<serde_json::Map<String, Value>>,
+    /// Every scripted value on the object, lifted clear of the strip by `hoist_property_scripts`.
+    #[serde(default, rename = "propertyscripts")]
+    pub scripts: Vec<PropertyScript>,
+    /// Every keyframe-animated value on the object, by path.
+    #[serde(default, rename = "propertytracks")]
+    pub tracks: Vec<PropertyTrack>,
     /// The font: a path inside the package or the engine's assets, or
     /// `systemfont_<family>`.
     #[serde(default)]
@@ -503,6 +575,18 @@ pub struct Object {
     /// inside the model's `*_puppet.mdl`; `rate` scales playback speed.
     #[serde(default)]
     pub animationlayers: Vec<AnimationLayer>,
+}
+
+/// One scripted value (`hoist_property_scripts`): where it sits in the object, its source, the
+/// `scriptproperties` it was configured with (user bindings already resolved), and its published value.
+#[derive(Debug, Clone, Deserialize)]
+pub struct PropertyScript {
+    pub path: String,
+    pub script: String,
+    #[serde(default)]
+    pub properties: Option<serde_json::Map<String, Value>>,
+    #[serde(default)]
+    pub initial: Value,
 }
 
 #[derive(Debug, Deserialize)]
@@ -585,10 +669,9 @@ pub fn is_text(object: &Object) -> bool {
     object.text.is_some()
 }
 
-/// A keyframe track on one scalar property.
+/// A keyframe track: one channel per component (`c0`..`c2`), so a vector property animates each on its own.
 ///
-/// Only channel `c0` is read: the tracks that matter here drive a single
-/// number. The control points carry bezier tangents (`back`/`front`) which are
+/// The control points carry bezier tangents (`back`/`front`) which are
 /// ignored — the segments in the corpus are straight ramps, and a linear read
 /// of a straight ramp is exact.
 #[derive(Debug, Clone, Deserialize)]
@@ -596,7 +679,22 @@ pub struct Track {
     #[serde(default)]
     pub c0: Vec<Keyframe>,
     #[serde(default)]
+    pub c1: Vec<Keyframe>,
+    #[serde(default)]
+    pub c2: Vec<Keyframe>,
+    #[serde(default)]
     pub options: TrackOptions,
+    /// The keyframes are offsets from the published value rather than values: 3438699689's letterbox
+    /// bars keyframe `origin.y` from 0 to 730 over a published 1440.
+    #[serde(default)]
+    pub relative: bool,
+}
+
+/// One animated value (`hoist_property_scripts`): where it sits in the object, as a script's path does.
+#[derive(Debug, Clone, Deserialize)]
+pub struct PropertyTrack {
+    pub path: String,
+    pub track: Track,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize)]
@@ -616,11 +714,14 @@ pub struct TrackOptions {
     /// `"single"` plays once and holds; anything else repeats.
     #[serde(default)]
     pub mode: String,
+    /// Waits at its first frame until something plays it — a script, or the cursor (a hover animation).
+    #[serde(default)]
+    pub startpaused: bool,
 }
 
 impl Default for TrackOptions {
     fn default() -> Self {
-        TrackOptions { fps: track_fps(), length: 0.0, mode: String::new() }
+        TrackOptions { fps: track_fps(), length: 0.0, mode: String::new(), startpaused: false }
     }
 }
 
@@ -628,10 +729,21 @@ fn track_fps() -> f32 {
     60.0
 }
 
-/// Sample `track` at `seconds`, or `None` when it has no keyframes.
+/// Sample `track`'s first channel at `seconds`, or `None` when it has no keyframes.
 pub fn sample_track(track: &Track, seconds: f32) -> Option<f32> {
-    let first = track.c0.first()?;
-    let last = track.c0.last()?;
+    sample_channel(track, 0, seconds)
+}
+
+/// Sample channel `channel` (0..=2) of `track` at `seconds`, or `None` when that channel has no keyframes.
+pub fn sample_channel(track: &Track, channel: usize, seconds: f32) -> Option<f32> {
+    let keys = match channel {
+        0 => &track.c0,
+        1 => &track.c1,
+        _ => &track.c2,
+    };
+    let first = keys.first()?;
+    let last = keys.last()?;
+    let seconds = if track.options.startpaused { 0.0 } else { seconds };
     let mut frame = seconds * track.options.fps.max(1e-3);
     if track.options.mode != "single" && track.options.length > 0.0 {
         frame = frame.rem_euclid(track.options.length);
@@ -643,7 +755,7 @@ pub fn sample_track(track: &Track, seconds: f32) -> Option<f32> {
     if frame >= last.frame {
         return Some(last.value);
     }
-    for pair in track.c0.windows(2) {
+    for pair in keys.windows(2) {
         let [a, b] = pair else { continue };
         if frame >= a.frame && frame <= b.frame {
             let span = b.frame - a.frame;
@@ -1038,6 +1150,31 @@ mod tests {
             object.effects[0].passes[0].constantshadervalues["scale"],
             Value::String("0.4 0.4".to_string())
         );
+    }
+
+    #[test]
+    fn scripted_and_animated_values_are_kept_by_path() {
+        let scene = parse_published(
+            br#"{"objects":[{"image":"models/a.json",
+                "visible":{"script":"export function update() { return true; }","value":false},
+                "origin":{"animation":{"c0":[{"frame":0,"value":0,"back":{"x":1}},{"frame":30,"value":-12}],
+                    "c1":[{"frame":0,"value":5}],"options":{"fps":30,"length":60,"mode":"single"}},"value":"0 5 0"},
+                "effects":[{"file":"effects/blend/effect.json","passes":[{"constantshadervalues":{"multiply":
+                    {"script":"export function update(v) { return 0; }","scriptproperties":{"k":{"user":"x","value":2}},
+                     "value":1}}}]}]}]}"#,
+        )
+        .unwrap();
+        let object = &scene.objects[0];
+        assert!(!object.visible, "the published value still stands for a renderer without scripts");
+        let paths: Vec<&str> = object.scripts.iter().map(|script| script.path.as_str()).collect();
+        assert_eq!(paths, ["effects.0.passes.0.constantshadervalues.multiply", "visible"]);
+        assert_eq!(object.scripts[0].properties.as_ref().unwrap()["k"], Value::from(2), "bindings in it resolve");
+        assert_eq!(object.scripts[0].initial, Value::from(1));
+        assert_eq!(object.tracks[0].path, "origin");
+        let track = &object.tracks[0].track;
+        assert_eq!(sample_channel(track, 0, 0.5), Some(-6.0));
+        assert_eq!(sample_channel(track, 1, 0.5), Some(5.0));
+        assert_eq!(sample_channel(track, 2, 0.5), None);
     }
 
     #[test]

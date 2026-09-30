@@ -190,11 +190,11 @@ fn run_layer_chain(
     finished: &HashMap<i64, glow::Texture>,
     time: f32,
 ) -> Result<(RgbaImage, Vec<String>)> {
-    let effects: Vec<&Effect> = model::visible_effects(layer.object).collect();
+    let effects: Vec<(usize, &Effect)> = layer.object.effects.iter().enumerate().filter(|(_, effect)| effect.visible).collect();
     let base = ChainBase { image: &layer.image, texel_scale: layer.texel_scale, id: layer.object.id };
     let chain = prepare_effect_chain(&gpu.gl, archive, &effects, base, headers, pass::Format::Ldr)
         .context("preparing the effect chain")?;
-    let target = chain.render_with(&gpu.gl, None, finished, time, &[]).context("running the effect chain")?;
+    let target = chain.render_with(&gpu.gl, None, finished, &[], time, &[]).context("running the effect chain")?;
     let image = capture::read_rgba(&gpu.gl, target.framebuffer, target.width, target.height)?;
     Ok((image, chain.skipped))
 }
@@ -211,6 +211,10 @@ struct CompiledPass {
     floats: Vec<(String, Vec<f32>)>,
     ints: Vec<(String, i32)>,
     label: String,
+    /// Which of the object's effects, and which of its passes, this came from — what a script's path
+    /// names — and the float uniform each material key feeds.
+    source: (usize, usize),
+    materials: Vec<(String, String)>,
 }
 
 /// What a pass binds to one sampler slot.
@@ -282,6 +286,24 @@ pub struct EffectChain {
 }
 
 impl EffectChain {
+    /// The compiled passes and uniform a scripted `constantshadervalues` key feeds: effect `effect` of the
+    /// object, its pass `pass`, material key `key`.
+    pub fn uniform_targets(&self, effect: usize, pass: usize, key: &str) -> Vec<(usize, String)> {
+        self.passes
+            .iter()
+            .enumerate()
+            .filter(|(_, compiled)| compiled.source == (effect, pass))
+            .flat_map(|(index, compiled)| {
+                compiled.materials.iter().filter(|(material, _)| material == key).map(move |(_, uniform)| (index, uniform.clone()))
+            })
+            .collect()
+    }
+
+    /// The value compiled pass `pass` sets `uniform` to before any per-frame override.
+    pub fn uniform_value(&self, pass: usize, uniform: &str) -> Option<Vec<f32>> {
+        self.passes.get(pass)?.floats.iter().find(|(name, _)| name == uniform).map(|(_, value)| value.clone())
+    }
+
     /// Redraw every pass in order with `g_Time` set to `time`, and return the
     /// final pass's target. `base`, when given, is read as `g_Texture0` instead
     /// of the texture baked in at prepare time: a puppet-warp layer's image
@@ -296,6 +318,7 @@ impl EffectChain {
         gl: &glow::Context,
         base: Option<glow::Texture>,
         layers: &HashMap<i64, glow::Texture>,
+        uniforms: &[(usize, String, Vec<f32>)],
         time: f32,
         overrides: &[f32],
     ) -> Result<&pass::Target> {
@@ -317,6 +340,15 @@ impl EffectChain {
                     && let Some(entry) = floats.iter_mut().find(|(name, _)| *name == tweakable.uniform_name)
                 {
                     entry.1 = vec![value];
+                }
+            }
+            // A script's value is the wallpaper's own and wins over the panel's.
+            for (_, name, value) in uniforms.iter().filter(|(index, _, _)| *index == pass_index) {
+                match floats.iter_mut().find(|(uniform, _)| uniform == name) {
+                    // A script's number spreads over a vector uniform, as it does over a vector property.
+                    Some(entry) if value.len() == 1 && entry.1.len() > 1 => entry.1.fill(value[0]),
+                    Some(entry) => entry.1.clone_from(value),
+                    None => floats.push((name.clone(), value.clone())),
                 }
             }
 
@@ -367,7 +399,7 @@ pub struct ChainBase<'a> {
 pub fn prepare_effect_chain(
     gl: &glow::Context,
     archive: &mut Archive,
-    effects: &[&Effect],
+    effects: &[(usize, &Effect)],
     base: ChainBase,
     headers: &HashMap<String, String>,
     format: pass::Format,
@@ -382,7 +414,7 @@ pub fn prepare_effect_chain(
     let mut tweakables = Vec::new();
     let mut skipped = Vec::new();
 
-    for effect in effects {
+    for &(effect_index, effect) in effects {
         let definition: EffectDefinition = crate::json::from_slice(&archive.read(&effect.file)?)
             .with_context(|| format!("parsing {}", effect.file))?;
 
@@ -401,7 +433,7 @@ pub fn prepare_effect_chain(
         let effect_input = (current, current_size);
         let mut named: HashMap<String, (glow::Texture, (u32, u32))> = HashMap::new();
 
-        for (definition_pass, effect_pass) in definition.passes.iter().zip(&effect.passes) {
+        for (pass_index, (definition_pass, effect_pass)) in definition.passes.iter().zip(&effect.passes).enumerate() {
             let Some(material_path) = definition_pass.material.as_deref() else {
                 continue;
             };
@@ -475,14 +507,7 @@ pub fn prepare_effect_chain(
                     .chain(uniform_ints(&fragment_declarations, &effect_pass.constantshadervalues))
                     .collect::<Vec<_>>();
 
-                if std::env::var_os("SIMULATE_TRACE").is_some() {
-                    let bound: Vec<String> = floats
-                        .iter()
-                        .filter(|(name, _)| name.ends_with("Resolution"))
-                        .map(|(name, value)| format!("{name}={:?}", &value[..2]))
-                        .collect();
-                    eprintln!("    pass {stem} target {target_width}x{target_height}  {}", bound.join(" "));
-                }
+                trace_pass(&stem, (target_width, target_height), &floats);
 
                 let target = pass::Target::with_format(gl, target_width, target_height, format)
                     .with_context(|| format!("allocating a render target for {stem}"))?;
@@ -492,7 +517,9 @@ pub fn prepare_effect_chain(
                 if let Some(name) = &definition_pass.target {
                     named.insert(name.clone(), (target.texture, current_size));
                 }
-                passes.push(CompiledPass { program, target, textures, floats, ints, label: stem });
+                let materials = material_uniforms(&vertex_declarations, &fragment_declarations);
+                let source = (effect_index, pass_index);
+                passes.push(CompiledPass { program, target, textures, floats, ints, label: stem, source, materials });
             }
         }
     }
@@ -676,6 +703,30 @@ fn resolve_slot_texture(
 }
 
 /// Every non-sampler uniform's value, ready for `pass::DrawCall.floats`.
+/// Every float uniform a material key feeds, as `(key, uniform)`.
+fn material_uniforms(vertex: &Declarations, fragment: &Declarations) -> Vec<(String, String)> {
+    vertex
+        .uniforms
+        .iter()
+        .chain(&fragment.uniforms)
+        .filter(|uniform| uniform.kind.starts_with("float") || uniform.kind.starts_with("vec"))
+        .filter_map(|uniform| Some((uniform.material.clone()?, uniform.name.clone())))
+        .collect()
+}
+
+/// `SIMULATE_TRACE`: each pass's target and the resolutions it was told.
+fn trace_pass(stem: &str, (width, height): (u32, u32), floats: &[(String, Vec<f32>)]) {
+    if std::env::var_os("SIMULATE_TRACE").is_none() {
+        return;
+    }
+    let bound: Vec<String> = floats
+        .iter()
+        .filter(|(name, _)| name.ends_with("Resolution"))
+        .map(|(name, value)| format!("{name}={:?}", &value[..2]))
+        .collect();
+    eprintln!("    pass {stem} target {width}x{height}  {}", bound.join(" "));
+}
+
 fn uniform_floats(declarations: &Declarations, material: &serde_json::Map<String, Value>) -> Vec<(String, Vec<f32>)> {
     bind::resolve(declarations, material)
         .into_iter()

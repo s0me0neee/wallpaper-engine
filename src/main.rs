@@ -447,6 +447,7 @@ fn run_info(args: &InfoArgs) -> Result<()> {
             println!("  canvas     {}x{}", ortho.width, ortho.height);
         }
         println!("  layers     {images} image, {particles} particle, {effects} effect(s)");
+        report_scripts(&scene, &project.properties);
     }
 
     match unsupported_reason(&project) {
@@ -460,6 +461,33 @@ fn run_info(args: &InfoArgs) -> Result<()> {
         None => println!("  export     yes"),
     }
     Ok(())
+}
+
+/// How many of the scene's scripts load and survive two seconds of frames, and why the rest do not.
+fn report_scripts(scene: &model::Scene, properties: &serde_json::Map<String, serde_json::Value>) {
+    let canvas = scene.general.orthographic.map_or((1920, 1080), |ortho| (ortho.width, ortho.height));
+    let host = match scene::scripting::start(scene, properties, canvas, None) {
+        Ok(Some(host)) => host,
+        Ok(None) => return,
+        Err(error) => return println!("  scripts    none run: {error:#}"),
+    };
+    let frame = (1..=60).try_fold(None, |_, tick| {
+        #[expect(clippy::cast_precision_loss, reason = "a tick count up to 60")]
+        let time = tick as f32 / 30.0;
+        scene::scripting::step(&host, time, 1.0 / 30.0).map(Some)
+    });
+    let failures: Vec<String> = match frame {
+        Ok(Some(frame)) => frame.failures.into_iter().zip(&host.bindings).filter_map(|(failure, (index, path))| {
+            Some(format!("{}.{path}: {}", model::label(&scene.objects[*index]), failure?))
+        }).collect(),
+        Ok(None) => Vec::new(),
+        Err(error) => vec![format!("stepping: {error:#}")],
+    };
+    let total = host.bindings.len() + host.load_failures.len();
+    println!("  scripts    {total}, {} failed", host.load_failures.len() + failures.len());
+    for note in host.load_failures.iter().chain(&failures) {
+        println!("    - {note}");
+    }
 }
 
 /// Video wallpapers ship a finished looping file; exporting is packaging.
@@ -607,7 +635,18 @@ fn run_simulate(args: &SimulateArgs, presentation: Presentation) -> Result<()> {
 
     let package = project::require_package(&project)?;
     let mut archive = pkg::Archive::open(package)?;
-    let scene = scene::load(&mut archive, &project.properties)?;
+    let mut scene = scene::load(&mut archive, &project.properties)?;
+
+    // `SIMULATE_CLOCK` (Unix seconds) pins the scripts' wall clock, to match a capture taken then.
+    let epoch_ms = std::env::var("SIMULATE_CLOCK").ok().and_then(|value| value.parse::<f64>().ok()).map(|seconds| seconds * 1000.0);
+    let canvas = scene.general.orthographic.map_or((1920, 1080), |ortho| (ortho.width, ortho.height));
+    let scripts = scene::scripting::start(&scene, &project.properties, canvas, epoch_ms).unwrap_or_else(|error| {
+        println!("  scripts not run: {error:#}");
+        None
+    });
+    if scripts.is_some() {
+        scene::scripting::unbake_scripted_alpha(&mut scene);
+    }
 
     let assets = we_assets(args.we_assets.as_ref());
     archive.set_fallback(assets.clone());
@@ -621,7 +660,8 @@ fn run_simulate(args: &SimulateArgs, presentation: Presentation) -> Result<()> {
         // window, so the terminal that launched it is the only way to stop it.
         println!("  playing as the desktop background — Ctrl-C to stop");
     }
-    simulate::run(&mut archive, &scene, assets.as_deref(), title, presentation, args.fps, args.scale)
+    let pacing = simulate::Pacing { fps: args.fps, scale: args.scale };
+    simulate::run(&mut archive, &scene, scripts, assets.as_deref(), title, presentation, pacing)
 }
 
 fn main() -> Result<()> {

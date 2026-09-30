@@ -23,7 +23,7 @@ use crate::pkg::Archive;
 use crate::render::{bloom, capture, particles, pass};
 use crate::scene::compose::{self, StaticItem};
 use crate::scene::model::{self, Blend, Scene};
-use crate::scene::{particle, video};
+use crate::scene::{particle, scripting, text, video};
 use crate::scene::render::{self, EffectChain};
 use crate::shader::shim;
 use anyhow::{Context, Result, anyhow};
@@ -49,6 +49,14 @@ use winit::keyboard::{Key, NamedKey};
 use winit::monitor::MonitorHandle;
 use winit::window::{Window, WindowId};
 
+/// `--fps` and `--scale`: `fps` `None` takes the display's refresh rate and `Some(0.0)` uncaps; `scale`
+/// `None` fits the canvas to the display.
+#[derive(Clone, Copy)]
+pub struct Pacing {
+    pub fps: Option<f32>,
+    pub scale: Option<f32>,
+}
+
 /// Open a window and play `scene` in it until it is closed.
 ///
 /// `presentation` chooses between the titled simulator window and the desktop
@@ -56,11 +64,11 @@ use winit::window::{Window, WindowId};
 pub fn run(
     archive: &mut Archive,
     scene: &Scene,
+    scripts: Option<scripting::ScriptHost>,
     assets: Option<&Path>,
     title: &str,
     presentation: Presentation,
-    fps: Option<f32>,
-    scale: Option<f32>,
+    pacing: Pacing,
 ) -> Result<()> {
     // The groundwork is deliberately *not* done here: which resolution to
     // decode at depends on the monitor, and only an `ActiveEventLoop` can name
@@ -73,12 +81,13 @@ pub fn run(
         scene,
         assets: assets.map(Path::to_path_buf),
         presentation,
-        fps,
-        scale,
+        fps: pacing.fps,
+        scale: pacing.scale,
         static_scene: None,
         headers: shim::headers(),
         start: Instant::now(),
         state: None,
+        scripted: Scripted::new(scripts, scene),
     };
     event_loop.run_app(&mut app).context("running the simulator window")
 }
@@ -98,12 +107,57 @@ struct App<'a> {
     headers: HashMap<String, String>,
     start: Instant,
     state: Option<State>,
+    scripted: Option<Scripted>,
+}
+
+/// What drives the scene's values frame to frame: its scripts, and what they last left the layers as, and
+/// its keyframe tracks.
+struct Scripted {
+    host: Option<scripting::ScriptHost>,
+    /// How far the scripts have been stepped.
+    clock: f32,
+    layers: Vec<scripting::LayerState>,
+    /// The value of each script not bound to a layer field, by binding.
+    values: Vec<serde_json::Value>,
+    /// Every object's anchor as prepared, and as the scripts have it now.
+    base: Vec<compose::Anchor>,
+    now: Vec<compose::Anchor>,
+    reported: bool,
+    stopped: bool,
+}
+
+impl Scripted {
+    /// `None` when nothing in the scene moves by script or by a track `simulate` does not already play.
+    fn new(host: Option<scripting::ScriptHost>, scene: &Scene) -> Option<Self> {
+        let tracked = scene.objects.iter().flat_map(|object| &object.tracks).any(|track| track.path != "alpha");
+        (host.is_some() || tracked).then(|| Scripted {
+            host,
+            clock: 0.0,
+            layers: Vec::new(),
+            values: Vec::new(),
+            base: compose::resolve_anchors(scene),
+            now: compose::resolve_anchors(scene),
+            reported: false,
+            stopped: false,
+        })
+    }
+}
+
+/// Where and how strongly a layer lands this frame.
+#[derive(Clone, Copy)]
+struct Placement {
+    rect: (i32, i32, i32, i32),
+    roll: f32,
+    alpha: f32,
 }
 
 /// Which per-frame work a live layer needs before it is composited.
 enum LiveKind {
     /// A plain image layer: texture uploaded once, never changes.
     Image,
+    /// A text layer whose string a script drives (a clock): redrawn in `style` whenever the script's string
+    /// differs from `shown`, flipped as its mirrored scale says.
+    Text { style: Box<text::Style>, shown: String, flip: (bool, bool) },
     /// A video texture, decoded on the scene clock and re-uploaded when its
     /// frame changes, then tinted the way `compose` tints a still layer.
     Video { video: Box<video::VideoTexture>, tint: (model::Vec3, f32, f32) },
@@ -348,11 +402,17 @@ struct LiveLayer {
     kind: LiveKind,
     /// The object's name, for the tweakable panel.
     name: String,
-    /// The object's id, and the ids of the other layers its chain samples.
+    /// The object's index in `scene.objects`, id, and the ids of the other layers its chain samples.
+    object_index: usize,
     id: i64,
     references: Vec<i64>,
     /// A hidden layer drawn only for another chain to sample (`StaticScene::sources`).
     source: bool,
+    /// Scripted `constantshadervalues`: `(script binding, compiled pass, uniform)`, fed from
+    /// `Scripted::values` each frame.
+    uniform_scripts: Vec<(usize, usize, String)>,
+    /// Keyframed `constantshadervalues`: `(compiled pass, uniform, track, published value)`.
+    uniform_tracks: Vec<(usize, String, model::Track, Vec<f32>)>,
     additive: bool,
     /// The layer's own effect chain, compiled once. `None` if it has no effects.
     chain: Option<EffectChain>,
@@ -387,6 +447,183 @@ fn track_alpha(layer: &LiveLayer, time: f32) -> f32 {
     let Some(track) = &layer.alpha_track else { return 1.0 };
     let Some(value) = model::sample_track(track, time) else { return 1.0 };
     (value / layer.alpha_static.max(1e-3)).clamp(0.0, 1.0)
+}
+
+/// Where a layer lands this frame: as prepared, moved and scaled by however far its scripts have moved
+/// its anchor (parents included), rolled by the change in roll, and faded by its scripted alpha over the
+/// alpha baked into its pixels.
+fn placement(layer: &LiveLayer, time: f32, scripted: Option<&Scripted>, px_per_unit: f32) -> Placement {
+    let mut place = Placement { rect: layer.rect, roll: layer.roll, alpha: track_alpha(layer, time) };
+    let Some(scripted) = scripted else { return place };
+    let (Some(base), Some(now)) = (scripted.base.get(layer.object_index), scripted.now.get(layer.object_index)) else {
+        return place;
+    };
+    if let Some(state) = scripted.layers.get(layer.object_index) {
+        place.alpha = (place.alpha * state.alpha / layer.alpha_static.max(1e-3)).clamp(0.0, 1.0);
+    }
+    // A particle layer's quad is the whole canvas; its emitter moves inside the simulation, not here.
+    if matches!(layer.kind, LiveKind::Particle { .. } | LiveKind::ParticleGpu { .. }) {
+        return place;
+    }
+    let ratio = |now: f32, base: f32| if base.abs() > 1e-6 { (now / base).abs() } else { 1.0 };
+    let (left, top, width, height) = layer.rect;
+    #[expect(clippy::cast_precision_loss, reason = "layer rects are a few thousand pixels")]
+    let (center_x, center_y) = (left as f32 + width as f32 / 2.0, top as f32 + height as f32 / 2.0);
+    let center_x = center_x + (now.origin.x - base.origin.x) * px_per_unit;
+    let center_y = center_y - (now.origin.y - base.origin.y) * px_per_unit;
+    #[expect(clippy::cast_precision_loss, reason = "layer rects are a few thousand pixels")]
+    let (new_width, new_height) =
+        (width as f32 * ratio(now.scale.x, base.scale.x), height as f32 * ratio(now.scale.y, base.scale.y));
+    #[expect(clippy::cast_possible_truncation, reason = "rounded pixel coordinates on a canvas")]
+    let rect = (
+        (center_x - new_width / 2.0).round() as i32,
+        (center_y - new_height / 2.0).round() as i32,
+        new_width.round().max(1.0) as i32,
+        new_height.round().max(1.0) as i32,
+    );
+    place.rect = rect;
+    place.roll = layer.roll + (now.roll - base.roll);
+    place
+}
+
+/// The scripted `constantshadervalues` of object `object_index` that `chain` compiled a pass for.
+fn uniform_scripts(chain: &EffectChain, bindings: &scripting::Bindings, object_index: usize) -> Vec<(usize, usize, String)> {
+    bindings
+        .iter()
+        .enumerate()
+        .filter(|(_, (index, _))| *index == object_index)
+        .filter_map(|(binding, (_, path))| {
+            let parts: Vec<&str> = path.split('.').collect();
+            let ["effects", effect, "passes", pass, "constantshadervalues", key] = parts.as_slice() else { return None };
+            let targets = chain.uniform_targets(effect.parse().ok()?, pass.parse().ok()?, key);
+            Some(targets.into_iter().map(move |(compiled, uniform)| (binding, compiled, uniform)))
+        })
+        .flatten()
+        .collect()
+}
+
+/// The keyframed `constantshadervalues` of `object` that `chain` compiled a pass for, each with its
+/// published value to be relative to.
+fn uniform_tracks(chain: &EffectChain, object: &model::Object) -> Vec<(usize, String, model::Track, Vec<f32>)> {
+    object
+        .tracks
+        .iter()
+        .filter_map(|model::PropertyTrack { path, track }| {
+            let parts: Vec<&str> = path.split('.').collect();
+            let ["effects", effect, "passes", pass, "constantshadervalues", key] = parts.as_slice() else { return None };
+            let targets = chain.uniform_targets(effect.parse().ok()?, pass.parse().ok()?, key);
+            Some(targets.into_iter().filter_map(move |(compiled, uniform)| {
+                let published = chain.uniform_value(compiled, &uniform)?;
+                Some((compiled, uniform, track.clone(), published))
+            }))
+        })
+        .flatten()
+        .collect()
+}
+
+/// Step the scripts up to `time` and re-resolve every anchor from what they left, with the keyframe tracks
+/// played over it.
+fn advance_scripts(scripted: &mut Scripted, scene: &Scene, time: f32) {
+    if time <= scripted.clock && !scripted.layers.is_empty() {
+        return;
+    }
+    if let Some(host) = scripted.host.take() {
+        if !scripted.stopped {
+            step_scripts(scripted, &host, scene, time);
+        }
+        scripted.host = Some(host);
+    }
+    scripted.clock = time;
+    let layers = &scripted.layers;
+    let vector = |v: [f32; 3]| model::Vec3 { x: v[0], y: v[1], z: v[2] };
+    scripted.now = compose::anchors_from(&scene.objects, |index, object| {
+        let mut node = match layers.get(index) {
+            Some(state) => compose::Node {
+                origin: vector(state.origin),
+                scale: vector(state.scale),
+                roll: state.angles[2],
+                visible: state.visible,
+            },
+            None => compose::Node::of(object),
+        };
+        apply_tracks(&mut node, object, time);
+        node
+    });
+}
+
+/// An object's `origin`, `scale` and `angles` keyframes at `time`, over whatever its node already holds.
+fn apply_tracks(node: &mut compose::Node, object: &model::Object, time: f32) {
+    let sample = |value: &mut model::Vec3, published: model::Vec3, track: &model::Track| {
+        for (channel, (component, base)) in
+            [(&mut value.x, published.x), (&mut value.y, published.y), (&mut value.z, published.z)].into_iter().enumerate()
+        {
+            if let Some(sample) = model::sample_channel(track, channel, time) {
+                *component = if track.relative { base + sample } else { sample };
+            }
+        }
+    };
+    for model::PropertyTrack { path, track } in &object.tracks {
+        match path.as_str() {
+            "origin" => sample(&mut node.origin, object.origin, track),
+            "scale" => sample(&mut node.scale, object.scale, track),
+            "angles" => {
+                let mut angles = model::Vec3 { z: node.roll, ..object.angles };
+                sample(&mut angles, object.angles, track);
+                node.roll = angles.z;
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Step the scripts from `scripted.clock` to `time`, at 30 Hz when time has jumped.
+fn step_scripts(scripted: &mut Scripted, host: &scripting::ScriptHost, scene: &Scene, time: f32) {
+    let mut clock = scripted.clock;
+    while clock < time {
+        let next = if time - clock > 0.1 { clock + 1.0 / 30.0 } else { time };
+        match scripting::step(host, next, next - clock) {
+            Ok(frame) => {
+                if !scripted.reported {
+                    scripted.reported = true;
+                    let failed: Vec<String> = frame
+                        .failures
+                        .iter()
+                        .zip(&host.bindings)
+                        .filter_map(|(failure, (index, path))| {
+                            Some(format!("{}.{path}: {}", model::label(&scene.objects[*index]), failure.as_ref()?))
+                        })
+                        .chain(host.load_failures.iter().cloned())
+                        .collect();
+                    println!("  {} script(s), {} failed", host.bindings.len() + host.load_failures.len(), failed.len());
+                    for note in failed.iter().take(8) {
+                        println!("    - {note}");
+                    }
+                }
+                if std::env::var_os("SIMULATE_TRACE").is_some() && next >= time {
+                    for message in &frame.messages {
+                        eprintln!("    script console: {message}");
+                    }
+                    for ((index, path), value) in host.bindings.iter().zip(&frame.values) {
+                        let layer = &frame.layers[*index];
+                        eprintln!(
+                            "    script {} {path} at {next:.2}: value {value} visible {} alpha {:.3}",
+                            model::label(&scene.objects[*index]),
+                            layer.visible,
+                            layer.alpha
+                        );
+                    }
+                }
+                scripted.layers = frame.layers;
+                scripted.values = frame.values;
+            }
+            Err(error) => {
+                println!("  scripts stopped: {error:#}");
+                scripted.stopped = true;
+                break;
+            }
+        }
+        clock = next;
+    }
 }
 
 /// Everything that only exists once the window itself does.
@@ -745,7 +982,7 @@ impl App<'_> {
     /// missing engine texture) still renders, just unprocessed, exactly as the
     /// still exporter degrades it.
     fn build_layers(&mut self, gl: &glow::Context) -> Result<Built> {
-        let App { archive, static_scene, headers, .. } = self;
+        let App { archive, static_scene, headers, scene, scripted, .. } = self;
         let static_scene = static_scene.as_ref().context("build_layers runs after the scene is prepared")?;
         let assets = static_scene.assets.as_deref();
         let mut layers = Vec::with_capacity(static_scene.items.len());
@@ -780,7 +1017,7 @@ impl App<'_> {
                             format!("{}: puppet warp skipped ({error})", model::label(layer.object)),
                         );
                     }
-                    let kind = image_kind(gl, layer)?;
+                    let kind = image_kind(gl, archive, assets, layer)?;
                     (
                         Some(layer.image.clone()),
                         layer.image.dimensions(),
@@ -830,20 +1067,23 @@ impl App<'_> {
                 )
             });
 
+            let object_index = scene.objects.iter().position(|candidate| std::ptr::eq(candidate, object)).unwrap_or(0);
             let start = tweak_values.len();
             if let Some(chain) = &chain {
                 tweak_values.extend(chain.tweakables.iter().map(|tweakable| tweakable.default));
             }
 
-            let textures = match &image {
-                Some(image) if matches!(kind, LiveKind::Image) => Some(LayerTextures::once(gl, image)?),
-                Some(image) => Some(LayerTextures::ring(gl, image)?),
-                None => None,
-            };
+            let textures = layer_textures(gl, image.as_ref(), &kind)?;
             let backdrop = blend_backdrop(gl, object, item, size, (static_scene.width, static_scene.height))?;
             layers.push(LiveLayer {
                 kind,
                 name: model::label(object),
+                object_index,
+                uniform_scripts: chain.as_ref().zip(scripted.as_ref().and_then(|s| s.host.as_ref())).map_or_else(
+                    Vec::new,
+                    |(chain, host)| uniform_scripts(chain, &host.bindings, object_index),
+                ),
+                uniform_tracks: chain.as_ref().map_or_else(Vec::new, |chain| uniform_tracks(chain, object)),
                 id: object.id,
                 references: compose::layer_references(object).collect(),
                 source: static_scene.sources.contains(&object.id),
@@ -864,9 +1104,25 @@ impl App<'_> {
     }
 }
 
+/// A layer's texture: uploaded once for a still image, a re-uploaded ring for anything that changes.
+fn layer_textures(gl: &glow::Context, image: Option<&RgbaImage>, kind: &LiveKind) -> Result<Option<LayerTextures>> {
+    Ok(match image {
+        Some(image) if matches!(kind, LiveKind::Image) => Some(LayerTextures::once(gl, image)?),
+        Some(image) => Some(LayerTextures::ring(gl, image)?),
+        None => None,
+    })
+}
+
 /// What a static image layer needs per frame: nothing, the frame beneath it, or its video.
-fn image_kind(gl: &glow::Context, layer: &compose::StaticImage) -> Result<LiveKind> {
+fn image_kind(gl: &glow::Context, archive: &mut Archive, assets: Option<&Path>, layer: &compose::StaticImage) -> Result<LiveKind> {
     let label = model::label(layer.object);
+    if layer.object.scripts.iter().any(|script| script.path == "text")
+        && let Ok(style) = text::style(archive, assets, layer.object)
+    {
+        let shown = layer.object.text.clone().unwrap_or_default();
+        let flip = (layer.object.scale.x < 0.0, layer.object.scale.y < 0.0);
+        return Ok(LiveKind::Text { style: Box::new(style), shown, flip });
+    }
     if layer.composition {
         let region = pass::Target::new(gl, layer.image.width(), layer.image.height())
             .with_context(|| format!("allocating {label}'s region"))?;
@@ -891,7 +1147,7 @@ fn compile_chain(
     format: pass::Format,
     omissions: &mut Vec<String>,
 ) -> Option<EffectChain> {
-    let effects: Vec<_> = model::visible_effects(object).collect();
+    let effects: Vec<_> = object.effects.iter().enumerate().filter(|(_, effect)| effect.visible).collect();
     if effects.is_empty() {
         return None;
     }
@@ -1047,11 +1303,11 @@ fn apply_camera(state: &State) {
 ///
 /// `premultiplied` is true only for the particle pass's target — every other
 /// layer texture holds straight alpha, the way `upload_texture` left it.
-fn composite_one(state: &State, layer: &LiveLayer, source: glow::Texture, time: f32, premultiplied: bool) {
+fn composite_one(state: &State, layer: &LiveLayer, source: glow::Texture, place: Placement, premultiplied: bool) {
     // A blend-mode layer needs the frame beneath it readable, so lift that
     // rectangle out before overwriting it. The rectangle is the rolled quad's
     // own bounding box, not the layer rect — see `pass::backdrop_rect`.
-    let backdrop_area = pass::backdrop_rect(layer.rect, layer.roll, state.content_size);
+    let backdrop_area = pass::backdrop_rect(place.rect, place.roll, state.content_size);
     if let Some(backdrop) = &layer.backdrop {
         pass::copy_region(
             &state.gl,
@@ -1067,13 +1323,13 @@ fn composite_one(state: &State, layer: &LiveLayer, source: glow::Texture, time: 
         &state.compositor,
         &state.composite,
         source,
-        layer.rect,
+        place.rect,
         backdrop_area,
         layer.additive,
         layer.blend_mode,
         layer.backdrop.as_ref().map(|target| target.texture),
-        layer.roll,
-        track_alpha(layer, time),
+        place.roll,
+        place.alpha,
         premultiplied,
     );
 }
@@ -1089,10 +1345,10 @@ fn composite_particles(
     sprites: &[particles::Sprite],
     ground: particles::Ground,
     shapes: Option<&particle::DrawList>,
-    time: f32,
+    place: Placement,
 ) {
     let (Some(live), Some(list)) = (&state.particles, shapes) else { return };
-    let alpha = track_alpha(layer, time);
+    let alpha = place.alpha;
 
     // Straight onto the frame: the particles *are* the composite, so there is
     // no second pass and the layer's alpha rides on each quad instead.
@@ -1108,7 +1364,7 @@ fn composite_particles(
     #[expect(clippy::cast_possible_wrap, reason = "wallpaper canvases are nowhere near i32::MAX")]
     let height = state.composite.height as i32;
     pass::set_scissor(&state.gl, canvas_rect(rect, live.scale), height);
-    composite_one(state, layer, target.texture, time, true);
+    composite_one(state, layer, target.texture, place, true);
     pass::clear_scissor(&state.gl);
 }
 
@@ -1217,6 +1473,7 @@ fn layer_output(
     state: &State,
     layer: &LiveLayer,
     finished: &HashMap<i64, glow::Texture>,
+    values: &[serde_json::Value],
     time: f32,
 ) -> Result<Option<glow::Texture>> {
     let Some(textures) = &layer.textures else { return Ok(None) };
@@ -1226,11 +1483,30 @@ fn layer_output(
     let base = match &layer.kind {
         LiveKind::Image => None,
         LiveKind::Composition { region } => Some(region.texture),
+        LiveKind::Text { .. } => Some(textures.current()),
         LiveKind::Puppet(_) | LiveKind::Video { .. } | LiveKind::Particle { .. } | LiveKind::ParticleGpu { .. } => {
             Some(textures.current())
         }
     };
-    let target = chain.render_with(&state.gl, base, finished, time, &state.tweak_values[layer.tweaks.clone()])?;
+    let tracked = layer.uniform_tracks.iter().map(|(pass, uniform, track, published)| {
+        let value = published
+            .iter()
+            .enumerate()
+            .map(|(channel, &base)| match model::sample_channel(track, channel, time) {
+                Some(sample) if track.relative => base + sample,
+                Some(sample) => sample,
+                None => base,
+            })
+            .collect();
+        (*pass, uniform.clone(), value)
+    });
+    let scripted = layer
+        .uniform_scripts
+        .iter()
+        .filter_map(|(binding, pass, uniform)| Some((*pass, uniform.clone(), scripting::floats(values.get(*binding)?)?)));
+    let uniforms: Vec<(usize, String, Vec<f32>)> = tracked.chain(scripted).collect();
+    let target =
+        chain.render_with(&state.gl, base, finished, &uniforms, time, &state.tweak_values[layer.tweaks.clone()])?;
     Ok(Some(target.texture))
 }
 
@@ -1248,38 +1524,48 @@ fn sampled_order(layers: &[LiveLayer]) -> Vec<usize> {
 /// Returns `true` when the caller should close the window (the debug dump hook
 /// asks for this after writing its frame).
 fn redraw(app: &mut App, time: f32) -> Result<bool> {
-    let App { static_scene, state, .. } = app;
+    let App { static_scene, state, scripted, scene, .. } = app;
     let (Some(state), Some(static_scene)) = (state.as_mut(), static_scene.as_ref()) else {
         return Ok(false);
     };
+    if let Some(scripted) = scripted.as_mut() {
+        advance_scripts(scripted, scene, time);
+    }
 
     run_panel(state);
 
-    let shapes = refresh_layers(state, static_scene, time)?;
+    let texts: &[scripting::LayerState] = scripted.as_ref().map_or(&[], |scripted| scripted.layers.as_slice());
+    let shapes = refresh_layers(state, static_scene, texts, time)?;
 
     // Stack the layers into the composite target, each under its blend mode.
     let gpu_start = Instant::now();
     pass::clear_target(&state.gl, &state.composite, state.background);
 
+    let script_values: &[serde_json::Value] = scripted.as_ref().map_or(&[], |scripted| scripted.values.as_slice());
     // A layer another chain samples is finished first, so the chain sampling it sees this frame's pixels.
     let mut finished: HashMap<i64, glow::Texture> = HashMap::new();
     for &index in &state.sampled_order {
         let layer = &state.layers[index];
-        if let Some(texture) = layer_output(state, layer, &finished, time)? {
+        if let Some(texture) = layer_output(state, layer, &finished, script_values, time)? {
             finished.insert(layer.id, texture);
         }
     }
 
     let only = layer_filter();
     for (index, layer) in state.layers.iter().enumerate() {
-        if layer.source || only.as_ref().is_some_and(|wanted| !wanted.contains(&index)) {
+        let visible = match scripted.as_ref() {
+            Some(scripted) => scripted.now.get(layer.object_index).is_some_and(|anchor| anchor.visible),
+            None => !layer.source,
+        };
+        if !visible || only.as_ref().is_some_and(|wanted| !wanted.contains(&index)) {
             continue;
         }
+        let place = placement(layer, time, scripted.as_ref(), static_scene.px_per_unit);
 
         // A GPU particle layer draws its own pixels and composites them under
         // a scissor, so it never touches a layer texture at all.
         if let LiveKind::ParticleGpu { sprites, ground, .. } = &layer.kind {
-            composite_particles(state, layer, sprites, *ground, shapes[index].as_ref(), time);
+            composite_particles(state, layer, sprites, *ground, shapes[index].as_ref(), place);
             continue;
         }
 
@@ -1292,18 +1578,18 @@ fn redraw(app: &mut App, time: f32) -> Result<bool> {
                 region,
                 state.composite.texture,
                 state.content_size,
-                layer.rect,
+                place.rect,
             );
         }
 
         let source = match finished.get(&layer.id) {
             Some(&texture) => texture,
-            None => match layer_output(state, layer, &finished, time)? {
+            None => match layer_output(state, layer, &finished, script_values, time)? {
                 Some(texture) => texture,
                 None => continue,
             },
         };
-        composite_one(state, layer, source, time, false);
+        composite_one(state, layer, source, place, false);
     }
 
     // Scene bloom runs over the finished stack, the way WE post-processes the
@@ -1368,6 +1654,7 @@ fn redraw(app: &mut App, time: f32) -> Result<bool> {
 fn refresh_layers(
     state: &mut State,
     static_scene: &compose::StaticScene<'_>,
+    texts: &[scripting::LayerState],
     time: f32,
 ) -> Result<Vec<Option<particle::DrawList>>> {
     // Per-frame CPU work: re-skin puppets, re-simulate particles, then upload
@@ -1384,6 +1671,23 @@ fn refresh_layers(
             // A composition layer's input is produced on the GPU during the
             // composite pass below, not here.
             LiveKind::Image | LiveKind::Composition { .. } => Ok(None),
+            LiveKind::Text { style, shown, flip } => {
+                let wanted = texts.get(layer.object_index).and_then(|state| state.text.as_ref());
+                let Some(wanted) = wanted.filter(|wanted| *wanted != shown && text::drawable(wanted)) else {
+                    return Ok(None);
+                };
+                #[expect(clippy::cast_sign_loss, reason = "a layer rect's sides are positive")]
+                let size = (layer.rect.2 as u32, layer.rect.3 as u32);
+                let mut image = text::draw(style, wanted, size);
+                if flip.0 {
+                    image::imageops::flip_horizontal_in_place(&mut image);
+                }
+                if flip.1 {
+                    image::imageops::flip_vertical_in_place(&mut image);
+                }
+                shown.clone_from(wanted);
+                Ok(Some(Refreshed::Image(image, layer.rect)))
+            }
             LiveKind::Video { video, tint: (color, brightness, alpha) } => {
                 let frame = video::frame_at(video, time).with_context(|| format!("playing {}'s video", layer.name))?;
                 Ok(frame.map(|mut image| {
@@ -1563,6 +1867,7 @@ fn report_layer_roster(layers: &[LiveLayer]) {
     for (index, layer) in layers.iter().enumerate() {
         let kind = match layer.kind {
             LiveKind::Image => "image",
+            LiveKind::Text { .. } => "text",
             LiveKind::Video { .. } => "video",
             LiveKind::Composition { .. } => "composition",
             LiveKind::Puppet(_) => "puppet",
