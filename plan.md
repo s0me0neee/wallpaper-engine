@@ -2633,3 +2633,46 @@ An explicit scale is therefore a fraction of the canvas, rendered whole, and
 covered by the blit the way §14.4 did it. That is a deliberate asymmetry
 between the default path and the override, and it is the one place the two
 disagree.
+
+### 14.7 Target: 60 fps on the majority of scenes
+
+**Goal.** `simulate` and `desktop` should hold 60 fps on most library scenes on
+this machine (Mesa, Iris Xe, a 2560x1600 display), at the default resolution —
+not only with `--scale`. Wallpaper Engine itself runs these scenes at 60 here.
+
+**Where it stands** (2026-09-29, one scene at a time, default resolution):
+Summer Miku (3484246124) 11–37 fps, `scene_example4` 16–18, `scene_example7`
+17–28. In every case the fps line shows `cpu` under 1 ms and `swap` at 30–90 ms:
+the frame is GPU-bound now (§4.16–4.17 moved the particle cost off the CPU),
+and the GPU work is only waited on at the swap.
+
+**First, measure it per layer.** The fps line cannot say *which* layer or pass
+costs the time. Wrap each layer's chain and composite in GL timer queries
+(`GL_TIME_ELAPSED`, GL 3.3 core) and report the top few under `SIMULATE_TRACE`;
+then run a library-wide sweep (every scene for ~10 s, median fps and the most
+expensive layer) so the work is ranked by payoff, the way §4.32 ranked fidelity.
+
+**Levers to try, in rough order of expected payoff:**
+
+1. *Don't redraw what did not change.* A static image layer's chain re-runs every
+   frame even when none of its passes reads `g_Time` or a scripted/keyframed
+   uniform. Cache its output once and composite the cached texture.
+2. *Chain resolution.* Chains run at the layer's size in display pixels, and
+   blur/glow chains (`blurprecise`, `godrays`, bloom) at full size are the likely
+   bulk. WE sizes some passes down (`_downsample` targets); check we honour every
+   pass's own target scale, and consider rendering expensive chains below display
+   resolution and upscaling.
+3. *Composition layers.* They copy the frame beneath each frame, and since
+   c2c1de8 a large one keeps its whole rectangle (up to 4x the canvas) — correct,
+   but possibly expensive (`scene_example4`'s clouds). Measure; if it matters,
+   render only the visible part while keeping the texture coordinates of the
+   whole (a texcoord sub-range) instead of allocating the full target.
+4. *Per-frame uploads.* Puppet warps, video frames and text redraws upload
+   textures every frame; puppets still warp on the CPU (§4.32's GPU mesh pass
+   would fix both the cost and the effect-order bug).
+5. *Pacing.* Confirm `--fps` defaults to the display rate with vsync so no GPU time
+   is spent on frames the display drops, and that an occluded window stops (§14.5).
+
+**Done when** a library sweep shows at least half the scenes at a median of
+60 fps or better at the default resolution, with none of §4.32's fidelity
+numbers made worse.
