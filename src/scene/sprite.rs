@@ -109,7 +109,16 @@ fn from_assets(root: &Path, name: &str) -> Option<Sprite> {
 fn from_tex(bytes: &[u8]) -> Option<Sprite> {
     let texture = tex::parse_bytes(bytes).ok()?;
     let mipmap = tex::largest_mipmap(&texture).ok()?;
-    let image = tex::decode_rgba(&texture, mipmap).ok()?;
+    let mut image = tex::decode_rgba(&texture, mipmap).ok()?;
+    // A sprite in RG88 is grey and alpha, as WE's particle shader reads it: `particle/magic/glyph_0` keeps
+    // its glyph in G over an all-white R. Decoded as the two colour channels a flow map is, it was opaque,
+    // fell through to luminance coverage, and drew every glyph as a hard-edged square (Magic-Hat's vortex).
+    if texture.format == tex::Format::Rg88 {
+        for pixel in image.pixels_mut() {
+            let [grey, alpha, _, _] = pixel.0;
+            pixel.0 = [grey, grey, grey, alpha];
+        }
+    }
     let Some((_cols, _rows, seconds)) = tex::sheet(&texture) else {
         return to_pixmap(&image).map(still);
     };
