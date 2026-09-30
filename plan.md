@@ -1959,9 +1959,27 @@ worst, and why, from their `motion.png`/`worst.png`:
 | 3287715210, 3291326967, ex8 | 15–23 | `bloom` + `hdr` on — the HDR bloom path is the next thing to check |
 | 3307673833, 3308867900 | 16–20 | scattered motion only in ours, in dark areas: sparkle particles brighter or denser than WE's |
 
+**SceneScript and keyframe tracks, done** (`scene/scripting.rs`, `scripting.js`;
+`simulate` only — `export` still freezes every driven value). One QuickJS context
+per scene; each script wrapped in its own function; init for all, then
+applyUserProperties for all, then update every frame; layer fields, effect
+uniforms, particle instance overrides and text all driven, tracks played over
+the scripts' state. 1774 of 1814 library scripts load and run (`info` reports
+it per scene). Measured at t=4 against the capture: White Oak 13.1 → 35.4 dB,
+3438699689 6.3 → 20.0, 3479521040 +2.3, 2925278995 +1.7, 3465215190 +1.5; no
+scripted scene regressed but SandBlack (−0.8), whose unnamed post-layer
+Brightness track (−1 → +1 over 4 s) WE visibly does not play — named tracks
+(3438699689's `b11`, `ll`) it does. What decides that is open.
+
+Found along the way, not yet fixed: text is fitted to its box where WE uses
+`pointsize` (SandBlack's and 3640882040's clocks come out smaller); and with
+`cameraparallax` on, WE draws 3233141951 about 1.2x larger than we do, which
+may be a parallax overscan zoom — and if so, the same thing as ex3's static
+per-layer offsets (§4.25).
+
 **Open, in order of payoff:**
 
-1. **SceneScript.** 53 of 87 scenes script a value somewhere — `visible` 277
+1. ~~**SceneScript.**~~ Done, above; the original note: 53 of 87 scenes script a value somewhere — `visible` 277
    times, `scale` 267, `origin` 257, `alpha` 189, `text` 351 — against an API
    of `engine.frametime`/`runtime`/`timeOfDay`/`canvasSize`/`userProperties`,
    `thisLayer`, `thisScene.getLayer`, `shared`, `createScriptProperties` and
