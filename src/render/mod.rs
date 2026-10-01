@@ -6,4 +6,5 @@ pub mod capture;
 pub mod gpu;
 pub mod particles;
 pub mod pass;
+pub mod skin;
 pub mod timer;

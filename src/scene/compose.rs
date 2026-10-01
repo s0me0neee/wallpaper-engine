@@ -893,6 +893,42 @@ pub fn warp_frame(item: &StaticPuppet, time: f32) -> (RgbaImage, i64, i64) {
     (image, left, top)
 }
 
+/// A puppet's mesh deformed at one time, for the GPU to draw instead of `warp_frame` rasterizing it.
+pub struct WarpMesh {
+    /// Each vertex's `(x, y)` in output pixels from the top-left, mirrored as `warp_frame` mirrors; the
+    /// output's size and place on the canvas are `warp_frame`'s, which never change frame to frame.
+    pub positions: Vec<f32>,
+    /// `apply_tint`'s factors: RGB multiplier and alpha, both clamped.
+    pub tint: [f32; 3],
+    pub alpha: f32,
+}
+
+/// `warp_frame`'s geometry without the raster: the same skin, placement and pad.
+pub fn warp_mesh(item: &StaticPuppet, time: f32) -> WarpMesh {
+    let skins = puppet::skin_transforms(&item.puppet, item.animation, time, item.rate);
+    let deformed = puppet::deform(&item.puppet, &skins);
+    let (u_slope, u_intercept, v_slope, v_intercept) =
+        puppet::rect_map(&item.puppet, item.object.size.map(|size| (size.x, size.y)));
+    let rect_px = item.rect_px;
+    let (out_w, out_h) = ((rect_px.0 * (1.0 + 2.0 * WARP_PAD)).ceil(), (rect_px.1 * (1.0 + 2.0 * WARP_PAD)).ceil());
+    // `mirror` flips pixel `p` to `side - 1 - p`, which moves a pixel centre `x` to `side - x`.
+    let flip = (item.mirror.scale.x < 0.0, item.mirror.scale.y < 0.0);
+    let mut positions = Vec::with_capacity(deformed.len() * 2);
+    for &(x, y) in &deformed {
+        let px = (WARP_PAD + u_slope * x + u_intercept) * rect_px.0;
+        let py = (WARP_PAD + v_slope * y + v_intercept) * rect_px.1;
+        positions.push(if flip.0 { out_w - px } else { px });
+        positions.push(if flip.1 { out_h - py } else { py });
+    }
+    let object = item.object;
+    let tint = [object.color.x, object.color.y, object.color.z].map(|channel| (channel * object.brightness).clamp(0.0, 1.0));
+    WarpMesh {
+        positions,
+        tint,
+        alpha: object.alpha.clamp(0.0, 1.0),
+    }
+}
+
 /// Resolve a scene into its canvas plus every visible image layer, prepared
 /// for placement but not yet flattened. `compose::render` overlays these
 /// straight; `scene::render` runs each layer's effect chain first. Puppet

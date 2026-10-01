@@ -20,7 +20,7 @@
 use crate::desktop::{self, Presentation};
 use crate::export::Resolution;
 use crate::pkg::Archive;
-use crate::render::{bloom, capture, particles, pass, timer};
+use crate::render::{bloom, capture, particles, pass, skin, timer};
 use crate::scene::compose::{self, StaticItem};
 use crate::scene::model::{self, Blend, Scene};
 use crate::scene::{particle, scripting, text, video};
@@ -162,8 +162,8 @@ enum LiveKind {
     /// A video texture, decoded on the scene clock and re-uploaded when its
     /// frame changes, then tinted the way `compose` tints a still layer.
     Video { video: Box<video::VideoTexture>, tint: (model::Vec3, f32, f32) },
-    /// A puppet-warp layer: `static_scene.items[usize]` is re-skinned each frame.
-    Puppet(usize),
+    /// A puppet-warp layer: `static_scene.items[item]` is re-skinned each frame, on the GPU into `skin`.
+    Puppet { item: usize, skin: Box<skin::Skin> },
     /// A composition layer: its input is the frame as composited so far,
     /// cropped to the layer's own rectangle into `region` each frame, then run
     /// through the layer's chain and drawn back over the same rectangle.
@@ -1096,7 +1096,9 @@ impl App<'_> {
                     let (image, left, top) = compose::warp_frame(puppet, 0.0);
                     let rect = rect_of(left, top, &image);
                     let size = image.dimensions();
-                    (Some(image), size, rect, puppet.blend, LiveKind::Puppet(index), puppet.object, puppet.texel_scale)
+                    let skin = Box::new(skin::build(gl, &puppet.puppet, &puppet.texture, size)?);
+                    let kind = LiveKind::Puppet { item: index, skin };
+                    (Some(image), size, rect, puppet.blend, kind, puppet.object, puppet.texel_scale)
                 }
                 // Effects are what decides the path: a chain wants a
                 // straight-alpha texture of a fixed size, which is not what the
@@ -1171,6 +1173,10 @@ impl App<'_> {
 fn layer_textures(gl: &glow::Context, image: Option<&RgbaImage>, kind: &LiveKind) -> Result<Option<LayerTextures>> {
     Ok(match image {
         Some(image) if matches!(kind, LiveKind::Image) => Some(LayerTextures::once(gl, image)?),
+        // Drawn into in place every frame, so one texture is the whole ring.
+        Some(image) if let LiveKind::Puppet { skin, .. } = kind => {
+            Some(LayerTextures { ring: vec![skin.target.texture], next: 0, size: image.dimensions() })
+        }
         Some(image) => Some(LayerTextures::ring(gl, image)?),
         None => None,
     })
@@ -1506,9 +1512,11 @@ fn blend_backdrop(
 
 /// What a layer's per-frame CPU work produced, before the GL context gets it.
 enum Refreshed {
-    /// Fresh pixels and where they sit: a re-skinned puppet, or a particle
-    /// system that still rasterizes on the CPU.
+    /// Fresh pixels and where they sit: a redrawn text or video frame, or a particle system that still
+    /// rasterizes on the CPU.
     Image(RgbaImage, (i32, i32, i32, i32)),
+    /// A puppet's deformed mesh, for its skin to draw.
+    Mesh(compose::WarpMesh),
     /// A particle system's shapes for this frame, for the instanced pass.
     Shapes(particle::DrawList),
 }
@@ -1812,13 +1820,11 @@ fn refresh_layers(
                     Refreshed::Image(image, layer.rect)
                 }))
             }
-            LiveKind::Puppet(index) => {
-                let StaticItem::Puppet(puppet) = &static_scene.items[*index] else {
+            LiveKind::Puppet { item, .. } => {
+                let StaticItem::Puppet(puppet) = &static_scene.items[*item] else {
                     unreachable!("a Puppet LiveKind always points at a Puppet item")
                 };
-                let (image, left, top) = compose::warp_frame(puppet, time);
-                let rect = rect_of(left, top, &image);
-                Ok(Some(Refreshed::Image(image, rect)))
+                Ok(Some(Refreshed::Mesh(compose::warp_mesh(puppet, time))))
             }
             LiveKind::ParticleGpu { placement, preset_path, presets, table, .. } => {
                 if let Some(overrides) = overrides {
@@ -1850,6 +1856,12 @@ fn refresh_layers(
                 layer.rect = rect;
                 if let Some(textures) = &mut layer.textures {
                     textures.refresh(&state.gl, &image)?;
+                }
+                shapes.push(None);
+            }
+            Some(Refreshed::Mesh(mesh)) => {
+                if let LiveKind::Puppet { skin, .. } = &layer.kind {
+                    skin::draw(&state.gl, skin, &mesh.positions, mesh.tint, mesh.alpha);
                 }
                 shapes.push(None);
             }
@@ -1995,7 +2007,7 @@ fn report_layer_roster(layers: &[LiveLayer]) {
             LiveKind::Text { .. } => "text",
             LiveKind::Video { .. } => "video",
             LiveKind::Composition { .. } => "composition",
-            LiveKind::Puppet(_) => "puppet",
+            LiveKind::Puppet { .. } => "puppet",
             LiveKind::Particle { .. } => "particle",
             LiveKind::ParticleGpu { .. } => "particle/gl",
         };
