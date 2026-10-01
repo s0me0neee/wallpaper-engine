@@ -46,7 +46,11 @@ pub fn open(bytes: Vec<u8>, size: (u32, u32)) -> Result<VideoTexture> {
     let stream = input.streams().best(Type::Video).context("the embedded video has no video stream")?;
     let (index, time_base) = (stream.index(), stream.time_base());
     let decoder = ffmpeg::codec::context::Context::from_parameters(stream.parameters())
-        .and_then(|context| context.decoder().video())
+        .and_then(|mut context| {
+            // libavcodec decodes on one thread unless told otherwise: ~26 ms a 4K frame (3326873240).
+            context.set_threading(ffmpeg::threading::Config::kind(ffmpeg::threading::Type::Frame));
+            context.decoder().video()
+        })
         .context("opening the embedded video's decoder")?;
     // The container's duration is in AV_TIME_BASE units; zero or negative means it did not say.
     #[expect(clippy::cast_precision_loss, reason = "a wallpaper loop's length in microseconds, far below 2^52")]
