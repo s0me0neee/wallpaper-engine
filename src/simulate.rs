@@ -709,8 +709,9 @@ struct State {
     /// allows. Vsync does not enforce this for us — measured at 120 fps on a
     /// display that cannot show them — so the loop sleeps instead.
     min_frame: Option<Duration>,
-    /// When the last frame started, for `min_frame` to measure from.
-    last_frame: Instant,
+    /// When the next frame is due: a fixed grid `min_frame` apart, so a late wake-up does not push every
+    /// later frame back with it (measured as 59 fps against a 60 Hz cap).
+    next_due: Instant,
     background: [f32; 4],
     layers: Vec<LiveLayer>,
     /// Indices of the layers another chain samples, each after whatever it samples in turn.
@@ -1022,7 +1023,7 @@ impl App<'_> {
             fit,
             occluded: false,
             min_frame,
-            last_frame: Instant::now(),
+            next_due: Instant::now(),
             background,
             layers,
             sampled_order,
@@ -2056,7 +2057,11 @@ impl ApplicationHandler for App<'_> {
                 let drawn = redraw(self, time);
                 if let Some(state) = &mut self.state {
                     state.frames_since.frame += started.elapsed();
-                    state.last_frame = started;
+                    if let Some(gap) = state.min_frame {
+                        // A frame more than a whole gap late restarts the grid rather than bursting to catch up.
+                        let next = state.next_due + gap;
+                        state.next_due = if started > next { started + gap } else { next };
+                    }
                 }
                 match drawn {
                     Ok(true) => event_loop.exit(),
@@ -2083,12 +2088,9 @@ impl ApplicationHandler for App<'_> {
         // Sleeping until the next frame is due is the whole saving: `Poll`
         // would return here immediately and draw a frame the display cannot
         // show, at full GPU cost.
-        if let Some(gap) = state.min_frame {
-            let due = state.last_frame + gap;
-            if Instant::now() < due {
-                event_loop.set_control_flow(ControlFlow::WaitUntil(due));
-                return;
-            }
+        if state.min_frame.is_some() && Instant::now() < state.next_due {
+            event_loop.set_control_flow(ControlFlow::WaitUntil(state.next_due));
+            return;
         }
         event_loop.set_control_flow(ControlFlow::Poll);
         state.window.request_redraw();
