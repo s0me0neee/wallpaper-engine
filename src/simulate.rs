@@ -417,6 +417,8 @@ struct LiveLayer {
     additive: bool,
     /// The layer's own effect chain, compiled once. `None` if it has no effects.
     chain: Option<EffectChain>,
+    /// The panel values `chain`'s output was last drawn with, when `still_chain`.
+    drawn_with: RefCell<Option<Vec<f32>>>,
     /// This chain's slice of `State::tweak_values`, one entry per tweakable.
     tweaks: Range<usize>,
     /// The current image: a single texture for `Image`, a re-uploaded ring for
@@ -998,6 +1000,10 @@ impl App<'_> {
             println!("  not simulated: {note}");
         }
         report_layer_roster(&layers);
+        let still = layers.iter().filter(|layer| layer.chain.as_ref().is_some_and(|chain| still_chain(layer, chain))).count();
+        if still > 0 {
+            println!("  {still} effect chain(s) drawn once: nothing in them moves");
+        }
         report_tweakables(&layers, self.presentation);
         let panel = panel_labels(&layers);
         let sampled_order = sampled_order(&layers);
@@ -1051,12 +1057,8 @@ impl App<'_> {
         // Start from what the static pass could not settle, then drop every
         // "N effect(s) not applied" note — a chain either runs below or re-adds
         // its own "skipped" note, the same handoff `render_frame` does.
-        let mut omissions: Vec<String> = static_scene
-            .omissions
-            .iter()
-            .filter(|note| !note.ends_with("effect(s) not applied"))
-            .cloned()
-            .collect();
+        let mut omissions: Vec<String> =
+            static_scene.omissions.iter().filter(|note| !note.ends_with("effect(s) not applied")).cloned().collect();
 
         let systems = static_scene.items.iter().filter(|item| matches!(item, StaticItem::Particle(_))).count();
         let sim_scale = particle_sim_scale((static_scene.width, static_scene.height), systems);
@@ -1149,6 +1151,7 @@ impl App<'_> {
                 source: static_scene.sources.contains(&object.id),
                 additive: blend == Blend::Add,
                 chain,
+                drawn_with: RefCell::new(None),
                 tweaks: start..tweak_values.len(),
                 textures,
                 rect,
@@ -1538,13 +1541,21 @@ fn layer_output(
 ) -> Result<Option<glow::Texture>> {
     let Some(textures) = &layer.textures else { return Ok(None) };
     let Some(chain) = &layer.chain else { return Ok(Some(textures.current())) };
+    let tweaks = &state.tweak_values[layer.tweaks.clone()];
+    let still = still_chain(layer, chain);
+    if still
+        && layer.drawn_with.borrow().as_deref() == Some(tweaks)
+        && let Some(output) = chain.output()
+    {
+        return Ok(Some(output.texture));
+    }
     // A static image's chain keeps its baked-in base; a puppet or
     // particle layer's image changed this frame, so re-feed it.
     let base = match &layer.kind {
         LiveKind::Image => None,
         LiveKind::Composition { region } => Some(region.texture),
         LiveKind::Text { .. } => Some(textures.current()),
-        LiveKind::Puppet(_) | LiveKind::Video { .. } | LiveKind::Particle { .. } | LiveKind::ParticleGpu { .. } => {
+        LiveKind::Puppet { .. } | LiveKind::Video { .. } | LiveKind::Particle { .. } | LiveKind::ParticleGpu { .. } => {
             Some(textures.current())
         }
     };
@@ -1565,9 +1576,21 @@ fn layer_output(
         .iter()
         .filter_map(|(binding, pass, uniform)| Some((*pass, uniform.clone(), scripting::floats(values.get(*binding)?)?)));
     let uniforms: Vec<(usize, String, Vec<f32>)> = tracked.chain(scripted).collect();
-    let target =
-        chain.render_with(&state.gl, base, finished, &uniforms, time, &state.tweak_values[layer.tweaks.clone()])?;
+    let target = chain.render_with(&state.gl, base, finished, &uniforms, time, tweaks)?;
+    if still {
+        *layer.drawn_with.borrow_mut() = Some(tweaks.to_vec());
+    }
     Ok(Some(target.texture))
+}
+
+/// Whether `chain`'s output depends on nothing but the panel's values: a still image, no `g_Time`, no
+/// scripted or keyframed uniform, no other layer sampled. Such a chain is redrawn only when those move.
+fn still_chain(layer: &LiveLayer, chain: &EffectChain) -> bool {
+    matches!(layer.kind, LiveKind::Image)
+        && !chain.animated()
+        && layer.uniform_scripts.is_empty()
+        && layer.uniform_tracks.is_empty()
+        && layer.references.is_empty()
 }
 
 /// `State::sampled_order`: the layers some chain samples, in an order that finishes each before its samplers.

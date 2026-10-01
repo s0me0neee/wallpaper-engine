@@ -315,6 +315,17 @@ impl EffectChain {
             .collect()
     }
 
+    /// Whether any pass reads `g_Time`: of what `render_with` feeds a pass, the only input that moves on
+    /// its own. Without it the chain's output changes only when its uniforms or its base do.
+    pub fn animated(&self) -> bool {
+        self.passes.iter().any(|pass| pass::uses_uniform(&pass.program, "g_Time"))
+    }
+
+    /// The final pass's target, as the last `render_with` left it.
+    pub fn output(&self) -> Option<&pass::Target> {
+        self.passes.last().map(|pass| &pass.target)
+    }
+
     /// The value compiled pass `pass` sets `uniform` to before any per-frame override.
     pub fn uniform_value(&self, pass: usize, uniform: &str) -> Option<Vec<f32>> {
         self.passes.get(pass)?.floats.iter().find(|(name, _)| name == uniform).map(|(_, value)| value.clone())

@@ -60,6 +60,11 @@ pub fn compile_program(gl: &glow::Context, vertex_src: &str, fragment_src: &str)
     Ok(Program { handle: program, float_widths: float_widths(gl, program) })
 }
 
+/// Whether the linked program actually reads float uniform `name`.
+pub fn uses_uniform(program: &Program, name: &str) -> bool {
+    program.float_widths.contains_key(name)
+}
+
 /// Component count per active float-typed uniform, by name.
 fn float_widths(gl: &glow::Context, program: glow::Program) -> HashMap<String, usize> {
     let count = unsafe { gl.get_active_uniforms(program) };
