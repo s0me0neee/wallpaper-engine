@@ -795,10 +795,6 @@ fn integrate(
     let steps = ((age * SIM_HZ).ceil() as u32).clamp(1, max_steps.max(1));
     let dt = age / steps as f32;
 
-    let mut pos = r.start;
-    let mut vel = r.velocity * speed;
-    let mut rotation = r.rotation;
-    let mut spin = r.spin;
     // A rope keeps the last `length` seconds of path, sampled at `segments`
     // points; everything else keeps nothing, since the history costs an
     // allocation per particle.
@@ -813,57 +809,123 @@ fn integrate(
     });
     let rope_every = rope.map_or(1, |(_, segments)| (steps.saturating_sub(rope_from) / segments).max(1));
 
+    let mut motion = Motion { pos: r.start, vel: r.velocity * speed, rotation: r.rotation, spin: r.spin };
     for step in 0..steps {
-        for op in &preset.operator {
-            match op {
-                Operator::Movement { gravity, drag } => {
-                    vel += xy(*gravity) * dt;
-                    vel *= (-drag * dt).exp();
-                }
-                Operator::Turbulence { mask, scale, .. } => {
-                    let force = flow_at(flow, pos * *scale + Vec2::splat(r.turb_phase));
-                    vel += force * xy(*mask) * (r.turb_speed * speed) * dt;
-                }
-                Operator::ControlPointAttract { controlpoint, origin, scale, threshold } => {
-                    // A constant pull toward the point, not an inverse-square
-                    // one, and `threshold` is a *diameter*: both match
-                    // linux-wallpaperengine's reading (plan.md §4.27).
-                    // `scale` is negative to push particles out instead.
-                    if let Some(center) = points.get(*controlpoint).copied().flatten() {
-                        let to_cp = center + xy(*origin) - pos;
-                        let dist = to_cp.length();
-                        if dist > 0.001 && dist < threshold * 0.5 {
-                            vel += to_cp / dist * (*scale * speed) * dt;
-                        }
-                    }
-                }
-                Operator::Vortex { distanceinner, distanceouter, speedinner, speedouter } => {
-                    // Tangential, about the same system origin: the radius picks
-                    // the speed, and the sign of the speed picks the direction.
-                    let radius = pos.length();
-                    if radius > 1.0 {
-                        let reach = (distanceouter - distanceinner).max(1e-3);
-                        let k = ((radius - distanceinner) / reach).clamp(0.0, 1.0);
-                        let tangential = speedinner + (speedouter - speedinner) * k;
-                        let around = Vec2::new(-pos.y, pos.x) / radius;
-                        vel += around * (tangential * speed) * dt / radius.max(4.0);
-                    }
-                }
-                Operator::AngularMovement { force, drag } => {
-                    spin += force.z * dt;
-                    spin *= (-drag * dt).exp();
-                }
-                _ => {}
-            }
-        }
-        pos += vel * dt;
-        rotation += spin * dt;
+        advance(preset, r, flow, points, speed, &mut motion, dt);
         if step >= rope_from && (step - rope_from) % rope_every == 0 {
-            trail.push(pos);
+            trail.push(motion.pos);
         }
     }
 
-    Integrated { pos, vel, rotation, trail }
+    Integrated { pos: motion.pos, vel: motion.vel, rotation: motion.rotation, trail }
+}
+
+/// `integrate` on a fixed grid, for the live simulator: whole steps of `1 / SIM_HZ` from birth, resumed
+/// from `prior` (the state after that many steps) when given, then one partial step to `age`. Returns the
+/// path and the state after the whole steps, for the next frame to resume from. A particle with no prior
+/// runs the same steps from birth, so a frame does not depend on whether the one before it was drawn.
+fn integrate_stepped(
+    preset: &Preset,
+    r: &Rolled,
+    flow: &Perlin,
+    points: &ControlPoints,
+    speed: f32,
+    age: f32,
+    prior: Option<Resume>,
+) -> (Integrated, Option<Resume>) {
+    let whole = (age * SIM_HZ).floor().max(0.0) as u32;
+    if whole > MAX_STEPS {
+        return (integrate(preset, r, flow, points, speed, age, MAX_STEPS), None);
+    }
+    let dt = 1.0 / SIM_HZ;
+    let (mut motion, mut steps) = match prior {
+        Some((motion, steps)) if steps <= whole => (motion, steps),
+        _ => (Motion { pos: r.start, vel: r.velocity * speed, rotation: r.rotation, spin: r.spin }, 0),
+    };
+    while steps < whole {
+        advance(preset, r, flow, points, speed, &mut motion, dt);
+        steps += 1;
+    }
+    let kept = (motion, steps);
+    let rest = age - whole as f32 * dt;
+    if rest > 0.0 {
+        advance(preset, r, flow, points, speed, &mut motion, rest);
+    }
+    (Integrated { pos: motion.pos, vel: motion.vel, rotation: motion.rotation, trail: Vec::new() }, Some(kept))
+}
+
+/// Each live particle's state after its last whole step, by `(salt, emission)`, carried from frame to frame
+/// by the live simulator: a frame integrates only the steps since the one before, where re-integrating
+/// every particle from birth each frame cost 2582765611 six cores.
+#[derive(Default)]
+pub struct SimCache {
+    states: HashMap<(u64, u64), (Resume, u64)>,
+    frame: u64,
+}
+
+/// One alive particle this frame: its emission, birth, state, and what a `SimCache` keeps of it.
+type Alive = (u64, f32, Live, Option<Resume>);
+
+/// A particle's state after some number of whole steps, to resume integrating from.
+type Resume = (Motion, u32);
+
+/// A particle's integrated state: where `advance` leaves it after each step.
+#[derive(Clone, Copy)]
+struct Motion {
+    pos: Vec2,
+    vel: Vec2,
+    rotation: f32,
+    spin: f32,
+}
+
+/// One integration step of `dt`: forces on velocity, velocity on position, torque on roll.
+fn advance(preset: &Preset, r: &Rolled, flow: &Perlin, points: &ControlPoints, speed: f32, motion: &mut Motion, dt: f32) {
+    let Motion { mut pos, mut vel, mut rotation, mut spin } = *motion;
+    for op in &preset.operator {
+        match op {
+            Operator::Movement { gravity, drag } => {
+                vel += xy(*gravity) * dt;
+                vel *= (-drag * dt).exp();
+            }
+            Operator::Turbulence { mask, scale, .. } => {
+                let force = flow_at(flow, pos * *scale + Vec2::splat(r.turb_phase));
+                vel += force * xy(*mask) * (r.turb_speed * speed) * dt;
+            }
+            Operator::ControlPointAttract { controlpoint, origin, scale, threshold } => {
+                // A constant pull toward the point, not an inverse-square
+                // one, and `threshold` is a *diameter*: both match
+                // linux-wallpaperengine's reading (plan.md §4.27).
+                // `scale` is negative to push particles out instead.
+                if let Some(center) = points.get(*controlpoint).copied().flatten() {
+                    let to_cp = center + xy(*origin) - pos;
+                    let dist = to_cp.length();
+                    if dist > 0.001 && dist < threshold * 0.5 {
+                        vel += to_cp / dist * (*scale * speed) * dt;
+                    }
+                }
+            }
+            Operator::Vortex { distanceinner, distanceouter, speedinner, speedouter } => {
+                // Tangential, about the same system origin: the radius picks
+                // the speed, and the sign of the speed picks the direction.
+                let radius = pos.length();
+                if radius > 1.0 {
+                    let reach = (distanceouter - distanceinner).max(1e-3);
+                    let k = ((radius - distanceinner) / reach).clamp(0.0, 1.0);
+                    let tangential = speedinner + (speedouter - speedinner) * k;
+                    let around = Vec2::new(-pos.y, pos.x) / radius;
+                    vel += around * (tangential * speed) * dt / radius.max(4.0);
+                }
+            }
+            Operator::AngularMovement { force, drag } => {
+                spin += force.z * dt;
+                spin *= (-drag * dt).exp();
+            }
+            _ => {}
+        }
+    }
+    pos += vel * dt;
+    rotation += spin * dt;
+    *motion = Motion { pos, vel, rotation, spin };
 }
 
 /// The closed-form half: fades, oscillators and `*change` ramps, each a
@@ -1431,6 +1493,7 @@ fn collect_preset(
     starttime: f32,
     salt: u64,
     depth: u32,
+    mut cache: Option<&mut SimCache>,
 ) {
     let Some(preset) = presets.get(key) else {
         return;
@@ -1451,7 +1514,7 @@ fn collect_preset(
         for child in children.clone().filter(|child| child.r#type != "eventfollow") {
             collect_preset(
                 presets, table, &child.name, out, place, time, starttime,
-                salt ^ fnv1a(&child.name), depth + 1,
+                salt ^ fnv1a(&child.name), depth + 1, cache.as_deref_mut(),
             );
         }
     }
@@ -1462,17 +1525,32 @@ fn collect_preset(
     // shapes and hang `eventfollow` children serially, which is what fixes
     // their draw order.
     let points = control_points(preset, place);
-    let alive: Vec<(u64, f32, Live)> = live_slots(&em, time, longest_lifetime(preset))
+    // A rope needs its path's history, which only the from-birth integration keeps.
+    let known = cache.as_deref().filter(|_| !matches!(renderer, Renderer::RopeTrail { .. }));
+    let alive: Vec<Alive> = live_slots(&em, time, longest_lifetime(preset))
         .into_par_iter()
         .filter_map(|slot| {
             let (n, birth) = slot_particle(&em, slot, time)?;
             let age = time - birth;
             let rolled = roll(preset, emitter, &flow, seed(salt, n));
-            (age < rolled.lifetime).then(|| {
-                (n, birth, simulate(preset, &rolled, &flow, &points, speed, age, place.max_sim_steps))
+            (age < rolled.lifetime).then(|| match known {
+                Some(known) => {
+                    let prior = known.states.get(&(salt, n)).map(|&(resume, _)| resume);
+                    let (path, resume) = integrate_stepped(preset, &rolled, &flow, &points, speed, age, prior);
+                    (n, birth, display(preset, &rolled, age, path), resume)
+                }
+                None => (n, birth, simulate(preset, &rolled, &flow, &points, speed, age, place.max_sim_steps), None),
             })
         })
         .collect();
+    if let Some(cache) = cache.as_deref_mut() {
+        let seen = cache.frame;
+        for (n, _, _, resume) in &alive {
+            if let Some(resume) = resume {
+                cache.states.insert((salt, *n), (*resume, seen));
+            }
+        }
+    }
 
     // `collect_presets` resolves a sprite for every preset it parses (falling
     // back to a stand-in itself), so a missing one means a hand-built preset
@@ -1481,7 +1559,7 @@ fn collect_preset(
         return;
     };
     let cells = preset.sprite.as_ref().map_or(0, |sprite| sprite.frames.len());
-    for (n, birth, live) in &alive {
+    for (n, birth, live, _) in &alive {
         let sprite = base + sheet_cell(preset, cells, time - birth, salt, *n);
         push_particle(out, sprite, place, renderer, live, preset.blend);
         if depth + 1 < MAX_DEPTH {
@@ -1489,7 +1567,7 @@ fn collect_preset(
                 let child_place = Placement { origin_px: to_screen(place, live.pos), ..place.clone() };
                 collect_preset(
                     presets, table, &child.name, out, &child_place, time, *birth,
-                    salt ^ n.wrapping_mul(0x9E37_79B9), depth + 1,
+                    salt ^ n.wrapping_mul(0x9E37_79B9), depth + 1, cache.as_deref_mut(),
                 );
             }
         }
@@ -1552,11 +1630,20 @@ pub fn build_draw_list(
     preset_path: &str,
     place: &Placement,
     time: f32,
+    mut cache: Option<&mut SimCache>,
 ) -> Result<DrawList> {
     let start = presets.get(preset_path).context("particle preset had no body")?.starttime;
     let mut list = DrawList { canvas_px: place.canvas_px, items: Vec::new(), unsupported: Vec::new() };
     let salt = 0x5EED_u64.wrapping_add(fnv1a(preset_path));
-    collect_preset(presets, table, preset_path, &mut list, place, time, start, salt, 0);
+    if let Some(cache) = cache.as_deref_mut() {
+        cache.frame += 1;
+    }
+    collect_preset(presets, table, preset_path, &mut list, place, time, start, salt, 0, cache.as_deref_mut());
+    // A particle not seen this frame has died, or its slot has moved on.
+    if let Some(cache) = cache {
+        let frame = cache.frame;
+        cache.states.retain(|_, (_, seen)| *seen == frame);
+    }
     Ok(list)
 }
 
@@ -1591,7 +1678,7 @@ pub fn render_system_from(
     tints: &mut TintCache,
 ) -> Result<ParticleLayer> {
     let table = sprite_table(presets);
-    let list = build_draw_list(presets, &table, preset_path, place, time)?;
+    let list = build_draw_list(presets, &table, preset_path, place, time, None)?;
     let image = rasterize(presets, &table, &list, tints)?;
     Ok(ParticleLayer { image, unsupported: list.unsupported })
 }
@@ -1849,6 +1936,27 @@ mod tests {
         let (n, _) = slot_particle(&em, 0, 10.0).unwrap();
         assert_eq!(n % 40, 0);
         assert!(n >= 40);
+    }
+
+    /// A frame resumed from the cache must land exactly where integrating from birth does, so a live frame
+    /// and a `SIMULATE_TIME` dump of the same moment agree.
+    #[test]
+    fn resuming_a_particle_matches_integrating_it_from_birth() {
+        let drifting = preset(
+            r#"{"emitter":[{"name":"sphererandom","rate":10,"distancemax":64}],
+                "initializer":[{"name":"lifetimerandom","min":30,"max":30},{"name":"velocityrandom","min":"-50 -50 0","max":"50 50 0"}],
+                "operator":[{"name":"movement","gravity":"0 -40 0","drag":0.5},{"name":"turbulence","speedmin":200,"speedmax":400,"scale":0.01}],
+                "maxcount":10}"#,
+        );
+        let flow = Perlin::new(7);
+        let rolled = roll(&drifting, &drifting.emitter[0], &flow, seed(7, 3));
+        let (cold, _) = integrate_stepped(&drifting, &rolled, &flow, &NO_CONTROL_POINTS, 1.0, 12.345, None);
+        let mut resume = None;
+        for age in [0.01, 1.0, 1.5, 7.77, 12.0] {
+            resume = integrate_stepped(&drifting, &rolled, &flow, &NO_CONTROL_POINTS, 1.0, age, resume).1;
+        }
+        let (warm, _) = integrate_stepped(&drifting, &rolled, &flow, &NO_CONTROL_POINTS, 1.0, 12.345, resume);
+        assert_eq!((cold.pos, cold.vel, cold.rotation), (warm.pos, warm.vel, warm.rotation));
     }
 
     /// The window must hold every slot a full scan would find with a particle young enough to be alive,

@@ -187,6 +187,8 @@ enum LiveKind {
         /// Whether this system can blend straight onto the frame, or needs a
         /// scratch layer of its own first.
         ground: particles::Ground,
+        /// Each particle's integration so far, so a frame only adds the steps since the last.
+        cache: particle::SimCache,
     },
     /// A particle system that carries effects, and so still rasterizes on the
     /// CPU: its chain needs a straight-alpha texture of a fixed size, which is
@@ -269,6 +271,7 @@ fn gpu_particle(
         table,
         sprites,
         ground,
+        cache: particle::SimCache::default(),
     })
 }
 
@@ -1940,11 +1943,11 @@ fn refresh_one(
             };
             Ok(Some(Refreshed::Mesh(compose::warp_mesh(puppet, time))))
         }
-        LiveKind::ParticleGpu { placement, preset_path, presets, table, .. } => {
+        LiveKind::ParticleGpu { placement, preset_path, presets, table, cache, .. } => {
             if let Some(overrides) = overrides {
                 placement.overrides = *overrides;
             }
-            let list = particle::build_draw_list(presets, table, preset_path, placement, time)
+            let list = particle::build_draw_list(presets, table, preset_path, placement, time, Some(cache))
                 .with_context(|| format!("simulating {preset_path}"))?;
             Ok(Some(Refreshed::Shapes(list)))
         }
