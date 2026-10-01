@@ -954,7 +954,8 @@ impl App<'_> {
             .general
             .orthographic
             .context("scene has no orthographic projection, so it is not a flat wallpaper")?;
-        let screen = event_loop.primary_monitor();
+        // Wayland has no primary monitor; without one the canvas renders at its full authored size, uncapped.
+        let screen = event_loop.primary_monitor().or_else(|| event_loop.available_monitors().next());
         let monitor = screen.as_ref().map(|screen| {
             let size = screen.size();
             (size.width, size.height)
