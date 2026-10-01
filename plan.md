@@ -16,14 +16,16 @@ running the scene's scripts and keyframe tracks every frame. Fidelity is
 measured against native Wallpaper Engine run under Proton on this machine: 78
 of the 87 library scenes are captured and scored (mean ~24 dB PSNR, range
 6–51). What is still to build: the desktop backend on Linux (§14 — `desktop`
-is macOS only), web wallpapers (§9), and 60 fps (§14.7).
+is macOS only) and web wallpapers (§9). 60 fps (§14.7) is reached: 82 of 86
+scenes at this panel's size, at or above native WE on the same Iris Xe.
 
 **Start here** in a new session:
 
 - §4.32 — the Proton reference captures: how to run WE and record it, the
   comparison tools, every fix they found with its measured effect, where the
   library sits, and the ranked open list. Read it before touching fidelity.
-- §14.7 — the performance goal (60 fps on most scenes) and where to start.
+- §14.7 — performance: the WE comparison on the same GPU, what each fix bought,
+  and what is still open.
 - `CLAUDE.md` — commands, the debugging hooks (`SIMULATE_DUMP`, `_LAYERS`,
   `_TRACE`, `_CLOCK`), format conventions that were each a real bug, and the
   measuring workflow.
@@ -1994,7 +1996,8 @@ per-layer offsets (§4.25).
 
 **Open, in order of payoff** (as of 2026-09-30):
 
-1. **Performance** — §14.7. Scenes run 11–37 fps, GPU-bound.
+1. **Performance** — §14.7, done as of 2026-10-01: 82 of 86 at 60 fps at
+   2560x1600, ahead of WE on the same GPU; ex8 and three others are GPU-bound.
 2. **Camera parallax / overscan.** With `cameraparallax` on, WE draws 3233141951
    ~1.2x larger than we do; probably an overscan zoom so parallax never shows an
    edge, and probably the same thing as ex3's static per-layer offsets (§4.25).
@@ -2715,3 +2718,85 @@ expensive layer) so the work is ranked by payoff, the way §4.32 ranked fidelity
 **Done when** a library sweep shows at least half the scenes at a median of
 60 fps or better at the default resolution, with none of §4.32's fidelity
 numbers made worse.
+
+**Measured against WE on the same GPU** (2026-10-01). The "WE runs these at 60"
+above was not a like-for-like figure: the DXVK log shows WE under Proton on the
+RTX 3060, while `simulate` renders on the Iris Xe. `tools/we_bench.py` pins both to
+the Iris Xe (`DXVK_FILTER_DEVICE_NAME`, the Mesa EGL vendor file), plays them on
+the same headless output at the same size and cap, and reads WE's frame rate from
+Wine's `fps` trace channel and each process's render-engine time from DRM fdinfo.
+At the canvas fitted in 2560x1600 (this panel), 60 fps cap, WE at its own settings
+(`fps` 60, medium preset):
+
+| scene | WE fps | WE GPU | ours fps | ours GPU | ours uncapped |
+|---|---|---|---|---|---|
+| ex1 ATRI (8K) | 41 | 88% | 60 | 27% | 240 |
+| ex2 | 60 | 74% | 60 | 42% | 125 |
+| ex3 Hope | 60 | 41% | 60 | 28% | 237 |
+| ex4 Into the night | 60 | 47% | 60 | 48% | 149 |
+| ex5 | 60 | 43% | 60 | 38% | 237 |
+| ex6 Rainy Day (1080p canvas) | 60 | 73% | 60 | 51% | 124 |
+| ex7 Magic-Hat | 24 | 92% | 60 | 81% | 66 |
+| ex8 Matte Clouds | 38 | 89% | 50 | 93% | 50 |
+| 3484246124 Summer Miku | 52 | 85% | 60 | 45% | 124 |
+| 2582765611 No Game No Life | 38 | 88% | 60 | 67% | 77 |
+| 3340707146 云天 | 20 | 92% | 56* | 92% | 55* |
+| 2978198116 Shanghai | 58 | 86% | 60 | 43% | 132 |
+| 3689822347 MyGO (4K60 video) | 60 | 27% | 60 | 34% | 238 |
+
+(* after the masked-pass change; 37 in the run the rest of the table comes from.)
+On the same GPU we are at or above WE's frame rate on every scene, and spend less
+GPU time per frame on all but ex4 (equal) and the video scene; WE's CPU is 0.1 core
+throughout.
+
+**What it took.** `SIMULATE_PROFILE` (GPU timestamps per layer span, CPU per
+layer) and a library sweep with `we_bench --only ours` found the slow scenes;
+none of the five levers above was the first problem, and two things were bugs:
+
+- *Wayland has no primary monitor.* `primary_monitor()` was always `None` on
+  Linux, so `simulate` rendered the full authored canvas (ex1's is 7680x4320) and
+  never applied the refresh cap: that is what the 11–37 fps above measured.
+- *Pacing* drifted to 59 fps against a 60 cap (each gap measured from the last
+  frame's start); frames now sit on a fixed grid.
+- *Puppets* re-rasterized on the CPU, 27 ms of Rainy Day's frame plus a 24 MB
+  upload; now skinned on the GPU into the same padded texture (55 dB against the
+  CPU raster, edge pixels only). Rainy Day 33 → 60.
+- *Hidden layers* did all their work: two day/night scenes decoded five 4K
+  videos a frame to show one. A layer hidden or at zero alpha now skips its
+  refresh, chain and composite unless another chain samples it; a video that
+  falls behind seeks. 19 → 60 and 14.5 → 60 fps.
+- *Videos* decoded on one thread and were scaled to RGBA by swscale on the CPU,
+  for 3689822347 into a 4920x2767 layer (54 MB a frame). Frame threading, and the
+  4:2:0 planes converted on the GPU with swscale's matrix choice (709 when tagged,
+  601 otherwise): 5 cores → 0.85, 55 → 60 fps.
+- *Particles* rolled every slot (625,000 for No Game No Life's `count` of 25) and
+  re-integrated every live particle from birth each frame. Only slots inside the
+  longest lifetime are rolled now (pixel-identical), and `simulate` resumes each
+  particle from a per-layer cache on a fixed 1/60 s grid (cold = warm, bit for
+  bit; no WE-capture score moved). No Game No Life 5.8 → 1.0 cores, Shanghai
+  3.4 → 1.5.
+- *Chains*: one that reads no `g_Time` over a still image is drawn once (93
+  chains in 29 scenes); a magnified layer's chain runs at WE's effect resolution
+  and is stretched, as WE does (ex8's cloud chain 5.8 → 1.3 ms, ex8 39 → 51 fps at
+  1440p, WE-capture scores unchanged to 0.01 dB); a masked stock `waterwaves`/
+  `twirl` pass over a still base redraws only inside its mask's bounding box
+  (pixel-identical; 3340707146 38 → 56 fps at 1440p).
+
+**Where the library sits** (8606f86, every scene, ours alone, canvas fitted in
+2560x1600): 82 of 86 hold 60 fps, the median
+scene would run at 167 uncapped, and the median process uses 0.16 of a core (3
+scenes above one core, none above 1.6). The four below 60, all GPU-bound: ex8 52,
+3358871872 54, Dome 56, 3340707146 56. §14.7's done-when is met.
+
+**Still open:**
+
+- ex8 (Matte Clouds) is GPU-bound at 1440p: its `POST` composition layer runs six
+  `waterwaves` and an `edge_glow` over the whole frame every frame, and
+  `MAIN`'s three `waterflow` passes. A composition base changes each frame, so the
+  masked-pass trick does not apply; a ping-pong of two buffers seeded with the
+  base would, at the price of two copies.
+- `simulate` defaults to the display's refresh rate, which on this 240 Hz panel
+  is 4x WE's default; whether a wallpaper should cap at 60 by default is a
+  product decision, not yet taken.
+- The masked-pass whitelist is two shaders; `shake`, `waterflow` and
+  `foliagesway` are the next candidates, each needing its own identity check.

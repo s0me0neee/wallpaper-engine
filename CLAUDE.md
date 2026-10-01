@@ -68,7 +68,15 @@ method depends on `SIMULATE_SCALE=1` meaning exactly that — so passing either 
 The fps line accounts for the *whole* frame — `cpu` (which nests `upload`), `gpu`, `present`, `swap`
 and `loop`. `gpu` is only the cost of *issuing* commands; because GL is asynchronous, the GPU is
 actually waited on at `present`, the first touch of the default framebuffer. A frame that is slow
-with a large `present` is GPU-bound on scene work, not on the blit.
+with a large `present` is GPU-bound on scene work, not on the blit. `SIMULATE_PROFILE=1` adds two
+lines under it: GPU milliseconds per layer chain/composite/particle draw (GL timestamp queries,
+read three frames late) and CPU milliseconds per layer's refresh. The CPU figures run inside rayon,
+which lets a layer's time include work it stole from other layers; the process's CPU is the honest
+total.
+
+On Wayland winit has no primary monitor, so the size and refresh cap come from the first listed one.
+This laptop's panel is 240 Hz, which is therefore `simulate`'s default cap; pass `--fps 60` to match
+Wallpaper Engine's own default.
 
 `simulate` has a headless dump hook, which is the fastest way to verify a rendering change:
 
@@ -136,6 +144,14 @@ the same concept, so `Vec3` has a custom deserializer.
 
 An `EffectChain` is compiled once and redrawn at any `g_Time` without touching the archive, the
 preprocessor or the GL compiler again — that split is why the live simulator is viable.
+
+`simulate` departs from `export` in ways that are only about speed (plan.md §14.7), each checked to
+leave the frame the same or closer to WE: puppets are skinned on the GPU (`render/skin.rs`) and 4:2:0
+videos converted on it (`render/yuv.rs`); particles resume each frame from a per-layer `SimCache` on a
+fixed 1/60 s grid, where `export` re-integrates from birth; a magnified still layer runs its chain at
+WE's effect resolution (`StaticImage::effect`); a chain that reads no `g_Time` is drawn once; a masked
+stock `waterwaves`/`twirl` pass over a still base redraws only inside its mask; and a layer that is
+hidden or at zero alpha skips its work entirely unless another chain samples it.
 
 ### Driven values: scripts and keyframe tracks
 
@@ -245,6 +261,15 @@ all used before:
   should be still is measurable as a PSNR delta;
 - decode the effect masks with the `tex` subcommand to see what area an effect was *meant* to touch;
 - watch the `simulate` startup report for chains that stopped compiling.
+
+Performance is compared the same way (plan.md §14.7): `tools/we_bench.py <ids or dirs>` plays a
+scene in WE and in `simulate` on the same headless output, size and frame cap, pinned to the same
+GPU, and reports each one's fps (WE's from Wine's `WINEDEBUG=fps` channel), GPU busy time from DRM
+fdinfo, and CPU; `--uncapped` adds ours with no cap, `--only ours` skips WE, `--profile` keeps the
+per-layer lines. This machine has an RTX 3060 beside the Iris Xe, and DXVK puts WE on the RTX unless
+`DXVK_FILTER_DEVICE_NAME` says otherwise, so a comparison that does not pin it is not a comparison.
+A window on a `special:` workspace counts as occluded and `simulate` pauses there, so measure on the
+headless output, never in a hidden workspace.
 
 The strongest reference is native Wallpaper Engine itself, run under Proton on Linux (plan.md
 §4.32). `tools/we_capture.py <ids or dirs>` records each scene on a headless Hyprland output at
