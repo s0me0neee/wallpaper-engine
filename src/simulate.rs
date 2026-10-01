@@ -1005,6 +1005,10 @@ impl App<'_> {
         if still > 0 {
             println!("  {still} effect chain(s) drawn once: nothing in them moves");
         }
+        let reduced = static_scene_effects(self.static_scene.as_ref());
+        if reduced > 0 {
+            println!("  {reduced} effect chain(s) run at WE's effect resolution, below the layer's on screen");
+        }
         report_tweakables(&layers, self.presentation);
         let panel = panel_labels(&layers);
         let sampled_order = sampled_order(&layers);
@@ -1081,14 +1085,9 @@ impl App<'_> {
                         );
                     }
                     let kind = image_kind(gl, archive, assets, layer)?;
-                    (
-                        Some(layer.image.clone()),
-                        layer.image.dimensions(),
-                        rect_of(layer.left, layer.top, &layer.image),
-                        layer.blend,
-                        kind,
-                        layer.object, layer.texel_scale,
-                    )
+                    let (image, texel_scale) = chain_image(layer, &kind);
+                    let rect = rect_of(layer.left, layer.top, &layer.image);
+                    (Some(image.clone()), layer.image.dimensions(), rect, layer.blend, kind, layer.object, texel_scale)
                 }
                 StaticItem::Puppet(puppet) => {
                     omissions.retain(|note| {
@@ -1138,6 +1137,7 @@ impl App<'_> {
                 tweak_values.extend(chain.tweakables.iter().map(|tweakable| tweakable.default));
             }
 
+            let image = if chain.is_none() { drawn_image(item, image) } else { image };
             let textures = layer_textures(gl, image.as_ref(), &kind)?;
             let backdrop = blend_backdrop(gl, object, item, size, (static_scene.width, static_scene.height))?;
             layers.push(LiveLayer {
@@ -1167,6 +1167,30 @@ impl App<'_> {
         }
 
         Ok(Built { layers, tweak_values, omissions, particle_scale: gpu_scale })
+    }
+}
+
+/// How many still layers carry a smaller image for their chain (`StaticImage::effect`).
+fn static_scene_effects(static_scene: Option<&compose::StaticScene<'_>>) -> usize {
+    static_scene.map_or(0, |scene| {
+        scene.items.iter().filter(|item| matches!(item, StaticItem::Image(layer) if layer.effect.is_some())).count()
+    })
+}
+
+/// The pixels a layer's chain starts from, and their texel scale: a still layer's chain runs at WE's own
+/// effect resolution when that is smaller, and the compositor stretches its output into the rect on screen.
+fn chain_image<'i>(layer: &'i compose::StaticImage, kind: &LiveKind) -> (&'i RgbaImage, (f32, f32)) {
+    match &layer.effect {
+        Some((image, scale)) if matches!(kind, LiveKind::Image) => (image, *scale),
+        _ => (&layer.image, layer.texel_scale),
+    }
+}
+
+/// What a layer without a chain draws: its full-size pixels, not the smaller ones a chain would have run on.
+fn drawn_image(item: &StaticItem, image: Option<RgbaImage>) -> Option<RgbaImage> {
+    match item {
+        StaticItem::Image(layer) if layer.effect.is_some() => Some(layer.image.clone()),
+        _ => image,
     }
 }
 

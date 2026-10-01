@@ -128,6 +128,32 @@ pub struct StaticImage<'a> {
     pub video: Option<Vec<u8>>,
     /// Roll about the layer's own centre, in radians — `Anchor::roll`.
     pub roll: f32,
+    /// For a layer with effects drawn larger than WE runs them: its pixels at WE's effect resolution and
+    /// their texel scale. `simulate` runs the chain over these and stretches the result into the layer's
+    /// rect, as WE does, rather than over `image` (ex8's 3x clouds: 4x the pixels through two blur passes).
+    pub effect: Option<(RgbaImage, (f32, f32))>,
+}
+
+/// The size WE runs a layer's effects at, and the texel scale left at that size, when it is well under the
+/// layer's `pixels` on screen: an axis drawn magnified (`texel_scale` under 1) shrinks to one texel a pixel.
+#[expect(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::cast_precision_loss,
+    reason = "layer sides of at most a few thousand px, scaled down and rounded"
+)]
+fn effect_size(pixels: (u32, u32), texel_scale: (f32, f32)) -> Option<((u32, u32), (f32, f32))> {
+    let axis = |side: u32, scale: f32| -> (u32, f32) {
+        if scale >= 1.0 {
+            return (side, scale);
+        }
+        let shrunk = ((side as f32 * scale).round() as u32).max(1);
+        (shrunk, side as f32 * scale / shrunk as f32)
+    };
+    let ((width, scale_x), (height, scale_y)) = (axis(pixels.0, texel_scale.0), axis(pixels.1, texel_scale.1));
+    // A second image is only worth keeping when it takes a quarter of the pixels or more off the chain.
+    (u64::from(width) * u64::from(height) * 4 <= u64::from(pixels.0) * u64::from(pixels.1) * 3)
+        .then_some(((width, height), (scale_x, scale_y)))
 }
 
 /// A puppet-warp layer: the parsed mesh and everything `warp_frame` needs to
@@ -552,6 +578,7 @@ fn static_composition<'a>(
         texel_scale: texel_scale(canvas, if fullscreen { (1.0, 1.0) } else { (anchor.scale.x, anchor.scale.y) }),
         video: None,
         roll: anchor.roll,
+        effect: None,
     })
 }
 
@@ -592,6 +619,7 @@ fn static_text<'a>(
         texel_scale: texel_scale(canvas, (anchor.scale.x, anchor.scale.y)),
         video: None,
         roll: anchor.roll,
+        effect: None,
     })
 }
 
@@ -635,20 +663,29 @@ fn static_solid<'a>(
     );
     let (width, height) = to_pixel_size(extent_x * canvas.scale, extent_y * canvas.scale);
 
-    let mut image = RgbaImage::from_pixel(width, height, Rgba([255, 255, 255, 255]));
-    apply_tint(&mut image, object.color, object.brightness, object.alpha);
+    let solid = |width: u32, height: u32| {
+        let mut image = RgbaImage::from_pixel(width, height, Rgba([255, 255, 255, 255]));
+        apply_tint(&mut image, object.color, object.brightness, object.alpha);
+        image
+    };
+    let scale = texel_scale(canvas, (anchor.scale.x, anchor.scale.y));
+    let effect = model::visible_effects(object)
+        .next()
+        .and_then(|_| effect_size((width, height), scale))
+        .map(|((effect_width, effect_height), effect_scale)| (solid(effect_width, effect_height), effect_scale));
 
     Some(StaticImage {
         object,
-        image,
+        image: solid(width, height),
         left: round_to_i64(rect_left),
         top: round_to_i64(rect_top),
         blend: Blend::Over,
         warp_error: None,
         composition: false,
-        texel_scale: texel_scale(canvas, (anchor.scale.x, anchor.scale.y)),
+        texel_scale: scale,
         video: None,
         roll: anchor.roll,
+        effect,
     })
 }
 
@@ -834,6 +871,14 @@ fn static_image_or_puppet<'a>(
     }
 
     let (pixel_width, pixel_height) = to_pixel_size(extent_x * canvas.scale, extent_y * canvas.scale);
+    let scale = texel_scale(canvas, (anchor.scale.x, anchor.scale.y));
+    let effect = model::visible_effects(object).next().and_then(|_| effect_size((pixel_width, pixel_height), scale)).map(
+        |((width, height), effect_scale)| {
+            let mut image = scaled_tinted(object, texture.clone(), width, height);
+            mirror(&mut image, anchor);
+            (image, effect_scale)
+        },
+    );
     let mut image = scaled_tinted(object, texture, pixel_width, pixel_height);
     mirror(&mut image, anchor);
     Ok(Some(StaticItem::Image(StaticImage {
@@ -844,9 +889,10 @@ fn static_image_or_puppet<'a>(
         blend,
         warp_error,
         composition: false,
-        texel_scale: texel_scale(canvas, (anchor.scale.x, anchor.scale.y)),
+        texel_scale: scale,
         video,
         roll: anchor.roll,
+        effect,
     })))
 }
 
