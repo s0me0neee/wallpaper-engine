@@ -989,6 +989,44 @@ fn nominal_lifetime(preset: &Preset) -> f32 {
         .max(0.01)
 }
 
+/// The longest lifetime the preset can roll: `roll` takes it from `lifetimerandom` alone, 3 s without one.
+fn longest_lifetime(preset: &Preset) -> f32 {
+    preset
+        .initializer
+        .iter()
+        .filter_map(|init| match init {
+            Initializer::LifeTimeRandom { min, max, .. } => {
+                let (low, high) = bounds(*min, *max, 1.0);
+                Some(low.max(high))
+            }
+            _ => None,
+        })
+        .reduce(f32::max)
+        .unwrap_or(3.0)
+        .max(0.01)
+}
+
+/// The slots whose particle can still be alive at `time`, in slot order: those holding an emission from
+/// the last `longest` seconds. Everything older is dead whatever it rolled, and `slot_particle` maps each
+/// slot here to exactly the emission a full scan would. 2582765611's `count` of 25 makes 625,000 slots of
+/// which a few percent are ever alive, and rolling every one of them each frame was most of 8 ms.
+fn live_slots(em: &Emission, time: f32, longest: f32) -> Vec<u32> {
+    let newest = ((time - em.starttime) * em.rate).floor();
+    if time < em.starttime || newest < 0.0 {
+        return Vec::new();
+    }
+    #[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss, reason = "emission counts, non-negative")]
+    let (newest, oldest) = (newest as u64, (((time - em.starttime - longest) * em.rate).floor() - 1.0).max(0.0) as u64);
+    let modulus = u64::from(em.maxcount);
+    if newest - oldest.min(newest) + 1 >= modulus {
+        return (0..em.maxcount).collect();
+    }
+    #[expect(clippy::cast_possible_truncation, reason = "a remainder below maxcount, a u32")]
+    let mut slots: Vec<u32> = (oldest.min(newest)..=newest).map(|n| (n % modulus) as u32).collect();
+    slots.sort_unstable();
+    slots
+}
+
 /// The particle occupying `slot` at `time`, as `(global index, birth time)` —
 /// the newest emission congruent to `slot` mod `maxcount` whose birth is not
 /// in the future. Whether it is still alive is the caller's check.
@@ -1424,7 +1462,7 @@ fn collect_preset(
     // shapes and hang `eventfollow` children serially, which is what fixes
     // their draw order.
     let points = control_points(preset, place);
-    let alive: Vec<(u64, f32, Live)> = (0..em.maxcount)
+    let alive: Vec<(u64, f32, Live)> = live_slots(&em, time, longest_lifetime(preset))
         .into_par_iter()
         .filter_map(|slot| {
             let (n, birth) = slot_particle(&em, slot, time)?;
@@ -1811,6 +1849,26 @@ mod tests {
         let (n, _) = slot_particle(&em, 0, 10.0).unwrap();
         assert_eq!(n % 40, 0);
         assert!(n >= 40);
+    }
+
+    /// The window must hold every slot a full scan would find with a particle young enough to be alive,
+    /// across wraps, a start offset, and the edge where the window would cover every slot anyway.
+    #[test]
+    fn live_slots_keep_every_slot_young_enough_to_be_alive() {
+        for (rate, maxcount, starttime, longest) in [(9250.0, 625_000, 0.0, 2.0), (10.0, 40, 1.5, 3.0), (370.0, 500, 0.0, 5.0)] {
+            let em = Emission { rate, maxcount, starttime };
+            for time in [0.0, 0.7, 1.6, 4.0, 33.3, 71.9] {
+                let live = live_slots(&em, time, longest);
+                assert!(live.windows(2).all(|pair| pair[0] < pair[1]), "slot order");
+                for slot in 0..maxcount {
+                    if let Some((_, birth)) = slot_particle(&em, slot, time)
+                        && time - birth < longest
+                    {
+                        assert!(live.binary_search(&slot).is_ok(), "slot {slot} at t={time} (rate {rate})");
+                    }
+                }
+            }
+        }
     }
 
     /// A full system stops emitting, so the steady-state rate is whatever
