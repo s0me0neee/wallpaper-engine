@@ -21,7 +21,8 @@ use anyhow::{Context, Result, bail};
 use image::RgbaImage;
 use noise::{NoiseFn, Perlin};
 use serde_json::Value;
-use std::collections::{HashMap, HashSet};
+use std::cell::Cell;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::f64::consts::TAU;
 use std::sync::OnceLock;
 
@@ -231,6 +232,75 @@ struct CompiledPass {
     /// names — and the float uniform each material key feeds.
     source: (usize, usize),
     materials: Vec<(String, String)>,
+    /// Where this pass can differ from a copy of its input, in target pixels; `None` when anywhere.
+    region: Option<Region>,
+}
+
+/// `[x0, y0, x1, y1)` in a target's pixels, empty when `x0 >= x1` or `y0 >= y1`.
+type Region = [i32; 4];
+
+/// Where a texture's red channel is above zero, as `[u0, v0, u1, v1]` widened by a texel each side for
+/// bilinear reach; `None` when nowhere.
+type Support = Option<[f32; 4]>;
+
+/// Stock passes that copy their input exactly wherever their opacity mask is zero: the mask only scales a
+/// displacement (waterwaves) or mixes back to the input (twirl). The source is checked as well as the name,
+/// since a package can ship its own copy of a stock shader; the mask must be on, and the input the chain's.
+fn identity_outside_mask(stem: &str, fragment: &str, combos: &BTreeMap<String, i64>, binds: &[EffectBind]) -> bool {
+    if combos.get("MASK") != Some(&1) || !binds.is_empty() {
+        return false;
+    }
+    match stem {
+        "shaders/effects/waterwaves" => {
+            fragment.contains("* mask;") && fragment.contains("gl_FragColor = texSample2D(g_Texture0, texCoord);")
+        }
+        "shaders/effects/twirl" => {
+            fragment.contains("gl_FragColor = mix(texSample2D(g_Texture0, v_TexCoord.xy), gl_FragColor, mask);")
+        }
+        _ => false,
+    }
+}
+
+#[expect(clippy::cast_precision_loss, reason = "texture dimensions, nowhere near 2^24")]
+fn red_support(image: &RgbaImage) -> Support {
+    let (mut x0, mut y0, mut x1, mut y1) = (u32::MAX, u32::MAX, 0, 0);
+    for (x, y, pixel) in image.enumerate_pixels() {
+        if pixel.0[0] > 0 {
+            (x0, y0, x1, y1) = (x0.min(x), y0.min(y), x1.max(x), y1.max(y));
+        }
+    }
+    let (width, height) = (image.width() as f32, image.height() as f32);
+    (x0 <= x1).then(|| {
+        [
+            ((x0 as f32 - 1.0) / width).max(0.0),
+            ((y0 as f32 - 1.0) / height).max(0.0),
+            ((x1 as f32 + 2.0) / width).min(1.0),
+            ((y1 as f32 + 2.0) / height).min(1.0),
+        ]
+    })
+}
+
+/// `support` in a `size` target's pixels, a pixel wider each side.
+#[expect(clippy::cast_possible_truncation, clippy::cast_precision_loss, reason = "target sides of at most a few thousand px")]
+fn region_of(support: Support, (width, height): (u32, u32)) -> Region {
+    let Some([u0, v0, u1, v1]) = support else { return [0, 0, 0, 0] };
+    let (width, height) = (width as f32, height as f32);
+    [
+        ((u0 * width).floor() as i32 - 1).max(0),
+        ((v0 * height).floor() as i32 - 1).max(0),
+        ((u1 * width).ceil() as i32 + 1).min(width as i32),
+        ((v1 * height).ceil() as i32 + 1).min(height as i32),
+    ]
+}
+
+/// The smallest region holding both.
+fn union(a: Region, b: Region) -> Region {
+    let empty = |r: Region| r[0] >= r[2] || r[1] >= r[3];
+    match (empty(a), empty(b)) {
+        (true, _) => b,
+        (_, true) => a,
+        _ => [a[0].min(b[0]), a[1].min(b[1]), a[2].max(b[2]), a[3].max(b[3])],
+    }
 }
 
 /// What a pass binds to one sampler slot.
@@ -299,6 +369,8 @@ pub struct EffectChain {
     /// Effects left out of the chain because this renderer cannot run them, one
     /// note each — the caller folds these into its omissions.
     pub skipped: Vec<String>,
+    /// Every pass has been drawn whole once, so each target holds last frame's pixels.
+    drawn: Cell<bool>,
 }
 
 impl EffectChain {
@@ -349,7 +421,16 @@ impl EffectChain {
         time: f32,
         overrides: &[f32],
     ) -> Result<&pass::Target> {
+        // Over a still base, a pass that copies its input outside `region` only has to redraw where it or
+        // any pass before it can have changed: everywhere else its target still holds last frame's pixels,
+        // which were that same copy. One pass without a region makes every later pass whole again.
+        let partial = base.is_none() && self.drawn.get();
+        let mut changed = Some([0, 0, 0, 0]);
         for (pass_index, pass) in self.passes.iter().enumerate() {
+            changed = changed.zip(pass.region.filter(|_| partial)).map(|(changed, region)| union(changed, region));
+            if changed.is_some_and(|[x0, y0, x1, y1]| x0 >= x1 || y0 >= y1) {
+                continue;
+            }
             let mut floats = pass.floats.clone();
             floats.push(("g_Time".to_string(), vec![time]));
             // The cursor, normalised over the canvas. Shaders that use it
@@ -394,7 +475,8 @@ impl EffectChain {
             let float_refs: Vec<(&str, &[f32])> = floats.iter().map(|(n, v)| (n.as_str(), v.as_slice())).collect();
             let int_refs: Vec<(&str, i32)> = pass.ints.iter().map(|(n, v)| (n.as_str(), *v)).collect();
 
-            pass::draw(
+            pass::limit_to(gl, changed);
+            let drawn = pass::draw(
                 gl,
                 &pass::DrawCall {
                     program: &pass.program,
@@ -405,9 +487,11 @@ impl EffectChain {
                     ints: &int_refs,
                     mvp: &IDENTITY,
                 },
-            )
-            .with_context(|| format!("drawing {}", pass.label))?;
+            );
+            pass::limit_to(gl, None);
+            drawn.with_context(|| format!("drawing {}", pass.label))?;
         }
+        self.drawn.set(true);
         self.passes.last().map(|pass| &pass.target).context("at least one pass must have run")
     }
 }
@@ -510,7 +594,7 @@ pub fn prepare_effect_chain(
                     .with_context(|| format!("preprocessing {stem}.frag"))?;
                 let program = compile_or_repair(gl, &vertex_glsl, &fragment_glsl).with_context(|| format!("compiling {stem}"))?;
 
-                let (mut textures, resolutions) = resolve_textures(
+                let (mut textures, resolutions, mask) = resolve_textures(
                     gl,
                     archive,
                     &fragment_declarations,
@@ -519,6 +603,11 @@ pub fn prepare_effect_chain(
                     (current, current_size),
                     base,
                 )?;
+                // A copy is texel for texel only at the input's own size.
+                let region = mask
+                    .filter(|_| identity_outside_mask(&stem, &fragment_source, &combos, &definition_pass.bind))
+                    .filter(|_| (target_width, target_height) == current_size)
+                    .map(|support| region_of(support, current_size));
                 follow_layer_base(&mut textures, base_texture);
 
                 let mut floats = uniform_floats(&vertex_declarations, &effect_pass.constantshadervalues);
@@ -546,7 +635,7 @@ pub fn prepare_effect_chain(
                 }
                 let materials = material_uniforms(&vertex_declarations, &fragment_declarations);
                 let source = (effect_index, pass_index);
-                passes.push(CompiledPass { program, target, textures, floats, ints, label: stem, source, materials });
+                passes.push(CompiledPass { program, target, textures, floats, ints, label: stem, source, materials, region });
             }
         }
     }
@@ -557,7 +646,7 @@ pub fn prepare_effect_chain(
         }
         bail!("{}", skipped.join("; "));
     }
-    Ok(EffectChain { quad, passes, base: base_texture, tweakables, skipped })
+    Ok(EffectChain { quad, passes, base: base_texture, tweakables, skipped, drawn: Cell::new(false) })
 }
 
 /// The pixel size a pass renders at: its `fbos` entry's scale divides the
@@ -610,7 +699,8 @@ fn bound_slots(
 /// halves of that vector to tell apart. A texture derived from the layer
 /// reports its size in WE's texels (`texel_scale`); a file reports its own.
 /// Bound textures, and the `g_TextureNResolution` floats they imply.
-type BoundTextures = (Vec<(String, PassTexture)>, Vec<(String, Vec<f32>)>);
+/// The pass's samplers, their resolutions, and where its mask (`g_Texture1`) is non-zero when asked for.
+type BoundTextures = (Vec<(String, PassTexture)>, Vec<(String, Vec<f32>)>, Option<Support>);
 
 fn resolve_textures(
     gl: &glow::Context,
@@ -624,6 +714,7 @@ fn resolve_textures(
     let texel_scale = base.texel_scale;
     let mut bound = Vec::new();
     let mut resolutions = Vec::new();
+    let mut mask = None;
 
     for uniform in declarations.uniforms.iter().filter(|uniform| uniform.kind == "sampler2D") {
         let Some(slot) = uniform.name.strip_prefix("g_Texture").and_then(|n| n.parse::<usize>().ok()) else {
@@ -640,8 +731,12 @@ fn resolve_textures(
         } else if name.is_some_and(is_layer_composite_target) {
             (PassTexture::LayerBase, base.image.dimensions(), texel_scale)
         } else {
-            let (texture, size) =
-                resolve_slot_texture(gl, archive, name.filter(|name| !is_render_target(name)), uniform.default.as_ref())?;
+            let name = name.filter(|name| !is_render_target(name));
+            let (texture, size, support) =
+                resolve_slot_texture(gl, archive, name, uniform.default.as_ref(), slot == 1)?;
+            if slot == 1 {
+                mask = support;
+            }
             (PassTexture::Fixed(texture), size, (1.0, 1.0))
         };
 
@@ -651,7 +746,7 @@ fn resolve_textures(
         resolutions.push((format!("{}Resolution", uniform.name), vec![w, h, w, h]));
     }
 
-    Ok((bound, resolutions))
+    Ok((bound, resolutions, mask))
 }
 
 /// Compile a pass as written, or failing that with its HLSL-only forms rewritten; the first error is the one kept.
@@ -698,17 +793,19 @@ fn resolve_slot_texture(
     archive: &mut Archive,
     name: Option<&str>,
     default: Option<&Value>,
-) -> Result<(glow::Texture, (u32, u32))> {
+    want_support: bool,
+) -> Result<(glow::Texture, (u32, u32), Option<Support>)> {
     if let Some(name) = name {
         // A pass may positionally name an engine builtin (`util/white`,
         // `util/noflow`, `util/noise`, ...); those ship with Wallpaper Engine,
         // not the package, so synthesize them rather than reading them.
         if let Some(solid) = builtin_solid(name) {
-            return Ok((pass::solid_texture(gl, solid)?, (1, 1)));
+            let support = (solid[0] > 0).then_some([0.0, 0.0, 1.0, 1.0]);
+            return Ok((pass::solid_texture(gl, solid)?, (1, 1), Some(support)));
         }
         if let Some(noise) = stock_noise(archive, name).or_else(|| builtin_noise(name)) {
             let size = (noise.width(), noise.height());
-            return Ok((pass::upload_repeating_texture(gl, &noise)?, size));
+            return Ok((pass::upload_repeating_texture(gl, &noise)?, size, None));
         }
 
         let texture_path = format!("materials/{name}.tex");
@@ -717,16 +814,18 @@ fn resolve_slot_texture(
         let mipmap = crate::tex::largest_mipmap(&tex)?;
         let decoded = crate::tex::decode_rgba(&tex, mipmap).with_context(|| format!("decoding {texture_path}"))?;
         let size = (decoded.width(), decoded.height());
-        return Ok((pass::upload_texture(gl, &decoded)?, size));
+        let support = want_support.then(|| red_support(&decoded));
+        return Ok((pass::upload_texture(gl, &decoded)?, size, support));
     }
 
     let default_name = default.and_then(Value::as_str);
     if let Some(noise) = default_name.and_then(|name| stock_noise(archive, name).or_else(|| builtin_noise(name))) {
         let size = (noise.width(), noise.height());
-        return Ok((pass::upload_repeating_texture(gl, &noise)?, size));
+        return Ok((pass::upload_repeating_texture(gl, &noise)?, size, None));
     }
     let builtin = default_name.and_then(builtin_solid).unwrap_or([0, 0, 0, 255]);
-    Ok((pass::solid_texture(gl, builtin)?, (1, 1)))
+    let support = (builtin[0] > 0).then_some([0.0, 0.0, 1.0, 1.0]);
+    Ok((pass::solid_texture(gl, builtin)?, (1, 1), Some(support)))
 }
 
 /// Every non-sampler uniform's value, ready for `pass::DrawCall.floats`.
@@ -774,6 +873,38 @@ fn uniform_ints(declarations: &Declarations, material: &serde_json::Map<String, 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A mask's support widens by a texel for bilinear reach and lands in target pixels a pixel wider still;
+    /// an all-black mask is nowhere, which makes its pass a pure copy.
+    #[test]
+    fn a_mask_region_covers_its_red_texels_and_their_bilinear_reach() {
+        let mut mask = RgbaImage::new(64, 32);
+        mask.put_pixel(10, 20, image::Rgba([255, 0, 0, 255]));
+        mask.put_pixel(30, 25, image::Rgba([1, 0, 0, 255]));
+        let support = red_support(&mask);
+        assert_eq!(region_of(support, (128, 64)), [17, 37, 65, 55]);
+        assert_eq!(red_support(&RgbaImage::new(8, 8)), None);
+        assert_eq!(region_of(None, (200, 100)), [0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn an_empty_region_adds_nothing_to_a_union() {
+        assert_eq!(union([0, 0, 0, 0], [5, 6, 7, 8]), [5, 6, 7, 8]);
+        assert_eq!(union([5, 6, 7, 8], [0, 0, 0, 0]), [5, 6, 7, 8]);
+        assert_eq!(union([5, 6, 7, 8], [1, 9, 6, 10]), [1, 6, 7, 10]);
+    }
+
+    /// Only the stock shapes qualify, and only with the mask on and no binds re-routing the input.
+    #[test]
+    fn only_a_masked_stock_waterwaves_or_twirl_copies_outside_its_mask() {
+        let waterwaves = "texCoord += val1 * s1 * offset * strength * mask;\ngl_FragColor = texSample2D(g_Texture0, texCoord);";
+        let masked = BTreeMap::from([("MASK".to_string(), 1)]);
+        let unmasked = BTreeMap::from([("MASK".to_string(), 0)]);
+        assert!(identity_outside_mask("shaders/effects/waterwaves", waterwaves, &masked, &[]));
+        assert!(!identity_outside_mask("shaders/effects/waterwaves", waterwaves, &unmasked, &[]));
+        assert!(!identity_outside_mask("shaders/effects/waterwaves", "gl_FragColor = vec4(1.0);", &masked, &[]));
+        assert!(!identity_outside_mask("shaders/effects/blur", waterwaves, &masked, &[]));
+    }
 
     #[test]
     fn a_previous_bind_to_the_layer_image_follows_the_refeed() {

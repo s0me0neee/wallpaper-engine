@@ -60,6 +60,20 @@ pub fn compile_program(gl: &glow::Context, vertex_src: &str, fragment_src: &str)
     Ok(Program { handle: program, float_widths: float_widths(gl, program) })
 }
 
+/// Limit drawing to `rect`, `[x0, y0, x1, y1)` in the bound target's own rows (row 0 first), or lift it.
+pub fn limit_to(gl: &glow::Context, rect: Option<[i32; 4]>) {
+    // Safety: plain fixed-function state on the current context.
+    unsafe {
+        match rect {
+            Some([x0, y0, x1, y1]) => {
+                gl.enable(glow::SCISSOR_TEST);
+                gl.scissor(x0, y0, x1 - x0, y1 - y0);
+            }
+            None => gl.disable(glow::SCISSOR_TEST),
+        }
+    }
+}
+
 /// Whether the linked program actually reads float uniform `name`.
 pub fn uses_uniform(program: &Program, name: &str) -> bool {
     program.float_widths.contains_key(name)
