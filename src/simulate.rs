@@ -1612,6 +1612,16 @@ fn sampled_order(layers: &[LiveLayer]) -> Vec<usize> {
         .collect()
 }
 
+/// Whether a layer shows this frame: visible, and not faded out entirely. The compositor scales a layer by
+/// its alpha under every blend mode, so one at zero changes nothing.
+fn shows(layer: &LiveLayer, scripted: Option<&Scripted>, time: f32, px_per_unit: f32) -> bool {
+    let visible = match scripted {
+        Some(scripted) => scripted.now.get(layer.object_index).is_some_and(|anchor| anchor.visible),
+        None => !layer.source,
+    };
+    visible && placement(layer, time, scripted, px_per_unit).alpha > 0.0
+}
+
 /// Returns `true` when the caller should close the window (the debug dump hook
 /// asks for this after writing its frame).
 fn redraw(app: &mut App, time: f32) -> Result<bool> {
@@ -1625,7 +1635,12 @@ fn redraw(app: &mut App, time: f32) -> Result<bool> {
 
     run_panel(state);
 
-    let shapes = refresh_layers(state, static_scene, scripted.as_ref().map(|scripted| (scripted, &**scene)), time)?;
+    let shown: Vec<bool> = state.layers.iter().map(|layer| shows(layer, scripted.as_ref(), time, static_scene.px_per_unit)).collect();
+    // A layer nobody sees and no chain samples skips its CPU work: a day/night scene's four hidden videos
+    // decoded every frame (3326873240).
+    let active: Vec<bool> =
+        shown.iter().enumerate().map(|(index, &shown)| shown || state.sampled_order.contains(&index)).collect();
+    let shapes = refresh_layers(state, static_scene, scripted.as_ref().map(|scripted| (scripted, &**scene)), &active, time)?;
 
     // Stack the layers into the composite target, each under its blend mode.
     let gpu_start = Instant::now();
@@ -1645,11 +1660,7 @@ fn redraw(app: &mut App, time: f32) -> Result<bool> {
 
     let only = layer_filter();
     for (index, layer) in state.layers.iter().enumerate() {
-        let visible = match scripted.as_ref() {
-            Some(scripted) => scripted.now.get(layer.object_index).is_some_and(|anchor| anchor.visible),
-            None => !layer.source,
-        };
-        if !visible || only.as_ref().is_some_and(|wanted| !wanted.contains(&index)) {
+        if !shown[index] || only.as_ref().is_some_and(|wanted| !wanted.contains(&index)) {
             continue;
         }
         let place = placement(layer, time, scripted.as_ref(), static_scene.px_per_unit);
@@ -1775,6 +1786,7 @@ fn refresh_layers(
     state: &mut State,
     static_scene: &compose::StaticScene<'_>,
     driven: Option<(&Scripted, &Scene)>,
+    active: &[bool],
     time: f32,
 ) -> Result<Vec<Option<particle::DrawList>>> {
     let texts: &[scripting::LayerState] = driven.map_or(&[], |(scripted, _)| scripted.layers.as_slice());
@@ -1795,7 +1807,11 @@ fn refresh_layers(
         .layers
         .par_iter_mut()
         .zip(overrides.par_iter())
-        .map(|(layer, overrides)| {
+        .zip(active.par_iter())
+        .map(|((layer, overrides), &active)| {
+            if !active {
+                return (Ok(None), Duration::ZERO);
+            }
             let started = Instant::now();
             let refreshed = refresh_one(layer, overrides.as_ref(), static_scene, texts, time);
             (refreshed, started.elapsed())

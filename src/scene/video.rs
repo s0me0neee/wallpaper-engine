@@ -17,6 +17,10 @@ use std::io::Cursor;
 /// Closer than this, two timestamps are the same frame.
 const TOLERANCE: f64 = 1e-4;
 
+/// Further ahead than this, seek rather than decode every frame in between: a layer left undrawn while
+/// hidden comes back this far behind.
+const SEEK_AHEAD: f64 = 1.0;
+
 pub struct VideoTexture {
     input: format::context::Input,
     stream: usize,
@@ -72,6 +76,10 @@ pub fn frame_at(video: &mut VideoTexture, time: f32) -> Result<Option<RgbaImage>
     if video.shown.is_some_and(|shown| time + TOLERANCE < shown) {
         rewind(video)?;
     }
+    let decoded_to = video.ahead.as_ref().map(|(pts, _)| *pts).or(video.shown);
+    if decoded_to.map_or(time > SEEK_AHEAD, |at| time - at > SEEK_AHEAD) {
+        seek(video, time)?;
+    }
 
     let mut latest = None;
     loop {
@@ -106,6 +114,18 @@ pub fn frame_at(video: &mut VideoTexture, time: f32) -> Result<Option<RgbaImage>
 /// Back to the first frame, for the next pass round the loop.
 fn rewind(video: &mut VideoTexture) -> Result<()> {
     video.input.seek(0, ..0).context("rewinding the embedded video")?;
+    video.decoder.flush();
+    video.shown = None;
+    video.ahead = None;
+    video.drained = false;
+    Ok(())
+}
+
+/// To the keyframe at or before `time`, from which decoding forward reaches it.
+fn seek(video: &mut VideoTexture, time: f64) -> Result<()> {
+    #[expect(clippy::cast_possible_truncation, reason = "a loop position in microseconds, far below i64::MAX")]
+    let target = (time * f64::from(ffmpeg::ffi::AV_TIME_BASE)) as i64;
+    video.input.seek(target, ..target).context("seeking the embedded video")?;
     video.decoder.flush();
     video.shown = None;
     video.ahead = None;
