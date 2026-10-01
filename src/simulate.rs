@@ -20,7 +20,7 @@
 use crate::desktop::{self, Presentation};
 use crate::export::Resolution;
 use crate::pkg::Archive;
-use crate::render::{bloom, capture, particles, pass, skin, timer};
+use crate::render::{bloom, capture, particles, pass, skin, timer, yuv};
 use crate::scene::compose::{self, StaticItem};
 use crate::scene::model::{self, Blend, Scene};
 use crate::scene::{particle, scripting, text, video};
@@ -160,8 +160,9 @@ enum LiveKind {
     /// differs from `shown`, flipped as its mirrored scale says.
     Text { style: Box<text::Style>, shown: String, flip: (bool, bool) },
     /// A video texture, decoded on the scene clock and re-uploaded when its
-    /// frame changes, then tinted the way `compose` tints a still layer.
-    Video { video: Box<video::VideoTexture>, tint: (model::Vec3, f32, f32) },
+    /// frame changes, then tinted the way `compose` tints a still layer. `gpu` converts a 4:2:0 frame's
+    /// planes straight into the layer's texture; without it swscale converts on the CPU.
+    Video { video: Box<video::VideoTexture>, tint: (model::Vec3, f32, f32), gpu: Option<Box<yuv::Yuv>> },
     /// A puppet-warp layer: `static_scene.items[item]` is re-skinned each frame, on the GPU into `skin`.
     Puppet { item: usize, skin: Box<skin::Skin> },
     /// A composition layer: its input is the frame as composited so far,
@@ -1177,6 +1178,9 @@ fn layer_textures(gl: &glow::Context, image: Option<&RgbaImage>, kind: &LiveKind
         Some(image) if let LiveKind::Puppet { skin, .. } = kind => {
             Some(LayerTextures { ring: vec![skin.target.texture], next: 0, size: image.dimensions() })
         }
+        Some(image) if let LiveKind::Video { gpu: Some(gpu), .. } = kind => {
+            Some(LayerTextures { ring: vec![gpu.target.texture], next: 0, size: image.dimensions() })
+        }
         Some(image) => Some(LayerTextures::ring(gl, image)?),
         None => None,
     })
@@ -1200,7 +1204,11 @@ fn image_kind(gl: &glow::Context, archive: &mut Archive, assets: Option<&Path>, 
     let Some(mp4) = &layer.video else { return Ok(LiveKind::Image) };
     let video = video::open(mp4.clone(), layer.image.dimensions()).with_context(|| format!("opening {label}'s video"))?;
     let tint = (layer.object.color, layer.object.brightness, layer.object.alpha);
-    Ok(LiveKind::Video { video: Box::new(video), tint })
+    let gpu = match video::source(&video) {
+        (source, Some(planar)) => Some(Box::new(yuv::build(gl, source, layer.image.dimensions(), planar)?)),
+        (_, None) => None,
+    };
+    Ok(LiveKind::Video { video: Box::new(video), tint, gpu })
 }
 
 /// Compile one layer's effect chain, recording whatever it could not build.
@@ -1517,6 +1525,8 @@ enum Refreshed {
     Image(RgbaImage, (i32, i32, i32, i32)),
     /// A puppet's deformed mesh, for its skin to draw.
     Mesh(compose::WarpMesh),
+    /// A video's next decoded frame, for its `yuv` converter to draw.
+    Frame(ffmpeg_next::frame::Video),
     /// A particle system's shapes for this frame, for the instanced pass.
     Shapes(particle::DrawList),
 }
@@ -1842,6 +1852,14 @@ fn refresh_layers(
                 }
                 shapes.push(None);
             }
+            Some(Refreshed::Frame(frame)) => {
+                if let LiveKind::Video { gpu: Some(gpu), tint: (color, brightness, alpha), .. } = &layer.kind {
+                    let tint = [color.x, color.y, color.z].map(|channel| (channel * brightness).clamp(0.0, 1.0));
+                    let planes = [0, 1, 2].map(|plane| (frame.data(plane), frame.stride(plane)));
+                    yuv::draw(&state.gl, gpu, planes, tint, alpha.clamp(0.0, 1.0));
+                }
+                shapes.push(None);
+            }
             Some(Refreshed::Shapes(list)) => shapes.push(Some(list)),
             None => shapes.push(None),
         }
@@ -1881,7 +1899,11 @@ fn refresh_one(
             shown.clone_from(wanted);
             Ok(Some(Refreshed::Image(image, layer.rect)))
         }
-        LiveKind::Video { video, tint: (color, brightness, alpha) } => {
+        LiveKind::Video { video, gpu: Some(_), .. } => {
+            let frame = video::next_frame(video, time).with_context(|| format!("playing {}'s video", layer.name))?;
+            Ok(frame.map(Refreshed::Frame))
+        }
+        LiveKind::Video { video, tint: (color, brightness, alpha), gpu: None } => {
             let frame = video::frame_at(video, time).with_context(|| format!("playing {}'s video", layer.name))?;
             Ok(frame.map(|mut image| {
                 compose::apply_tint(&mut image, *color, *brightness, *alpha);

@@ -73,6 +73,33 @@ pub fn open(bytes: Vec<u8>, size: (u32, u32)) -> Result<VideoTexture> {
 /// The frame showing at `time` seconds into the loop, or `None` when it is the
 /// one already handed out (or the video has no frame that early).
 pub fn frame_at(video: &mut VideoTexture, time: f32) -> Result<Option<RgbaImage>> {
+    let Some(frame) = next_frame(video, time)? else { return Ok(None) };
+    to_rgba(video, &frame).map(Some)
+}
+
+/// How a 4:2:0 planar frame's YUV becomes RGB, as swscale would convert it.
+#[derive(Clone, Copy)]
+pub struct Planar {
+    /// Full (JPEG) range rather than limited (MPEG).
+    pub full_range: bool,
+    /// BT.709 rather than BT.601, which is swscale's choice for a stream that does not say: the day/night
+    /// scenes' videos are tagged 709 and 3689822347's is untagged, and each matches only its own.
+    pub bt709: bool,
+}
+
+/// The decoded size, and how to convert a frame on the GPU when it is 4:2:0 planar YUV.
+pub fn source(video: &VideoTexture) -> ((u32, u32), Option<Planar>) {
+    let full_range = match video.decoder.format() {
+        format::Pixel::YUVJ420P => Some(true),
+        format::Pixel::YUV420P => Some(video.decoder.color_range() == ffmpeg::util::color::Range::JPEG),
+        _ => None,
+    };
+    let bt709 = video.decoder.color_space() == ffmpeg::util::color::Space::BT709;
+    ((video.decoder.width(), video.decoder.height()), full_range.map(|full_range| Planar { full_range, bt709 }))
+}
+
+/// `frame_at` before the conversion: the decoded frame showing at `time`, as it left the decoder.
+pub fn next_frame(video: &mut VideoTexture, time: f32) -> Result<Option<frame::Video>> {
     let time = match video.duration {
         Some(length) if length > 0.0 => f64::from(time).rem_euclid(length),
         _ => f64::from(time),
@@ -112,7 +139,7 @@ pub fn frame_at(video: &mut VideoTexture, time: f32) -> Result<Option<RgbaImage>
         return Ok(None);
     }
     video.shown = Some(pts);
-    to_rgba(video, &frame).map(Some)
+    Ok(Some(frame))
 }
 
 /// Back to the first frame, for the next pass round the loop.

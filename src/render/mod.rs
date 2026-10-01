@@ -8,3 +8,4 @@ pub mod particles;
 pub mod pass;
 pub mod skin;
 pub mod timer;
+pub mod yuv;
