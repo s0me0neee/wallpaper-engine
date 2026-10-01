@@ -20,7 +20,7 @@
 use crate::desktop::{self, Presentation};
 use crate::export::Resolution;
 use crate::pkg::Archive;
-use crate::render::{bloom, capture, particles, pass};
+use crate::render::{bloom, capture, particles, pass, timer};
 use crate::scene::compose::{self, StaticItem};
 use crate::scene::model::{self, Blend, Scene};
 use crate::scene::{particle, scripting, text, video};
@@ -34,6 +34,7 @@ use glutin::surface::{GlSurface, Surface, SurfaceAttributesBuilder, SwapInterval
 use glutin_winit::{DisplayBuilder, GlWindow};
 use image::RgbaImage;
 use raw_window_handle::HasWindowHandle;
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::ffi::CString;
 use std::num::NonZeroU32;
@@ -729,6 +730,15 @@ struct State {
     /// Separate from `frames_since.frames`, which the fps line resets every
     /// second: a scene slower than 1 fps never reached the warm-up count.
     frames_drawn: u32,
+    /// GPU time per layer and pass, when `SIMULATE_PROFILE` is set.
+    timers: Option<RefCell<timer::Timers>>,
+}
+
+/// Open a GPU timing span called `label`, closing the one before it, when profiling.
+fn mark(state: &State, label: impl FnOnce() -> String) {
+    if let Some(timers) = &state.timers {
+        timer::mark(&state.gl, &mut timers.borrow_mut(), label());
+    }
 }
 
 /// `(left, top, width, height)` in canvas pixels for an image placed with its
@@ -1020,6 +1030,7 @@ impl App<'_> {
             panel,
             frames_since: FrameStats::new(),
             frames_drawn: 0,
+            timers: std::env::var_os("SIMULATE_PROFILE").map(|_| RefCell::new(timer::new())),
         })
     }
 
@@ -1585,6 +1596,7 @@ fn redraw(app: &mut App, time: f32) -> Result<bool> {
 
     // Stack the layers into the composite target, each under its blend mode.
     let gpu_start = Instant::now();
+    mark(state, || "clear".to_string());
     pass::clear_target(&state.gl, &state.composite, state.background);
 
     let script_values: &[serde_json::Value] = scripted.as_ref().map_or(&[], |scripted| scripted.values.as_slice());
@@ -1592,6 +1604,7 @@ fn redraw(app: &mut App, time: f32) -> Result<bool> {
     let mut finished: HashMap<i64, glow::Texture> = HashMap::new();
     for &index in &state.sampled_order {
         let layer = &state.layers[index];
+        mark(state, || format!("{} chain", layer.name));
         if let Some(texture) = layer_output(state, layer, &finished, script_values, time)? {
             finished.insert(layer.id, texture);
         }
@@ -1611,6 +1624,7 @@ fn redraw(app: &mut App, time: f32) -> Result<bool> {
         // A GPU particle layer draws its own pixels and composites them under
         // a scissor, so it never touches a layer texture at all.
         if let LiveKind::ParticleGpu { sprites, ground, .. } = &layer.kind {
+            mark(state, || format!("{} particles", layer.name));
             composite_particles(state, layer, sprites, *ground, shapes[index].as_ref(), place);
             continue;
         }
@@ -1618,6 +1632,7 @@ fn redraw(app: &mut App, time: f32) -> Result<bool> {
         // A composition layer renders the frame beneath it, so lift that
         // rectangle out of the composite before its chain runs.
         if let LiveKind::Composition { region } = &layer.kind {
+            mark(state, || format!("{} copy", layer.name));
             pass::copy_region(
                 &state.gl,
                 &state.region_copy,
@@ -1628,6 +1643,7 @@ fn redraw(app: &mut App, time: f32) -> Result<bool> {
             );
         }
 
+        mark(state, || format!("{} chain", layer.name));
         let source = match finished.get(&layer.id) {
             Some(&texture) => texture,
             None => match layer_output(state, layer, &finished, script_values, time)? {
@@ -1635,17 +1651,20 @@ fn redraw(app: &mut App, time: f32) -> Result<bool> {
                 None => continue,
             },
         };
+        mark(state, || format!("{} composite", layer.name));
         composite_one(state, layer, source, place, false);
     }
 
     // Scene bloom runs over the finished stack, the way WE post-processes the
     // whole frame rather than any one layer.
     if let Some((compiled, settings)) = &state.bloom {
+        mark(state, || "bloom".to_string());
         bloom::apply(&state.gl, compiled, &state.composite, *settings);
     }
 
     // The camera acts on the finished frame, after every layer and the bloom,
     // which is the one point where the whole picture exists in canvas pixels.
+    mark(state, || "camera".to_string());
     apply_camera(state);
 
     state.frames_since.gpu += gpu_start.elapsed();
@@ -1669,14 +1688,27 @@ fn redraw(app: &mut App, time: f32) -> Result<bool> {
         }
     }
 
+    present(state)?;
+    Ok(false)
+}
+
+/// Blit the finished frame to the window, swap, and report the frame rate.
+fn present(state: &mut State) -> Result<()> {
     let present_start = Instant::now();
     let size = state.window.inner_size();
     let sized = present_start.elapsed();
     #[expect(clippy::cast_possible_wrap, reason = "window dimensions are nowhere near i32::MAX")]
     let window = (size.width as i32, size.height as i32);
+    mark(state, || "blit".to_string());
     pass::blit_to_screen(&state.gl, &state.blit, &state.display_quad, state.composite.texture, state.content_size, window, state.fit);
+    if state.egui.is_some() {
+        mark(state, || "egui".to_string());
+    }
     if let Some(egui) = &mut state.egui {
         egui.paint(&state.window);
+    }
+    if let Some(timers) = &state.timers {
+        timer::end_frame(&state.gl, &mut timers.borrow_mut());
     }
     // Timed separately from `gpu` above, which only counts issuing the commands
     // — GL runs them asynchronously, so this is where the GPU is actually
@@ -1688,8 +1720,14 @@ fn redraw(app: &mut App, time: f32) -> Result<bool> {
     state.surface.swap_buffers(&state.context).context("swapping buffers")?;
     state.frames_since.swap += swap_start.elapsed();
 
-    report_fps(&mut state.frames_since);
-    Ok(false)
+    if report_fps(&mut state.frames_since)
+        && let Some(timers) = &state.timers
+    {
+        let (spans, total) = timer::take(&mut timers.borrow_mut(), 8);
+        let spans: Vec<String> = spans.iter().map(|(label, ms)| format!("{label} {ms:.2}")).collect();
+        println!("    gpu {total:.2} ms: {}", spans.join(", "));
+    }
+    Ok(())
 }
 
 /// Every layer's per-frame CPU work, and the uploads that follow it.
@@ -1863,26 +1901,28 @@ impl FrameStats {
 
 /// Print a frame-rate line about once a second so a slow scene is visible
 /// without a profiler.
-fn report_fps(stats: &mut FrameStats) {
+fn report_fps(stats: &mut FrameStats) -> bool {
     stats.frames += 1;
     let elapsed = stats.since.elapsed();
-    if elapsed.as_secs() >= 1 {
-        let frames = f64::from(stats.frames);
-        let fps = frames / elapsed.as_secs_f64();
-        let cpu = stats.cpu.as_secs_f64() * 1000.0 / frames;
-        let gpu = stats.gpu.as_secs_f64() * 1000.0 / frames;
-        let upload = stats.upload.as_secs_f64() * 1000.0 / frames;
-        let swap = stats.swap.as_secs_f64() * 1000.0 / frames;
-        // Whatever the frame period is that `redraw` did not spend: the event
-        // loop's own round trip.
-        let loop_ms = (elapsed.as_secs_f64() - stats.frame.as_secs_f64()) * 1000.0 / frames;
-        let present = stats.present.as_secs_f64() * 1000.0 / frames;
-        let sized = stats.sized.as_secs_f64() * 1000.0 / frames;
-        println!(
-            "  {fps:.0} fps  (cpu {cpu:.1}, upload {upload:.1}, gpu {gpu:.1}, present {present:.1} [sized {sized:.1}], swap {swap:.1}, loop {loop_ms:.1} ms)"
-        );
-        *stats = FrameStats::new();
+    if elapsed.as_secs() < 1 {
+        return false;
     }
+    let frames = f64::from(stats.frames);
+    let fps = frames / elapsed.as_secs_f64();
+    let cpu = stats.cpu.as_secs_f64() * 1000.0 / frames;
+    let gpu = stats.gpu.as_secs_f64() * 1000.0 / frames;
+    let upload = stats.upload.as_secs_f64() * 1000.0 / frames;
+    let swap = stats.swap.as_secs_f64() * 1000.0 / frames;
+    // Whatever the frame period is that `redraw` did not spend: the event
+    // loop's own round trip.
+    let loop_ms = (elapsed.as_secs_f64() - stats.frame.as_secs_f64()) * 1000.0 / frames;
+    let present = stats.present.as_secs_f64() * 1000.0 / frames;
+    let sized = stats.sized.as_secs_f64() * 1000.0 / frames;
+    println!(
+        "  {fps:.0} fps  (cpu {cpu:.1}, upload {upload:.1}, gpu {gpu:.1}, present {present:.1} [sized {sized:.1}], swap {swap:.1}, loop {loop_ms:.1} ms)"
+    );
+    *stats = FrameStats::new();
+    true
 }
 
 /// Run the egui pass and copy the slider values back into `state.tweak_values`.
