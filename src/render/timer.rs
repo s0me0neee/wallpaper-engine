@@ -6,6 +6,7 @@
 
 use glow::HasContext;
 use std::collections::HashMap;
+use std::time::Duration;
 
 const LAG: usize = 3;
 
@@ -23,10 +24,20 @@ pub struct Timers {
     /// Nanoseconds per label, summed since the last `take`, and the frames that sum covers.
     totals: HashMap<String, u64>,
     frames_counted: u32,
+    /// Per-layer CPU time (puppet skins, particle simulation), summed since the last `take`, and its frames.
+    cpu: HashMap<String, Duration>,
+    cpu_frames: u32,
 }
 
 pub fn new() -> Timers {
-    Timers { frames: (0..LAG).map(|_| Frame::default()).collect(), current: 0, totals: HashMap::new(), frames_counted: 0 }
+    Timers {
+        frames: (0..LAG).map(|_| Frame::default()).collect(),
+        current: 0,
+        totals: HashMap::new(),
+        frames_counted: 0,
+        cpu: HashMap::new(),
+        cpu_frames: 0,
+    }
 }
 
 /// Close the running span and open one called `label`.
@@ -64,6 +75,25 @@ pub fn end_frame(gl: &glow::Context, timers: &mut Timers) {
         timers.frames_counted += 1;
     }
     frame.labels.clear();
+}
+
+/// One frame's CPU time per layer.
+pub fn add_cpu<'a>(timers: &mut Timers, spans: impl Iterator<Item = (&'a str, Duration)>) {
+    for (label, spent) in spans {
+        *timers.cpu.entry(label.to_string()).or_default() += spent;
+    }
+    timers.cpu_frames += 1;
+}
+
+/// The `count` layers with the most CPU time, as `(label, ms per frame)`, since the last call.
+pub fn take_cpu(timers: &mut Timers, count: usize) -> Vec<(String, f64)> {
+    let frames = f64::from(timers.cpu_frames.max(1));
+    let mut spans: Vec<(String, f64)> =
+        timers.cpu.drain().map(|(label, spent)| (label, spent.as_secs_f64() * 1000.0 / frames)).collect();
+    timers.cpu_frames = 0;
+    spans.sort_by(|a, b| b.1.total_cmp(&a.1));
+    spans.truncate(count);
+    spans
 }
 
 /// The `count` most expensive spans as `(label, ms per frame)`, and the whole frame's GPU ms, since the

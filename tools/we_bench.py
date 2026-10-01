@@ -140,9 +140,11 @@ def bench_ours(wallpaper, title, scale, fps, args):
     rates = [float(m.group(1)) for line in window if (m := re.match(r"\s+([\d.]+) fps  \(", line))]
     stats = [line.strip() for line in window if " fps  (" in line]
     profile = [line.strip() for line in window if line.strip().startswith("gpu ")]
+    cpu_profile = [line.strip() for line in window if line.strip().startswith("cpu by layer")]
     return {"fps": statistics.median(rates) if rates else None, "gpu": gpu, "cpu": cpu,
             "line": stats[len(stats) // 2] if stats else None,
-            "profile": profile[len(profile) // 2] if profile else None}
+            "profile": profile[len(profile) // 2] if profile else None,
+            "cpu_profile": cpu_profile[len(cpu_profile) // 2] if cpu_profile else None}
 
 
 def scene_canvas(binary, wallpaper):
@@ -205,7 +207,7 @@ def main():
                 wc.size_output(*size, args.fps)
                 row["ours"] = bench_ours(str(project.parent), title, scale, args.fps, args)
                 print(f"  ours  {fmt(row['ours'])}", flush=True)
-                for key in ("line", "profile"):
+                for key in ("line", "profile", "cpu_profile"):
                     if row["ours"].get(key):
                         print(f"        {row['ours'][key]}", flush=True)
                 if args.uncapped:

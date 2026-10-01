@@ -1759,6 +1759,9 @@ fn present(state: &mut State) -> Result<()> {
         let (spans, total) = timer::take(&mut timers.borrow_mut(), 8);
         let spans: Vec<String> = spans.iter().map(|(label, ms)| format!("{label} {ms:.2}")).collect();
         println!("    gpu {total:.2} ms: {}", spans.join(", "));
+        let cpu: Vec<String> =
+            timer::take_cpu(&mut timers.borrow_mut(), 5).iter().map(|(label, ms)| format!("{label} {ms:.2}")).collect();
+        println!("    cpu by layer: {}", cpu.join(", "));
     }
     Ok(())
 }
@@ -1792,59 +1795,17 @@ fn refresh_layers(
         .layers
         .par_iter_mut()
         .zip(overrides.par_iter())
-        .map(|(layer, overrides)| match &mut layer.kind {
-            // A composition layer's input is produced on the GPU during the
-            // composite pass below, not here.
-            LiveKind::Image | LiveKind::Composition { .. } => Ok(None),
-            LiveKind::Text { style, shown, flip } => {
-                let wanted = texts.get(layer.object_index).and_then(|state| state.text.as_ref());
-                let Some(wanted) = wanted.filter(|wanted| *wanted != shown && text::drawable(wanted)) else {
-                    return Ok(None);
-                };
-                #[expect(clippy::cast_sign_loss, reason = "a layer rect's sides are positive")]
-                let size = (layer.rect.2 as u32, layer.rect.3 as u32);
-                let mut image = text::draw(style, wanted, size);
-                if flip.0 {
-                    image::imageops::flip_horizontal_in_place(&mut image);
-                }
-                if flip.1 {
-                    image::imageops::flip_vertical_in_place(&mut image);
-                }
-                shown.clone_from(wanted);
-                Ok(Some(Refreshed::Image(image, layer.rect)))
-            }
-            LiveKind::Video { video, tint: (color, brightness, alpha) } => {
-                let frame = video::frame_at(video, time).with_context(|| format!("playing {}'s video", layer.name))?;
-                Ok(frame.map(|mut image| {
-                    compose::apply_tint(&mut image, *color, *brightness, *alpha);
-                    Refreshed::Image(image, layer.rect)
-                }))
-            }
-            LiveKind::Puppet { item, .. } => {
-                let StaticItem::Puppet(puppet) = &static_scene.items[*item] else {
-                    unreachable!("a Puppet LiveKind always points at a Puppet item")
-                };
-                Ok(Some(Refreshed::Mesh(compose::warp_mesh(puppet, time))))
-            }
-            LiveKind::ParticleGpu { placement, preset_path, presets, table, .. } => {
-                if let Some(overrides) = overrides {
-                    placement.overrides = *overrides;
-                }
-                let list = particle::build_draw_list(presets, table, preset_path, placement, time)
-                    .with_context(|| format!("simulating {preset_path}"))?;
-                Ok(Some(Refreshed::Shapes(list)))
-            }
-            LiveKind::Particle { placement, preset_path, presets, tints } => {
-                if let Some(overrides) = overrides {
-                    placement.overrides = *overrides;
-                }
-                let image = particle::render_system_from(presets, preset_path, placement, time, tints)
-                    .with_context(|| format!("simulating {preset_path}"))?
-                    .image;
-                Ok(Some(Refreshed::Image(image, layer.rect)))
-            }
+        .map(|(layer, overrides)| {
+            let started = Instant::now();
+            let refreshed = refresh_one(layer, overrides.as_ref(), static_scene, texts, time);
+            (refreshed, started.elapsed())
         })
-        .collect::<Result<Vec<_>>>()?;
+        .collect::<Vec<_>>();
+    if let Some(timers) = &state.timers {
+        let spans = state.layers.iter().zip(&refreshed).map(|(layer, (_, spent))| (layer.name.as_str(), *spent));
+        timer::add_cpu(&mut timers.borrow_mut(), spans);
+    }
+    let refreshed = refreshed.into_iter().map(|(refreshed, _)| refreshed).collect::<Result<Vec<_>>>()?;
 
     // Shapes cannot be drawn here — this thread owns the GL context, and the
     // composite below needs them in z-order — so they ride along to it.
@@ -1873,6 +1834,68 @@ fn refresh_layers(
 
     state.frames_since.cpu += cpu_start.elapsed();
     Ok(shapes)
+}
+
+/// One layer's per-frame CPU work: what it needs uploaded or drawn this frame, if anything.
+fn refresh_one(
+    layer: &mut LiveLayer,
+    overrides: Option<&model::InstanceOverride>,
+    static_scene: &compose::StaticScene<'_>,
+    texts: &[scripting::LayerState],
+    time: f32,
+) -> Result<Option<Refreshed>> {
+    match &mut layer.kind {
+        // A composition layer's input is produced on the GPU during the
+        // composite pass below, not here.
+        LiveKind::Image | LiveKind::Composition { .. } => Ok(None),
+        LiveKind::Text { style, shown, flip } => {
+            let wanted = texts.get(layer.object_index).and_then(|state| state.text.as_ref());
+            let Some(wanted) = wanted.filter(|wanted| *wanted != shown && text::drawable(wanted)) else {
+                return Ok(None);
+            };
+            #[expect(clippy::cast_sign_loss, reason = "a layer rect's sides are positive")]
+            let size = (layer.rect.2 as u32, layer.rect.3 as u32);
+            let mut image = text::draw(style, wanted, size);
+            if flip.0 {
+                image::imageops::flip_horizontal_in_place(&mut image);
+            }
+            if flip.1 {
+                image::imageops::flip_vertical_in_place(&mut image);
+            }
+            shown.clone_from(wanted);
+            Ok(Some(Refreshed::Image(image, layer.rect)))
+        }
+        LiveKind::Video { video, tint: (color, brightness, alpha) } => {
+            let frame = video::frame_at(video, time).with_context(|| format!("playing {}'s video", layer.name))?;
+            Ok(frame.map(|mut image| {
+                compose::apply_tint(&mut image, *color, *brightness, *alpha);
+                Refreshed::Image(image, layer.rect)
+            }))
+        }
+        LiveKind::Puppet { item, .. } => {
+            let StaticItem::Puppet(puppet) = &static_scene.items[*item] else {
+                unreachable!("a Puppet LiveKind always points at a Puppet item")
+            };
+            Ok(Some(Refreshed::Mesh(compose::warp_mesh(puppet, time))))
+        }
+        LiveKind::ParticleGpu { placement, preset_path, presets, table, .. } => {
+            if let Some(overrides) = overrides {
+                placement.overrides = *overrides;
+            }
+            let list = particle::build_draw_list(presets, table, preset_path, placement, time)
+                .with_context(|| format!("simulating {preset_path}"))?;
+            Ok(Some(Refreshed::Shapes(list)))
+        }
+        LiveKind::Particle { placement, preset_path, presets, tints } => {
+            if let Some(overrides) = overrides {
+                placement.overrides = *overrides;
+            }
+            let image = particle::render_system_from(presets, preset_path, placement, time, tints)
+                .with_context(|| format!("simulating {preset_path}"))?
+                .image;
+            Ok(Some(Refreshed::Image(image, layer.rect)))
+        }
+    }
 }
 
 /// `SIMULATE_LAYERS=0,4,7-9` composites only those layers, so a defect can be
