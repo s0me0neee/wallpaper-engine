@@ -34,6 +34,9 @@ sys.path.insert(0, str(Path(__file__).parent))
 import we_capture as wc  # noqa: E402
 
 CLK_TCK = os.sysconf("SC_CLK_TCK")
+# Every simulate started, so an interrupted run never leaves one behind: once the headless output goes, a
+# survivor lands on a real monitor and Hyprland asks the user whether to kill it.
+CHILDREN = []
 
 
 def render_ns(pid):
@@ -119,6 +122,7 @@ def bench_ours(wallpaper, title, scale, fps, args):
     if args.profile:
         env["SIMULATE_PROFILE"] = "1"
     proc = subprocess.Popen(command, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    CHILDREN.append(proc)
     lines = []
     reader = threading.Thread(target=lambda: lines.extend(iter(proc.stdout.readline, "")), daemon=True)
     reader.start()
@@ -217,6 +221,10 @@ def main():
             with open(args.out, "a") as out:
                 out.write(json.dumps(row, ensure_ascii=False) + "\n")
     finally:
+        for proc in CHILDREN:
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait()
         wc.stop_we(args.proton)
         wc.teardown_output()
 
