@@ -22,6 +22,7 @@ import glob
 import json
 import os
 import re
+import shlex
 import signal
 import statistics
 import subprocess
@@ -60,6 +61,29 @@ def cpu_seconds(pid):
     except OSError:
         return 0.0
     return (int(fields[11]) + int(fields[12])) / CLK_TCK
+
+
+def descendants(pid):
+    """`pid` and every process under it: a wrapper such as prime-run runs the renderer as a child."""
+    found = [pid]
+    for task in glob.glob(f"/proc/{pid}/task/*/children"):
+        try:
+            children = open(task).read().split()
+        except OSError:
+            continue
+        for child in children:
+            found.extend(descendants(int(child)))
+    return found
+
+
+def nvidia_busy(seconds):
+    """The NVIDIA GPU's mean utilization over `seconds`: its driver keeps no per-process engine time in fdinfo."""
+    proc = subprocess.Popen(["nvidia-smi", "--query-gpu=utilization.gpu", "--format=csv,noheader,nounits", "-lms", "250"],
+                            stdout=subprocess.PIPE, text=True)
+    time.sleep(seconds)
+    proc.terminate()
+    values = [float(line) for line in proc.communicate()[0].split() if line.strip().replace(".", "", 1).isdigit()]
+    return statistics.mean(values) / 100 if values else 0.0
 
 
 def sample(pids, seconds):
@@ -109,19 +133,21 @@ def bench_we(project, size, args, scratch):
     return {"fps": statistics.median(rates) if rates else None, "gpu": gpu, "cpu": cpu}
 
 
-def bench_ours(wallpaper, title, scale, fps, args):
+def bench_ours(wallpaper, title, size, fps, args):
     escaped = re.sub(r"([\\^$.|?*+()\[\]{}])", r"\\\1", title)
     wc.hypr("--batch", f"keyword windowrule match:title ^{escaped}$, workspace name:{wc.TITLE} silent ; "
                        f"keyword windowrule match:title ^{escaped}$, fullscreen on")
-    command = [args.binary, "simulate", wallpaper, "--fps", str(fps)]
-    if scale < 1:
-        command += ["--scale", f"{scale:.6f}"]
+    command = [*shlex.split(args.wrap), args.binary, "simulate", wallpaper, "--fps", str(fps)]
+    command += ["--resolution", f"{size[0]}x{size[1]}"]
     env = {**os.environ, **gpu_env(args.gpu)[1]}
     if args.assets:
         env["WE_ASSETS"] = str(args.assets)
     if args.profile:
         env["SIMULATE_PROFILE"] = "1"
-    proc = subprocess.Popen(command, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    # A session of its own, so stopping it reaches the renderer too: bash (prime-run) holds a SIGTERM
+    # until its child exits, and killing bash alone orphaned simulate onto a real monitor.
+    proc = subprocess.Popen(command, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+                            start_new_session=True)
     CHILDREN.append(proc)
     lines = []
     reader = threading.Thread(target=lambda: lines.extend(iter(proc.stdout.readline, "")), daemon=True)
@@ -134,21 +160,43 @@ def bench_ours(wallpaper, title, scale, fps, args):
         time.sleep(0.2)
     time.sleep(args.settle)
     first = len(lines)
-    gpu, cpu = sample([proc.pid], args.seconds)
+    pids = descendants(proc.pid)
+    if args.gpu == "nvidia":
+        busy = [0.0]
+        watcher = threading.Thread(target=lambda: busy.__setitem__(0, nvidia_busy(args.seconds)), daemon=True)
+        watcher.start()
+        _, cpu = sample(pids, args.seconds)
+        watcher.join()
+        gpu = busy[0]
+    else:
+        gpu, cpu = sample(pids, args.seconds)
     window = lines[first:]
-    proc.send_signal(signal.SIGTERM)
-    try:
-        proc.wait(10)
-    except subprocess.TimeoutExpired:
-        proc.kill()
+    stop(proc)
     rates = [float(m.group(1)) for line in window if (m := re.match(r"\s+([\d.]+) fps  \(", line))]
     stats = [line.strip() for line in window if " fps  (" in line]
     profile = [line.strip() for line in window if line.strip().startswith("gpu ")]
     cpu_profile = [line.strip() for line in window if line.strip().startswith("cpu by layer")]
+    renderer = next((line.split("GL renderer", 1)[1].strip() for line in lines if "GL renderer" in line), None)
     return {"fps": statistics.median(rates) if rates else None, "gpu": gpu, "cpu": cpu,
             "line": stats[len(stats) // 2] if stats else None,
             "profile": profile[len(profile) // 2] if profile else None,
-            "cpu_profile": cpu_profile[len(cpu_profile) // 2] if cpu_profile else None}
+            "cpu_profile": cpu_profile[len(cpu_profile) // 2] if cpu_profile else None, "renderer": renderer}
+
+
+def stop(proc):
+    """End a renderer and everything it started."""
+    if proc.poll() is not None:
+        return
+    for sig in (signal.SIGTERM, signal.SIGKILL):
+        try:
+            os.killpg(proc.pid, sig)
+        except ProcessLookupError:
+            return
+        try:
+            proc.wait(5)
+            return
+        except subprocess.TimeoutExpired:
+            pass
 
 
 def scene_canvas(binary, wallpaper):
@@ -175,6 +223,7 @@ def main():
     parser.add_argument("--gpu", choices=["intel", "nvidia"], default="intel")
     parser.add_argument("--only", choices=["we", "ours"])
     parser.add_argument("--profile", action="store_true", help="print ours' GPU time per layer (SIMULATE_PROFILE)")
+    parser.add_argument("--wrap", default="", help="command to run ours under, e.g. prime-run")
     parser.add_argument("--binary", default="target/release/wallpaper-engine")
     parser.add_argument("--label", default="", help="tag for this run in the JSON lines (e.g. a commit)")
     parser.add_argument("--out", type=Path, default=Path("papers/_we_captures/bench.jsonl"))
@@ -191,6 +240,9 @@ def main():
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(1))
     try:
         wc.setup_output()
+        # A heavy scene's first frame (shader compiles) can stall its window for seconds; the dialog Hyprland
+        # raises for that lands on the user's own workspace. `teardown_output`'s reload brings it back.
+        wc.hypr("keyword", "misc:enable_anr_dialog", "false")
         for wallpaper in args.wallpapers:
             ident, project = wc.resolve_wallpaper(wallpaper)
             title, canvas = scene_canvas(args.binary, str(project.parent))
@@ -199,7 +251,6 @@ def main():
                 continue
             general = wc.scene_general(project)
             size = wc.window_size(general, args.max)
-            scale = size[0] / canvas[0]
             row = {"id": ident, "title": title, "size": size, "gpu_device": args.gpu, "label": args.label,
                    "time": time.strftime("%Y-%m-%dT%H:%M:%S")}
             print(f"{ident} {title}: {size[0]}x{size[1]}", flush=True)
@@ -209,22 +260,20 @@ def main():
                 print(f"  WE    {fmt(row['we'])}", flush=True)
             if args.only != "we":
                 wc.size_output(*size, args.fps)
-                row["ours"] = bench_ours(str(project.parent), title, scale, args.fps, args)
+                row["ours"] = bench_ours(str(project.parent), title, size, args.fps, args)
                 print(f"  ours  {fmt(row['ours'])}", flush=True)
-                for key in ("line", "profile", "cpu_profile"):
+                for key in ("renderer", "line", "profile", "cpu_profile"):
                     if row["ours"].get(key):
                         print(f"        {row['ours'][key]}", flush=True)
                 if args.uncapped:
                     wc.size_output(*size, 240)
-                    row["ours_uncapped"] = bench_ours(str(project.parent), title, scale, 0, args)
+                    row["ours_uncapped"] = bench_ours(str(project.parent), title, size, 0, args)
                     print(f"  ours uncapped  {fmt(row['ours_uncapped'])}", flush=True)
             with open(args.out, "a") as out:
                 out.write(json.dumps(row, ensure_ascii=False) + "\n")
     finally:
         for proc in CHILDREN:
-            if proc.poll() is None:
-                proc.kill()
-                proc.wait()
+            stop(proc)
         wc.stop_we(args.proton)
         wc.teardown_output()
 

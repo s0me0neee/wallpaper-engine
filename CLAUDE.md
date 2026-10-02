@@ -52,8 +52,13 @@ macOS only — the other platforms need a different mechanism entirely and it sa
 opening an ordinary window. It has no title bar and never becomes key, so Ctrl-C in its terminal is
 how it stops.
 
-Both live subcommands take `--fps` and `--scale`, and both pause entirely while the window is
-occluded (plan.md §14.5). The frame rate defaults to the display's refresh rate because vsync does
+Both live subcommands take `--fps`, `--scale` and `--resolution WxH` (render for a screen of that size
+instead of the display), and both pause entirely while the window is occluded (plan.md §14.5). `--fps
+0` drops vsync too, so it shows how fast a scene can actually go. The startup report names the GL
+renderer: `prime-run` alone does not move `simulate` to the RTX, since it only sets the GLX/Vulkan
+offload variables and the context is EGL — add
+`__EGL_VENDOR_LIBRARY_FILENAMES=/usr/share/glvnd/egl_vendor.d/10_nvidia.json` (what `we_bench --gpu
+nvidia` does). The frame rate defaults to the display's refresh rate because vsync does
 *not* enforce one here — uncapped, `scene_example2` measured 120 fps on a 60 Hz panel, i.e. half of
 every frame's GPU time spent on pixels the display had no opportunity to scan out. `--fps 0` removes
 the cap; `--scale` trades sharpness for frames and is the only lever that helps a GPU-bound scene.
