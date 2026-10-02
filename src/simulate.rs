@@ -50,12 +50,13 @@ use winit::keyboard::{Key, NamedKey};
 use winit::monitor::MonitorHandle;
 use winit::window::{Window, WindowId};
 
-/// `--fps` and `--scale`: `fps` `None` takes the display's refresh rate and `Some(0.0)` uncaps; `scale`
-/// `None` fits the canvas to the display.
+/// `--fps`, `--scale` and `--resolution`: `fps` `None` takes the display's refresh rate and `Some(0.0)`
+/// uncaps; `scale` `None` fits the canvas to the display, or to `resolution` in its place.
 #[derive(Clone, Copy)]
 pub struct Pacing {
     pub fps: Option<f32>,
     pub scale: Option<f32>,
+    pub resolution: Option<Resolution>,
 }
 
 /// Open a window and play `scene` in it until it is closed.
@@ -84,6 +85,7 @@ pub fn run(
         presentation,
         fps: pacing.fps,
         scale: pacing.scale,
+        resolution: pacing.resolution,
         static_scene: None,
         headers: shim::headers(),
         start: Instant::now(),
@@ -103,6 +105,8 @@ struct App<'a> {
     fps: Option<f32>,
     /// `--scale`; `None` fits the canvas to the display.
     scale: Option<f32>,
+    /// `--resolution`: the screen size to render for, in place of the display's.
+    resolution: Option<Resolution>,
     /// Built by `open_window`, once the monitor it will render for is known.
     static_scene: Option<compose::StaticScene<'a>>,
     headers: HashMap<String, String>,
@@ -889,6 +893,7 @@ fn open_gl_window(
     title: &str,
     render_size: (u32, u32),
     screen: Option<MonitorHandle>,
+    fps: Option<f32>,
 ) -> Result<Windowed> {
     let attributes = Window::default_attributes().with_title(title.to_string());
     let attributes = match presentation {
@@ -942,7 +947,9 @@ fn open_gl_window(
 
     let context = not_current.make_current(&surface).context("making the GL context current")?;
     let one = NonZeroU32::new(1).context("1 is non-zero")?;
-    surface.set_swap_interval(&context, SwapInterval::Wait(one)).context("enabling vsync")?;
+    // `--fps 0` asks how fast the scene can go, which vsync would hide behind the refresh rate.
+    let interval = if fps.is_some_and(|fps| fps <= 0.0) { SwapInterval::DontWait } else { SwapInterval::Wait(one) };
+    surface.set_swap_interval(&context, interval).context("setting the swap interval")?;
 
     let gl = unsafe {
         glow::Context::from_loader_function(|name| {
@@ -963,9 +970,11 @@ impl App<'_> {
             .context("scene has no orthographic projection, so it is not a flat wallpaper")?;
         // Wayland has no primary monitor; without one the canvas renders at its full authored size, uncapped.
         let screen = event_loop.primary_monitor().or_else(|| event_loop.available_monitors().next());
-        let monitor = screen.as_ref().map(|screen| {
-            let size = screen.size();
-            (size.width, size.height)
+        let monitor = self.resolution.map(|resolution| (resolution.width, resolution.height)).or_else(|| {
+            screen.as_ref().map(|screen| {
+                let size = screen.size();
+                (size.width, size.height)
+            })
         });
         let fit = screen_fit(self.presentation);
         let min_frame = frame_interval(self.fps, screen.as_ref());
@@ -986,7 +995,9 @@ impl App<'_> {
         let background = normalized_rgba(static_scene.background);
         self.static_scene = Some(static_scene);
         let Windowed { window, surface, context, gl } =
-            open_gl_window(event_loop, self.presentation, &self.title, (width, height), screen)?;
+            open_gl_window(event_loop, self.presentation, &self.title, (width, height), screen, self.fps)?;
+        // Which GPU the context landed on: offload variables decide it, and nothing else says so.
+        println!("  GL renderer {}", pass::renderer(&gl));
 
         let display_quad = pass::build_display_quad(&gl)?;
         let blit = pass::compile_blit_program(&gl)?;

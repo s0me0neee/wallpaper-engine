@@ -60,6 +60,12 @@ pub fn compile_program(gl: &glow::Context, vertex_src: &str, fragment_src: &str)
     Ok(Program { handle: program, float_widths: float_widths(gl, program) })
 }
 
+/// The GL renderer string: which GPU and driver the context is on.
+pub fn renderer(gl: &glow::Context) -> String {
+    // Safety: a string query on the current context.
+    unsafe { gl.get_parameter_string(glow::RENDERER) }
+}
+
 /// Limit drawing to `rect`, `[x0, y0, x1, y1)` in the bound target's own rows (row 0 first), or lift it.
 pub fn limit_to(gl: &glow::Context, rect: Option<[i32; 4]>) {
     // Safety: plain fixed-function state on the current context.

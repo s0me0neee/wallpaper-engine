@@ -68,15 +68,21 @@ struct SimulateArgs {
 
     /// Cap the frame rate. Defaults to the display's refresh rate, which is
     /// free: a frame drawn between two refreshes is never scanned out, so the
-    /// GPU time and power that made it are discarded. `0` removes the cap.
+    /// GPU time and power that made it are discarded. `0` removes the cap and
+    /// vsync with it, to see how fast a scene can go.
     #[arg(long, value_name = "FPS")]
     fps: Option<f32>,
 
     /// Render at this fraction of the authored canvas. Defaults to whatever
     /// fits the display. On a GPU-bound scene this is the only lever that
     /// actually buys frames, and it costs sharpness to do it.
-    #[arg(long, value_name = "FACTOR")]
+    #[arg(long, value_name = "FACTOR", conflicts_with = "resolution")]
     scale: Option<f32>,
+
+    /// Render for a screen of this size, `WIDTHxHEIGHT`, instead of the display: the window fits the
+    /// canvas inside it (never past the canvas's own size), the desktop background fills it exactly.
+    #[arg(long, value_name = "WxH")]
+    resolution: Option<Resolution>,
 }
 
 #[derive(Args)]
@@ -660,7 +666,7 @@ fn run_simulate(args: &SimulateArgs, presentation: Presentation) -> Result<()> {
         // window, so the terminal that launched it is the only way to stop it.
         println!("  playing as the desktop background — Ctrl-C to stop");
     }
-    let pacing = simulate::Pacing { fps: args.fps, scale: args.scale };
+    let pacing = simulate::Pacing { fps: args.fps, scale: args.scale, resolution: args.resolution };
     simulate::run(&mut archive, &scene, scripts, assets.as_deref(), title, presentation, pacing)
 }
 
